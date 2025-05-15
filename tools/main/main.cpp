@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/mman.h>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -82,6 +83,11 @@ static void sigint_handler(int signo) {
     }
 }
 #endif
+
+#define END_TOKEN 151645
+extern void* model_addr;
+extern size_t model_size;
+extern void async_reload(int layer);
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -530,6 +536,7 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    bool push_end = false;
 
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
@@ -663,6 +670,14 @@ int main(int argc, char ** argv) {
                     n_eval = params.n_batch;
                 }
 
+                if ( embd.size() == 1 && embd[i] == END_TOKEN){
+                    push_end = true;
+                    break;
+                }
+                if (push_end){
+                    embd.insert(embd.begin(), END_TOKEN);
+                    push_end = false;
+                }
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
@@ -850,6 +865,15 @@ int main(int argc, char ** argv) {
                 // color user input only
                 console::set_display(console::user_input);
                 display = params.display_prompt;
+				auto addr_offset = 0x48300800;
+                unsigned long start_addr = (unsigned long)(model_addr+addr_offset+ 4095) & ~4095;
+                size_t madvise_size = ((unsigned long)(model_addr + model_size) & ~4095) - start_addr;
+                //LOG("model addr:%lx madvise addr:%lx, size:%ld\n", model_addr, start_addr, madvise_size);
+
+                int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
+				if (m_ret){
+					LOG("madvise failed:%d\n", m_ret);
+				}
 
                 std::string line;
                 bool another_line = true;
@@ -857,6 +881,12 @@ int main(int argc, char ** argv) {
                     another_line = console::readline(line, params.multiline_input);
                     buffer += line;
                 } while (another_line);
+
+                m_ret = madvise((void*)start_addr,madvise_size,MADV_WILLNEED);
+				if (m_ret){
+					LOG("madvise failed:%d\n", m_ret);
+				}
+                async_reload(18);
 
                 // done taking input, reset color
                 console::set_display(console::reset);

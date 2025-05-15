@@ -6,6 +6,8 @@
 #include <cinttypes>
 #include <cstring>
 #include <future>
+#include <fcntl.h> 
+#include <aio.h>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -91,6 +93,7 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
     return paths;
 }
 
+std::string model_fname;
 namespace GGUFMeta {
     template <typename T, gguf_type gt_, T (*gfun)(const gguf_context *, const int64_t)>
     struct GKV_Base_Type {
@@ -467,6 +470,7 @@ llama_model_loader::llama_model_loader(
         /*.ctx      = */ &ctx,
     };
 
+    model_fname = fname;
     meta.reset(gguf_init_from_file(fname.c_str(), params));
     if (!meta) {
         throw std::runtime_error(format("%s: failed to load model from %s\n", __func__, fname.c_str()));
@@ -890,6 +894,32 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+struct ggml_context *g_ctx;
+void async_reload(int layer)
+{
+
+    int fd = open(model_fname.c_str(), O_RDONLY);
+    struct ggml_context *ctx = g_ctx;
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        size_t n_size = ggml_nbytes(cur);
+        auto t_layer = cur->info & 0xff;
+        if (ggml_backend_buffer_is_host(cur->buffer) &&  t_layer >= layer) {
+            //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\tlayer:%d\n", cur->data, n_size,cur->info & 0xff);
+            if (!cur->extra){
+                cur->extra = malloc(sizeof(struct aiocb));
+                bzero((char *)cur->extra, sizeof(struct aiocb));
+            }
+            ((struct aiocb*)cur->extra)->aio_fildes = fd;    
+            ((struct aiocb*)cur->extra)->aio_nbytes = n_size;
+            ((struct aiocb*)cur->extra)->aio_offset = cur->info>>8;
+            ((struct aiocb*)cur->extra)->aio_buf = cur->data; 
+            if (aio_read((struct aiocb*)cur->extra) < 0) {
+                LLAMA_LOG_INFO("read error\n");
+            }
+        }
+    }
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -900,6 +930,7 @@ bool llama_model_loader::load_all_data(
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+    g_ctx = ctx;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1036,6 +1067,7 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                cur->info |= (weight->offs << 8);
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

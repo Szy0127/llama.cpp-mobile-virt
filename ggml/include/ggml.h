@@ -600,9 +600,9 @@ extern "C" {
 
         char name[GGML_MAX_NAME];
 
-        void * extra; // extra things e.g. for ggml-cuda.cu
+        void * extra; // extra things e.g. for ggml-cuda.cu aiocb
 
-        char padding[8];
+        uint64_t info;// weight->offs << 8 | layer;
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
