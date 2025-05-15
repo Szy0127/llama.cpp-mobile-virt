@@ -904,7 +904,7 @@ void async_reload(int layer)
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
         auto t_layer = cur->info & 0xff;
-        if (ggml_backend_buffer_is_host(cur->buffer) &&  t_layer >= layer) {
+        if (ggml_backend_buffer_is_host(cur->buffer) &&  t_layer != 255 && t_layer >= layer) {
             //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\tlayer:%d\n", cur->data, n_size,cur->info & 0xff);
             if (!cur->extra){
                 cur->extra = malloc(sizeof(struct aiocb));

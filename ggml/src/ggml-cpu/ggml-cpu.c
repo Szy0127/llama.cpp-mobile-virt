@@ -2843,10 +2843,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-        if (node->src[0] && node->src[0]->extra)
+        //uint64_t wait_total = 0;
+        if (node->src[0] && node->src[0]->extra){
+
+            //uint64_t wait_start = ggml_time_us();
         	while (aio_error((struct aiocb*)node->src[0]->extra) == EINPROGRESS);
-        if (node->src[1] && node->src[1]->extra)
+            //uint64_t wait_end = ggml_time_us();
+            //wait_total += wait_end - wait_start;
+        }
+        if (node->src[1] && node->src[1]->extra){
+            //uint64_t wait_start = ggml_time_us();
         	while (aio_error((struct aiocb*)node->src[1]->extra) == EINPROGRESS);
+            //uint64_t wait_end = ggml_time_us();
+            //wait_total += wait_end - wait_start;
+        }
+        /*
+        if (wait_total){
+            GGML_LOG_INFO("[%d]decode wait:%ld layer:%d\n", state->ith,wait_total, node->src[0]->info & 0xff);
+        }
+        */
  
 
         ggml_compute_forward(&params, node);
