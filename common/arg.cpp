@@ -1295,6 +1295,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_THREADS"));
     add_opt(common_arg(
+        {"-rl", "--reload-layer"}, "N",
+        string_format("reload layer (default: %d)", params.n_reload_layer),
+        [](common_params & params, int value) {
+            params.n_reload_layer = value;
+        }
+    ).set_env("LLAMA_RELOAD_LAYER"));
+    add_opt(common_arg(
         {"-tb", "--threads-batch"}, "N",
         "number of threads to use during batch and prompt processing (default: same as --threads)",
         [](common_params & params, int value) {

@@ -898,6 +898,7 @@ struct ggml_context *g_ctx;
 void async_reload(int layer)
 {
 
+    LLAMA_LOG_INFO("reload from layer%d\n", layer);
     int fd = open(model_fname.c_str(), O_RDONLY);
     struct ggml_context *ctx = g_ctx;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {

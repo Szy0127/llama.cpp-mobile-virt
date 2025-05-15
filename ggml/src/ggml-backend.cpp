@@ -1949,7 +1949,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
         return NULL;
     }
 
-    if(size/1024/1024>800){
+    if(size/1024/1024>400){
         model_addr = data;
         model_size = size;
     }
