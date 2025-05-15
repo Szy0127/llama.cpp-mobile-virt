@@ -697,6 +697,7 @@ int main(int argc, char ** argv) {
                     n_eval = params.n_batch;
                 }
 
+                uint64_t decode_s = 0;
                 if ( embd.size() == 1 && embd[i] == END_TOKEN){
                     push_end = true;
                     break;
@@ -704,12 +705,17 @@ int main(int argc, char ** argv) {
                 if (push_end){
                     embd.insert(embd.begin(), END_TOKEN);
                     push_end = false;
+                    decode_s = ggml_time_us();
                 }
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
+                }
+                if(decode_s){
+                    auto decode_e = ggml_time_us();
+                    LOG("prefill cost:%ld\n", decode_e - decode_s);
                 }
 
                 n_past += n_eval;
@@ -914,7 +920,10 @@ int main(int argc, char ** argv) {
 				if (m_ret){
 					LOG("madvise failed:%d\n", m_ret);
 				}
+                auto reload_s = ggml_time_us();
                 async_reload(layer);
+                auto reload_e = ggml_time_us();
+                LOG("reload cost:%ld\n", reload_e - reload_s);
 
                 // done taking input, reset color
                 console::set_display(console::reset);
