@@ -2843,10 +2843,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+        /*
         if (node->src[0] && node->src[0]->extra)
         	while (aio_error((struct aiocb*)node->src[0]->extra) == EINPROGRESS);
         if (node->src[1] && node->src[1]->extra)
         	while (aio_error((struct aiocb*)node->src[1]->extra) == EINPROGRESS);
+            */
  
 
         ggml_compute_forward(&params, node);

@@ -88,6 +88,7 @@ static void sigint_handler(int signo) {
 extern void* model_addr;
 extern size_t model_size;
 extern void async_reload(int layer);
+extern void reload_all_data();
 
 uint64_t layer_offsets[24]={
 0xd2f9600,             
@@ -921,7 +922,8 @@ int main(int argc, char ** argv) {
 					LOG("madvise failed:%d\n", m_ret);
 				}
                 auto reload_s = ggml_time_us();
-                async_reload(layer);
+                //async_reload(layer);
+                reload_all_data();
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);
 

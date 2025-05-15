@@ -921,6 +921,21 @@ void async_reload(int layer)
     }
 }
 
+void reload_all_data()
+{
+    auto model_file = new llama_file(model_fname.c_str(),"rb");
+        struct ggml_context *ctx = g_ctx;
+    LLAMA_LOG_INFO("reload all data\n");
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        size_t n_size = ggml_nbytes(cur);
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                model_file->seek(cur->info >> 8, SEEK_SET);
+                model_file->read_raw(cur->data, n_size);
+            }
+    }
+
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
