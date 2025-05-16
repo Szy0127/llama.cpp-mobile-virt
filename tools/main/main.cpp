@@ -88,6 +88,7 @@ static void sigint_handler(int signo) {
 extern void* model_addr;
 extern size_t model_size;
 extern void async_reload(int layer);
+extern void sync_reload_all();
 
 uint64_t layer_offsets[24]={
 0x0,
@@ -899,7 +900,7 @@ int main(int argc, char ** argv) {
                 console::set_display(console::user_input);
                 display = params.display_prompt;
                 auto layer = params.n_reload_layer;
-				auto addr_offset = layer_offsets[layer];
+				auto addr_offset = layer == 255 ? 0 : layer_offsets[layer];
                 unsigned long start_addr = (unsigned long)(model_addr+addr_offset+ 4095) & ~4095;
                 size_t madvise_size = ((unsigned long)(model_addr + model_size) & ~4095) - start_addr;
                 LOG("model addr:%lx madvise addr:%lx, size:%ld\n", model_addr, start_addr, madvise_size);
@@ -921,7 +922,11 @@ int main(int argc, char ** argv) {
 					LOG("madvise failed:%d\n", m_ret);
 				}
                 auto reload_s = ggml_time_us();
-                async_reload(layer);
+                if ( layer == 255 ) {
+                    sync_reload_all();
+                } else {
+                    async_reload(layer);
+                }
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);
 
