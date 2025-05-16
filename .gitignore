@@ -44,6 +44,7 @@ lcov-report/
 
 tags
 .build/
+datas*
 build*
 !build.sh
 !build-x86.sh

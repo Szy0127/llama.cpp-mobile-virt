@@ -900,15 +900,19 @@ int main(int argc, char ** argv) {
                 console::set_display(console::user_input);
                 display = params.display_prompt;
                 auto layer = params.n_reload_layer;
-				auto addr_offset = layer == 255 ? 0 : layer_offsets[layer];
+                //255:baseline
+                //254:vanilla
+				auto addr_offset = layer == 254 ? 0 : layer_offsets[layer];
                 unsigned long start_addr = (unsigned long)(model_addr+addr_offset+ 4095) & ~4095;
                 size_t madvise_size = ((unsigned long)(model_addr + model_size) & ~4095) - start_addr;
                 LOG("model addr:%lx madvise addr:%lx, size:%ld\n", model_addr, start_addr, madvise_size);
 
-                int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
-				if (m_ret){
-					LOG("madvise failed:%d\n", m_ret);
-				}
+                if (layer != 255) {
+                    int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
+				    if (m_ret){
+					    LOG("madvise failed:%d\n", m_ret);
+				    }
+                }
 
                 std::string line;
                 bool another_line = true;
@@ -917,12 +921,15 @@ int main(int argc, char ** argv) {
                     buffer += line;
                 } while (another_line);
 
-                m_ret = madvise((void*)start_addr,madvise_size,MADV_WILLNEED);
-				if (m_ret){
-					LOG("madvise failed:%d\n", m_ret);
-				}
+                if (layer != 255) {
+                    int m_ret = madvise((void*)start_addr,madvise_size,MADV_WILLNEED);
+				    if (m_ret){
+					    LOG("madvise failed:%d\n", m_ret);
+				    }
+                }
                 auto reload_s = ggml_time_us();
-                if ( layer == 255 ) {
+                if (layer !=255)
+                if ( layer == 254 ) {
                     sync_reload_all();
                 } else {
                     async_reload(layer);
