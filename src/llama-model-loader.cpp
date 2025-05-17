@@ -1,6 +1,8 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+//#include "aes.h"
+#include "chacha20.h"
 
 #include <array>
 #include <cinttypes>
@@ -12,6 +14,8 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+//#define ENC
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -920,16 +924,97 @@ void async_reload(int layer)
         }
     }
 }
+
+/*
+	uint8_t key[] = {
+		0x00, 0x01, 0x02, 0x03,
+		0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b,
+		0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13,
+		0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b,
+		0x1c, 0x1d, 0x1e, 0x1f};
+        */
+
+
+
+    uint8_t key[] = {
+        0x00, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b,
+        0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13,
+        0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b,
+        0x1c, 0x1d, 0x1e, 0x1f
+
+        };
+
+    uint8_t nonce[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+    };
+extern "C" void md5(const uint8_t *initial_msg, size_t initial_len, uint8_t *digest);
+
+
+//TODO bug if encrypt last tensor
+#define N_TENSOR 291
 void sync_reload_all()
 {
-    auto model_file = new llama_file(model_fname.c_str(),"rb");
+    auto model_file = new llama_file(model_fname.c_str(),"r+b");
     struct ggml_context *ctx = g_ctx;
     LLAMA_LOG_INFO("reload all data\n");
+    char *buffer = (char*)malloc(1024*1024*400);
+    memset(buffer,0,1024*1024*400);
+    uint8_t result[16];
+	//uint8_t *w; // expanded key
+
+//	w = aes_init(sizeof(key));
+
+	//aes_key_expansion(key, w);
+    int count = 1;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                auto start = ggml_time_us();
+
                 model_file->seek(cur->info >> 8, SEEK_SET);
                 model_file->read_raw(cur->data, n_size);
+#ifdef ENC
+                LLAMA_LOG_INFO("%d %ld, %ld\n", cur->info & 0xff, cur->info >> 8, n_size);
+                md5((uint8_t*)cur->data, n_size, result);
+                //model_file->read_raw(buffer, n_size);
+    for (int j = 0; j < 16; j++)
+        LLAMA_LOG_INFO("%2.2x", result[j]);
+    LLAMA_LOG_INFO(" enc:");
+                auto end = ggml_time_us();
+                
+                //LLAMA_LOG_INFO("load cost:%ld\n", end-start);
+                start = ggml_time_us();
+     //           aes_cipher_long((uint8_t*)cur->data, (uint8_t*)buffer, w, n_size);
+                //LLAMA_LOG_INFO("data:%lx\n", *(uint64_t*)cur->data);
+    ChaCha20XOR(key, 1, nonce, (uint8_t*)cur->data, (uint8_t*)buffer, n_size);
+                model_file->seek(cur->info >> 8, SEEK_SET);
+                if (count <  N_TENSOR)
+                model_file->write_raw(buffer, n_size);
+                count++;
+                md5((uint8_t*)buffer, n_size, result);
+    for (int j = 0; j < 16; j++)
+        LLAMA_LOG_INFO("%2.2x", result[j]);
+    LLAMA_LOG_INFO("\n");
+                //LLAMA_LOG_INFO("write buffer:%lx\n", *(uint64_t*)buffer);
+                //LLAMA_LOG_INFO("data:%lx\n", *(uint64_t*)cur->data);
+                //*(uint64_t*)cur->data = 0xdeafbeef;
+                //LLAMA_LOG_INFO("data:%lx\n", *(uint64_t*)cur->data);
+                end = ggml_time_us();
+                //LLAMA_LOG_INFO("enc cost:%ld\n", end-start);
+                start = ggml_time_us();
+    //            aes_inv_cipher_long((uint8_t*)buffer,(uint8_t*)cur->data, w, n_size);
+    ChaCha20XOR(key, 1, nonce, (uint8_t*)buffer, (uint8_t*)cur->data, n_size);
+                //LLAMA_LOG_INFO("data:%lx\n", *(uint64_t*)cur->data);
+                end = ggml_time_us();
+                //LLAMA_LOG_INFO("de cost:%ld len:%ld\n", end-start, n_size);
+#endif
             }
     }
 
@@ -1035,7 +1120,10 @@ bool llama_model_loader::load_all_data(
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
     }
+    char *buffer = (char*)malloc(1024*1024*400);
+    memset(buffer,0,1024*1024*400);
 
+    int n_tensor = 1;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1084,7 +1172,29 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 cur->info |= (weight->offs << 8);
                 file->seek(weight->offs, SEEK_SET);
+#ifndef ENC
+                LLAMA_LOG_INFO("%d %ld, %ld\n", cur->info & 0xff, weight->offs, n_size);
+                if (n_tensor < N_TENSOR) {
+
+                file->read_raw(buffer, n_size);
+                uint8_t result[16];
+                md5((uint8_t*)buffer, n_size, result);
+    for (int j = 0; j < 16; j++)
+        LLAMA_LOG_INFO("%2.2x", result[j]);
+    LLAMA_LOG_INFO(" recoverd:");
+    ChaCha20XOR(key, 1, nonce, (uint8_t*)buffer, (uint8_t*)cur->data, n_size);
+                md5((uint8_t*)cur->data, n_size, result);
+    for (int j = 0; j < 16; j++)
+        LLAMA_LOG_INFO("%2.2x", result[j]);
+    LLAMA_LOG_INFO("\n");
+                }else{
                 file->read_raw(cur->data, n_size);
+
+                }
+                n_tensor++;
+#else
+                file->read_raw(cur->data, n_size);
+#endif
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));

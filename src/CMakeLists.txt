@@ -22,6 +22,9 @@ add_library(llama
             llama-kv-cache.cpp
             llama-memory.cpp
             llama-mmap.cpp
+            chacha20.c
+            chacha20.h
+            md5.c
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
