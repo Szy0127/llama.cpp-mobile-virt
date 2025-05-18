@@ -14,7 +14,7 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-#define ENC_MODEL
+//#define ENC_MODEL
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -933,11 +933,12 @@ void async_reload(int layer)
                 cur->extra = malloc(sizeof(struct aiocb));
                 bzero((char *)cur->extra, sizeof(struct aiocb));
             }
-            ((struct aiocb*)cur->extra)->aio_fildes = fd;    
-            ((struct aiocb*)cur->extra)->aio_nbytes = n_size;
-            ((struct aiocb*)cur->extra)->aio_offset = cur->info>>8;
-            ((struct aiocb*)cur->extra)->aio_buf = cur->data; 
-            if (aio_read((struct aiocb*)cur->extra) < 0) {
+            auto cb = (struct aiocb*)cur->extra;
+            cb->aio_fildes = fd;    
+            cb->aio_nbytes = n_size;
+            cb->aio_offset = cur->info>>8;
+            cb->aio_buf = cur->data; 
+            if (aio_read(cb) < 0) {
                 LLAMA_LOG_INFO("read error\n");
             }
         }
@@ -990,8 +991,10 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+#ifdef ENC_MODEL
     decrypt_buffer = (uint8_t*)malloc(MiB*138);
     int n_tensor = 1;
+#endif
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
