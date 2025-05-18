@@ -1585,7 +1585,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.info         =*/ tensor_layer
+        /*.info         =*/ tensor_layer,
+
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads

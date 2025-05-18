@@ -9,12 +9,13 @@
 #include <future>
 #include <fcntl.h> 
 #include <aio.h>
+#include <signal.h> 
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-//#define ENC_MODEL
+#define ENC_MODEL
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -918,6 +919,20 @@ uint8_t * decrypt_buffer;
 #endif
 
 struct ggml_context *g_ctx;
+
+#ifdef ENC_MODEL
+void aio_completion_handler(sigval_t sigval)
+{
+    auto tensor = (struct ggml_tensor*)sigval.sival_ptr;
+    if (!(tensor->info & 0b10000000)) {
+        size_t n_size = ggml_nbytes(tensor);
+        memcpy(decrypt_buffer, tensor->data, n_size);
+        ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)tensor->data, n_size);
+        //LLAMA_LOG_INFO("decypt:%lx %d\n", tensor, std::this_thread::get_id());
+    }
+}
+#endif
+
 void async_reload(int layer)
 {
 
@@ -926,7 +941,7 @@ void async_reload(int layer)
     struct ggml_context *ctx = g_ctx;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
-        auto t_layer = cur->info & 0xff;
+        int t_layer = cur->info & 0x7f;
         if (ggml_backend_buffer_is_host(cur->buffer) &&  t_layer >= layer) {
             //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\tlayer:%d\n", cur->data, n_size,cur->info & 0xff);
             if (!cur->extra){
@@ -938,6 +953,13 @@ void async_reload(int layer)
             cb->aio_nbytes = n_size;
             cb->aio_offset = cur->info>>8;
             cb->aio_buf = cur->data; 
+#ifdef ENC_MODEL
+            cb->aio_sigevent.sigev_notify=SIGEV_THREAD;
+            cb->aio_sigevent.sigev_notify_function=aio_completion_handler;
+            cb->aio_sigevent.sigev_notify_attributes=NULL;
+            cb->aio_sigevent.sigev_value.sival_ptr=cur;
+#endif
+
             if (aio_read(cb) < 0) {
                 LLAMA_LOG_INFO("read error\n");
             }
@@ -1131,6 +1153,7 @@ bool llama_model_loader::load_all_data(
                     ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)cur->data, n_size);
                 } else {
                     file->read_raw(cur->data, n_size);
+                    cur->info |= (1 << 7);
                 }
                 n_tensor++;
 #endif
