@@ -31,6 +31,8 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            chacha20.c
+            chacha20.h
             )
 
 target_include_directories(llama PRIVATE .)

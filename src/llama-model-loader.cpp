@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+#include "chacha20.h"
 
 #include <array>
 #include <cinttypes>
@@ -12,6 +13,8 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+#define ENC_MODEL
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -894,6 +897,26 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+#ifdef ENC_MODEL
+uint8_t key[] = {
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13,
+    0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b,
+    0x1c, 0x1d, 0x1e, 0x1f
+    };
+
+uint8_t nonce[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+};
+//TODO bug if encrypt last tensor
+#define N_TENSOR 291
+uint8_t * decrypt_buffer;
+#endif
+
 struct ggml_context *g_ctx;
 void async_reload(int layer)
 {
@@ -925,11 +948,22 @@ void sync_reload_all()
     auto model_file = new llama_file(model_fname.c_str(),"rb");
     struct ggml_context *ctx = g_ctx;
     LLAMA_LOG_INFO("reload all data\n");
+    int n_tensor = 1;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 model_file->seek(cur->info >> 8, SEEK_SET);
+#ifndef ENC_MODEL
                 model_file->read_raw(cur->data, n_size);
+#else
+                if (n_tensor < N_TENSOR){
+                    model_file->read_raw(decrypt_buffer, n_size);
+                    ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)cur->data, n_size);
+                } else {
+                    model_file->read_raw(cur->data, n_size);
+                }
+                n_tensor++;
+#endif
             }
     }
 
@@ -956,6 +990,8 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    decrypt_buffer = (uint8_t*)malloc(MiB*138);
+    int n_tensor = 1;
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1084,7 +1120,17 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 cur->info |= (weight->offs << 8);
                 file->seek(weight->offs, SEEK_SET);
+#ifndef ENC_MODEL
                 file->read_raw(cur->data, n_size);
+#else
+                if (n_tensor < N_TENSOR){
+                    file->read_raw(decrypt_buffer, n_size);
+                    ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)cur->data, n_size);
+                } else {
+                    file->read_raw(cur->data, n_size);
+                }
+                n_tensor++;
+#endif
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
