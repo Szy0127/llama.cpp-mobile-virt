@@ -915,7 +915,6 @@ uint8_t nonce[] = {
 };
 //TODO bug if encrypt last tensor
 #define N_TENSOR 291
-uint8_t * decrypt_buffer;
 #endif
 
 struct ggml_context *g_ctx;
@@ -926,8 +925,7 @@ void aio_completion_handler(sigval_t sigval)
     auto tensor = (struct ggml_tensor*)sigval.sival_ptr;
     if (!(tensor->info & 0b10000000)) {
         size_t n_size = ggml_nbytes(tensor);
-        memcpy(decrypt_buffer, tensor->data, n_size);
-        ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)tensor->data, n_size);
+        ChaCha20XOR(key, 1, nonce, (uint8_t*)tensor->data, (uint8_t*)tensor->data, n_size);
         //LLAMA_LOG_INFO("decypt:%lx %d\n", tensor, std::this_thread::get_id());
     }
 }
@@ -980,8 +978,8 @@ void sync_reload_all()
                 model_file->read_raw(cur->data, n_size);
 #else
                 if (n_tensor < N_TENSOR){
-                    model_file->read_raw(decrypt_buffer, n_size);
-                    ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)cur->data, n_size);
+                    model_file->read_raw(cur->data, n_size);
+                    ChaCha20XOR(key, 1, nonce, (uint8_t*)cur->data, (uint8_t*)cur->data, n_size);
                 } else {
                     model_file->read_raw(cur->data, n_size);
                 }
@@ -1014,7 +1012,6 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
 #ifdef ENC_MODEL
-    decrypt_buffer = (uint8_t*)malloc(MiB*138);
     int n_tensor = 1;
 #endif
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
@@ -1149,8 +1146,8 @@ bool llama_model_loader::load_all_data(
                 file->read_raw(cur->data, n_size);
 #else
                 if (n_tensor < N_TENSOR){
-                    file->read_raw(decrypt_buffer, n_size);
-                    ChaCha20XOR(key, 1, nonce, decrypt_buffer, (uint8_t*)cur->data, n_size);
+                    file->read_raw(cur->data, n_size);
+                    ChaCha20XOR(key, 1, nonce, (uint8_t*)cur->data, (uint8_t*)cur->data, n_size);
                 } else {
                     file->read_raw(cur->data, n_size);
                     cur->info |= (1 << 7);
