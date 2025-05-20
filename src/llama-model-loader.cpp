@@ -10,12 +10,13 @@
 #include <fcntl.h> 
 #include <aio.h>
 #include <signal.h> 
+#include <native_aio.h>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-#define ENC_MODEL
+//#define ENC_MODEL
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -914,9 +915,9 @@ uint8_t nonce[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
 };
 //TODO bug if encrypt last tensor
-#define N_TENSOR 291
 #endif
 
+#define N_TENSOR 291
 struct ggml_context *g_ctx;
 
 #ifdef ENC_MODEL
@@ -931,26 +932,42 @@ void aio_completion_handler(sigval_t sigval)
 }
 #endif
 
-void async_reload(int layer)
+struct iocb iocb_list[N_TENSOR];
+struct iocb* aio_requests[N_TENSOR];
+io_event events[N_TENSOR];
+aio_context_t io_ctx;
+
+void aio_setup()
+{
+    int ret = io_setup(N_TENSOR, &io_ctx);
+    if (ret < 0) {
+        LLAMA_LOG_INFO("io setup failed %d\n", ret);
+    }
+    for(int i = 0; i < N_TENSOR;i++) {
+        aio_requests[i] = &iocb_list[i];
+    }
+}
+void async_reload(int tensor_index)
 {
 
-    LLAMA_LOG_INFO("reload from layer%d\n", layer);
     int fd = open(model_fname.c_str(), O_RDONLY);
+    int to_submit = 0;
     struct ggml_context *ctx = g_ctx;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
-        int t_layer = cur->info & 0x7f;
-        if (ggml_backend_buffer_is_host(cur->buffer) &&  t_layer >= layer) {
-            //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\tlayer:%d\n", cur->data, n_size,cur->info & 0xff);
-            if (!cur->extra){
-                cur->extra = malloc(sizeof(struct aiocb));
-                bzero((char *)cur->extra, sizeof(struct aiocb));
-            }
-            auto cb = (struct aiocb*)cur->extra;
+        auto index = cur->index;
+        if (ggml_backend_buffer_is_host(cur->buffer) &&  index >= tensor_index) {
+
+            //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\ index:%d\n", cur->data, n_size,cur->index);
+            struct iocb *cb = &iocb_list[index];
+            memset(cb,0,sizeof(*cb));
+            cb->aio_data = (__u64)(index);
+            cb->aio_lio_opcode = IOCB_CMD_PREAD;
             cb->aio_fildes = fd;    
             cb->aio_nbytes = n_size;
-            cb->aio_offset = cur->info>>8;
-            cb->aio_buf = cur->data; 
+            cb->aio_offset = cur->weight_offs;
+            cb->aio_buf = (__u64)cur->data; 
+            to_submit++;
 #ifdef ENC_MODEL
             cb->aio_sigevent.sigev_notify=SIGEV_THREAD;
             cb->aio_sigevent.sigev_notify_function=aio_completion_handler;
@@ -958,11 +975,39 @@ void async_reload(int layer)
             cb->aio_sigevent.sigev_value.sival_ptr=cur;
 #endif
 
-            if (aio_read(cb) < 0) {
-                LLAMA_LOG_INFO("read error\n");
-            }
         }
     }
+    LLAMA_LOG_INFO("to submit:%d\n", to_submit);
+    int submitted = 0;
+    while (to_submit) {
+        //int submit = io_submit(io_ctx, to_submit > 128 ? 128:to_submit, &aio_requests[submitted]);
+        int submit = io_submit(io_ctx, to_submit, &aio_requests[submitted]);
+        if (submit< 0) {
+                LLAMA_LOG_INFO( "io_submit failed: %s\n", strerror(errno) );
+                return;
+        }
+        submitted += submit;
+        to_submit -= submit;
+        LLAMA_LOG_INFO("submit:%d\n", submit);
+    }
+    while (1) {
+        timespec timeout = { .tv_sec = 10, .tv_nsec = 0 };
+        int total = 0;
+        int num_events = io_getevents(io_ctx, 1, N_TENSOR, events, &timeout);
+        if (num_events < 0) {
+            perror("io_getevents failed");
+            break;
+        }
+        for (int j = 0; j < num_events; ++j) {
+            int tensor_idx = (int)(events[j].data);
+            //g_finish_flags[tensor_idx].flag.store(true, std::memory_order_release);
+            //LLAMA_LOG_INFO("%d finish\n", tensor_idx);
+        }
+        total += num_events;
+        if (total == submitted)break;
+    }
+    
+
 }
 void sync_reload_all()
 {
@@ -973,7 +1018,7 @@ void sync_reload_all()
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         size_t n_size = ggml_nbytes(cur);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                model_file->seek(cur->info >> 8, SEEK_SET);
+                model_file->seek(cur->weight_offs, SEEK_SET);
 #ifndef ENC_MODEL
                 model_file->read_raw(cur->data, n_size);
 #else
@@ -1001,6 +1046,7 @@ bool llama_model_loader::load_all_data(
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
     g_ctx = ctx;
+    aio_setup();
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1014,6 +1060,7 @@ bool llama_model_loader::load_all_data(
 #ifdef ENC_MODEL
     int n_tensor = 1;
 #endif
+    int tensor_index = 0;
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1140,8 +1187,10 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                cur->info |= (weight->offs << 8);
+                cur->weight_offs = weight->offs;
+                cur->index = tensor_index;
                 file->seek(weight->offs, SEEK_SET);
+                tensor_index++;
 #ifndef ENC_MODEL
                 file->read_raw(cur->data, n_size);
 #else
