@@ -1587,6 +1587,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.extra        =*/ NULL,
         /*.weight_offs  =*/ 0,
         /*.index        =*/ 0,
+        /*.need_wait    =*/ 0,
 
     };
 

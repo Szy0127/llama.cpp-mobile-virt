@@ -603,7 +603,8 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu aiocb
 
         uint32_t weight_offs;
-        uint32_t index;
+        uint16_t index;
+        uint16_t need_wait;
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

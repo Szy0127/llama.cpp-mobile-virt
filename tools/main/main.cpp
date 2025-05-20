@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <sys/mman.h>
+#include <thread>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -932,7 +933,9 @@ int main(int argc, char ** argv) {
                 if ( layer == 254 ) {
                     sync_reload_all();
                 } else {
-                    async_reload(layer);
+                    std::thread t(async_reload, layer);
+                    //async_reload(layer);
+                    t.detach();
                 }
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);

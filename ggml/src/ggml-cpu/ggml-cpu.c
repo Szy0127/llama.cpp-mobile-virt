@@ -2826,6 +2826,7 @@ struct ggml_cplan ggml_graph_plan(
 
 extern void* model_addr;
 extern size_t model_size;
+atomic_bool g_finish_flags[500]= {ATOMIC_VAR_INIT(false)}; 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -2850,10 +2851,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node->src[0] && node->src[0]->data > model_addr)
             GGML_LOG_INFO("%lx %d\n", node->src[0]->data, node->src[0]->info & 0xff);
         */
-        if (node->src[0] && node->src[0]->extra){
+        if (node->src[0] && node->src[0]->need_wait){
 
             //uint64_t wait_start = ggml_time_us();
-        	while (aio_error((struct aiocb*)node->src[0]->extra) == EINPROGRESS);
+            int idx = node->src[0]->index;
+            while(atomic_load(&g_finish_flags[idx]));
+            node->src[0]->need_wait = 0;
             //uint64_t wait_end = ggml_time_us();
             //wait_total += wait_end - wait_start;
         }
@@ -2861,9 +2864,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node->src[1] && node->src[1]->data > model_addr)
             GGML_LOG_INFO("%lx %d\n", node->src[1]->data, node->src[1]->info & 0xff);
         */
-        if (node->src[1] && node->src[1]->extra){
+        if (node->src[1] && node->src[1]->need_wait){
             //uint64_t wait_start = ggml_time_us();
-        	while (aio_error((struct aiocb*)node->src[1]->extra) == EINPROGRESS);
+            int idx = node->src[1]->index;
+            while(atomic_load(&g_finish_flags[idx]));
+            node->src[1]->need_wait = 0;
             //uint64_t wait_end = ggml_time_us();
             //wait_total += wait_end - wait_start;
         }
