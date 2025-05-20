@@ -118,6 +118,9 @@ uint64_t layer_offsets[24]={
 0x18b30000,
 };
            
+int layer2index[24]={
+    0,15,27,39,51,63,75,87,99,111,123,135,147,159,171,183,195,207,219,231,243,255,267,279
+};
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
@@ -933,7 +936,7 @@ int main(int argc, char ** argv) {
                 if ( layer == 254 ) {
                     sync_reload_all();
                 } else {
-                    std::thread t(async_reload, layer);
+                    std::thread t(async_reload, layer2index[layer]);
                     //async_reload(layer);
                     t.detach();
                 }

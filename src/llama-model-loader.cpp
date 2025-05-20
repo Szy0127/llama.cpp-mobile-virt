@@ -983,22 +983,22 @@ void async_reload(int tensor_index)
 
         }
     }
-    LLAMA_LOG_INFO("to submit:%d\n", to_submit);
-    int submitted = 0;
-    while (to_submit) {
+    //LLAMA_LOG_INFO("to submit:%d\n", to_submit);
+    int submitted = tensor_index;
+    while (submitted < N_TENSOR) {
         //int submit = io_submit(io_ctx, to_submit > 128 ? 128:to_submit, &aio_requests[submitted]);
-        int submit = io_submit(io_ctx, to_submit, &aio_requests[submitted]);
+        int submit = io_submit(io_ctx, to_submit - submitted + tensor_index, &aio_requests[submitted]);
         if (submit< 0) {
                 LLAMA_LOG_INFO( "io_submit failed: %s\n", strerror(errno) );
                 return;
         }
         submitted += submit;
-        to_submit -= submit;
-        LLAMA_LOG_INFO("submit:%d\n", submit);
+        //LLAMA_LOG_INFO("submit:%d\n", submit);
     }
+    int total = 0;
     while (1) {
         timespec timeout = { .tv_sec = 10, .tv_nsec = 0 };
-        int total = 0;
+        memset(events, 0, sizeof(events));
         int num_events = io_getevents(io_ctx, 1, N_TENSOR, events, &timeout);
         if (num_events < 0) {
             perror("io_getevents failed");
@@ -1007,14 +1007,14 @@ void async_reload(int tensor_index)
         for (int j = 0; j < num_events; ++j) {
             int tensor_idx = (int)(events[j].data);
             g_finish_flags[tensor_idx].store(false, std::memory_order_release);
-            //atomic_store(&g_finish_flags[index],false);
-            //g_finish_flags[tensor_idx].flag.store(true, std::memory_order_release);
-            //LLAMA_LOG_INFO("%d finish\n", tensor_idx);
         }
-        LLAMA_LOG_INFO("io finish:%d\n", num_events);
+        //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
+        //LLAMA_LOG_INFO("io finish:%d\n", num_events);
         total += num_events;
-        if (total == submitted)break;
+        //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
+        if (total >= to_submit)break;
     }
+    //LLAMA_LOG_INFO("finish aio\n");
     
 
 }
