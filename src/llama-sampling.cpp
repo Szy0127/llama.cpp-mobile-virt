@@ -16,6 +16,7 @@
 #include <random>
 #include <unordered_map>
 #include <stdexcept>
+#include <fstream>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
@@ -304,15 +305,20 @@ static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) 
 
 static uint32_t get_rng_seed(uint32_t seed) {
     if (seed == LLAMA_DEFAULT_SEED) {
-        // use system clock if std::random_device is not a true RNG
-        static bool is_rd_prng = std::random_device().entropy() == 0;
-        if (is_rd_prng) {
-            return (uint32_t) std::chrono::system_clock::now().time_since_epoch().count();
-        }
-        std::random_device rd;
-        return rd();
+       std::ifstream urandom("/dev/urandom", std::ios::in | std::ios::binary);
+       if (!urandom){
+               return 0xdeadbeef;
+       }
+       uint32_t rnd = 0;
+       urandom.read(reinterpret_cast<char*>(&rnd), sizeof(rnd));
+       if (!rnd) {
+               urandom.close();
+               return 0xdeadbeef;
+       }
+       urandom.close();
+       return rnd;
     }
-    return seed;
+  return seed;
 }
 
 // llama_sampler API

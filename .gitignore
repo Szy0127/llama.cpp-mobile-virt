@@ -48,6 +48,7 @@ datas*
 build*
 !build.sh
 !build-x86.sh
+!build-hm.sh
 release
 debug
 !build-info.cmake

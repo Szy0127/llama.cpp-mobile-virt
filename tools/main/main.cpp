@@ -914,7 +914,7 @@ int main(int argc, char ** argv) {
                 if (layer != 255) {
                     int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
 				    if (m_ret){
-					    LOG("madvise failed:%d\n", m_ret);
+					    LOG("madvise failed:%d %s\n", m_ret, strerror(errno));
 				    }
                 }
 

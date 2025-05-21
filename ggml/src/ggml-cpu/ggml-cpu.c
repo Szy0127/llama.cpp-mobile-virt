@@ -609,7 +609,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
 
     // figure out which node we're on
-    uint current_cpu;
+    int current_cpu;
     int getcpu_ret = 0;
 #if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
     getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
