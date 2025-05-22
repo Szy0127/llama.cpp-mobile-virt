@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "src/chacha20.h"
+#include "src/chacha12.h"
 
 #define MAX_LINE_LENGTH 256
 
@@ -97,7 +97,7 @@ int main(int argc, char *argv[]) {
             free(buffer);
             continue;
         }
-        ChaCha20XOR(key, 1, nonce, buffer,buffer, size);
+        ChaCha12XOR(key, 1, nonce, buffer,buffer, size);
 
         if (fseek(fp_output, offset, SEEK_SET) != 0) {
             perror("Failed to seek output file");
