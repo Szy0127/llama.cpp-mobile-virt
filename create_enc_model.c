@@ -29,6 +29,9 @@ typedef struct {
     uint8_t nonce[] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
     };
+
+#define ALIGN(x) ((x+511)&~511)
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <offset_file> <input_file> <output_file>\n", argv[0]);
@@ -75,10 +78,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    int pad = 0;
     for (int i = 0; i < count; i++) {
         unsigned long offset = blocks[i].offset;
         unsigned long size = blocks[i].size;
         printf("%ld %ld\n", offset,size);
+        if (i == 0){
+            pad = ALIGN(offset) - offset;
+        }
 
         if (fseek(fp_input, offset, SEEK_SET) != 0) {
             perror("Failed to seek input file");
@@ -99,7 +106,8 @@ int main(int argc, char *argv[]) {
         }
         ChaCha12XOR(key, 1, nonce, buffer,buffer, size);
 
-        if (fseek(fp_output, offset, SEEK_SET) != 0) {
+
+        if (fseek(fp_output, offset+pad, SEEK_SET) != 0) {
             perror("Failed to seek output file");
             free(buffer);
             continue;

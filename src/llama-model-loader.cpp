@@ -1,7 +1,6 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
-#include "chacha20.h"
 
 #include <array>
 #include <cinttypes>
@@ -954,7 +953,8 @@ void aio_setup()
 void async_reload(int tensor_index)
 {
 
-    int fd = open(model_fname.c_str(), O_RDONLY);
+    LLAMA_LOG_INFO("async reload\n");
+    int fd = open(model_fname.c_str(), O_RDONLY | O_DIRECT);
     int to_submit = 0;
     struct ggml_context *ctx = g_ctx;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -963,14 +963,16 @@ void async_reload(int tensor_index)
         if (ggml_backend_buffer_is_host(cur->buffer) &&  index >= tensor_index) {
 
             //LLAMA_LOG_INFO("load tensor \taddr:%lx\t\t size:%ld\ index:%d\n", cur->data, n_size,cur->index);
+            //LLAMA_LOG_INFO("buf:%d, size:%d, offset:%d\n", (uint64_t)cur->data % 512,
+             //       n_size % 512, cur->weight_offs % 512);
             struct iocb *cb = &iocb_list[index];
             memset(cb,0,sizeof(*cb));
             cb->aio_data = (__u64)(index);
             cb->aio_lio_opcode = IOCB_CMD_PREAD;
             cb->aio_fildes = fd;    
             cb->aio_nbytes = n_size;
-            cb->aio_offset = cur->weight_offs;
-            cb->aio_buf = (__u64)cur->data; 
+            cb->aio_offset = (cur->weight_offs+511)&~511;
+            cb->aio_buf = (__u64)cur->data;
             to_submit++;
             g_finish_flags[index].store(true, std::memory_order_release);
             cur->need_wait = 1;
@@ -1005,10 +1007,13 @@ void async_reload(int tensor_index)
             break;
         }
         for (int j = 0; j < num_events; ++j) {
-            int tensor_idx = (int)(events[j].data);
-            g_finish_flags[tensor_idx].store(false, std::memory_order_release);
+            if(events[j].res <=0){
+               LLAMA_LOG_INFO("res:%d\n", events[j].res);
+            }else{
+                int tensor_idx = (int)(events[j].data);
+                g_finish_flags[tensor_idx].store(false, std::memory_order_release);
+            }
         }
-        //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
         //LLAMA_LOG_INFO("io finish:%d\n", num_events);
         total += num_events;
         //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
@@ -1201,7 +1206,7 @@ bool llama_model_loader::load_all_data(
                 file->seek(weight->offs, SEEK_SET);
                 tensor_index++;
 #ifndef ENC_MODEL
-                file->read_raw(cur->data, n_size);
+                file->read_raw((void*)(((uint64_t)cur->data+511)&~511), n_size);
 #else
                 if (n_tensor < N_TENSOR){
                     file->read_raw(cur->data, n_size);
