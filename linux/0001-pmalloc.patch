@@ -1,0 +1,629 @@
+From 48165c24dcd8a200abf668335dc8507b31f20539 Mon Sep 17 00:00:00 2001
+From: Zheyun Shen <szy0127@sjtu.edu.cn>
+Date: Sat, 21 Jun 2025 15:59:56 +0800
+Subject: [PATCH 1/2] pmalloc
+
+---
+ include/linux/gfp.h |  53 ++++++++
+ kmod/Makefile       |   1 +
+ kmod/exp.c          | 190 ++++++++++++++++++++++++++
+ mm/page_alloc.c     | 316 +++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 559 insertions(+), 1 deletion(-)
+ create mode 100644 kmod/Makefile
+ create mode 100644 kmod/exp.c
+
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 7f9691d37..6a5889482 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -216,6 +216,59 @@ unsigned long alloc_pages_bulk_noprof(gfp_t gfp, int preferred_nid,
+ 				struct page **page_array);
+ #define __alloc_pages_bulk(...)			alloc_hooks(alloc_pages_bulk_noprof(__VA_ARGS__))
+ 
++/* pmalloc interface - allocate pages getting biggest orders first with order info */
++struct pmalloc_page_info {
++	struct page *page;
++	unsigned int order;
++	unsigned long size_bytes;
++	void *virt_addr;
++	unsigned long phys_addr;
++	struct list_head list;
++};
++
++unsigned long pmalloc_get_pages_with_info(gfp_t gfp, int preferred_nid,
++				   nodemask_t *nodemask, 
++				   struct list_head *page_info_list,
++				   unsigned long target_size,
++				   unsigned long max_pages);
++unsigned long pmalloc_get_size_with_info(unsigned long size_mb, 
++					  struct list_head *page_info_list);
++unsigned long pmalloc_get_dma_pages(unsigned long size_mb, 
++				     struct list_head *page_info_list);
++void pmalloc_free_pages_with_info(struct list_head *page_info_list);
++int pmalloc_get_available_info_count(void);
++
++/* Helper functions to access pmalloc_page_info */
++static inline unsigned int pmalloc_page_order(struct pmalloc_page_info *info)
++{
++	return info ? info->order : 0;
++}
++
++static inline unsigned long pmalloc_page_size(struct pmalloc_page_info *info)
++{
++	return info ? info->size_bytes : 0;
++}
++
++static inline void *pmalloc_page_address(struct pmalloc_page_info *info)
++{
++	return info ? info->virt_addr : NULL;
++}
++
++static inline unsigned long pmalloc_page_phys_addr(struct pmalloc_page_info *info)
++{
++	return info ? info->phys_addr : 0;
++}
++
++/* pmalloc interface - allocate pages getting biggest orders first */
++unsigned long pmalloc_get_pages(gfp_t gfp, int preferred_nid,
++			       nodemask_t *nodemask, 
++			       struct list_head *page_list,
++			       unsigned long target_size,
++			       unsigned long max_pages);
++unsigned long pmalloc_get_size(unsigned long size_mb, struct list_head *page_list);
++unsigned long pmalloc_get_all_free(gfp_t gfp, struct list_head *page_list);
++void pmalloc_example_22mb(void);  /* Example: 22MB allocation */
++
+ unsigned long alloc_pages_bulk_array_mempolicy_noprof(gfp_t gfp,
+ 				unsigned long nr_pages,
+ 				struct page **page_array);
+diff --git a/kmod/Makefile b/kmod/Makefile
+new file mode 100644
+index 000000000..8491a3485
+--- /dev/null
++++ b/kmod/Makefile
+@@ -0,0 +1 @@
++obj-m += exp.o
+diff --git a/kmod/exp.c b/kmod/exp.c
+new file mode 100644
+index 000000000..c4dcb1bdb
+--- /dev/null
++++ b/kmod/exp.c
+@@ -0,0 +1,190 @@
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/gfp.h>
++#include <asm/io.h>
++
++/* Module parameters */
++static int cmd = -1;
++static int size = 0;
++static int use_dma = 0;
++
++module_param(cmd, int, 0644);
++MODULE_PARM_DESC(cmd, "Command: 0=allocate, 1=free");
++
++module_param(size, int, 0644);
++MODULE_PARM_DESC(size, "Size in MB to allocate when cmd=0");
++
++module_param(use_dma, int, 0644);
++MODULE_PARM_DESC(use_dma, "Use DMA zone specifically (0=normal, 1=DMA zone)");
++
++/* Global storage for allocated pages */
++static LIST_HEAD(global_page_list);
++static DEFINE_MUTEX(page_list_mutex);
++static bool pages_allocated = false;
++
++/*
++ * pmalloc_allocate - Allocate memory using pmalloc
++ */
++static int pmalloc_allocate(unsigned long size_mb)
++{
++	struct pmalloc_page_info *info;
++	unsigned long total_pages = 0;
++	unsigned long total_allocated = 0;
++	int block_count = 0;
++	
++	mutex_lock(&page_list_mutex);
++	
++	/* Check if pages are already allocated */
++	if (pages_allocated) {
++		printk(KERN_WARNING "pmalloc_exp: Pages already allocated. Free them first with cmd=1\n");
++		mutex_unlock(&page_list_mutex);
++		return -EBUSY;
++	}
++	
++	printk(KERN_INFO "pmalloc_exp: Allocating %lu MB using pmalloc (use_dma=%d)...\n", size_mb, use_dma);
++	printk(KERN_INFO "pmalloc_exp: Before allocation - check /proc/buddyinfo\n");
++	printk(KERN_INFO "pmalloc_exp: Available info structures: %d\n", pmalloc_get_available_info_count());
++	
++	/* Allocate pages getting biggest orders first */
++	if (use_dma) {
++		printk(KERN_INFO "pmalloc_exp: Using DMA-specific allocation\n");
++		total_pages = pmalloc_get_dma_pages(size_mb, &global_page_list);
++	} else {
++		printk(KERN_INFO "pmalloc_exp: Using normal allocation (includes DMA)\n");
++		total_pages = pmalloc_get_size_with_info(size_mb, &global_page_list);
++	}
++	
++	if (total_pages == 0) {
++		printk(KERN_ERR "pmalloc_exp: Failed to allocate any pages\n");
++		mutex_unlock(&page_list_mutex);
++		return -ENOMEM;
++	}
++	
++	printk(KERN_INFO "pmalloc_exp: Successfully allocated %lu total pages\n", total_pages);
++	
++	/* Display information about each allocated block */
++	list_for_each_entry(info, &global_page_list, list) {
++		void *memory = pmalloc_page_address(info);
++		unsigned int order = pmalloc_page_order(info);
++		unsigned long block_size = pmalloc_page_size(info);
++		unsigned long phys_addr = info->phys_addr;
++		unsigned long num_pages = 1UL << order;
++		
++		block_count++;
++		
++		printk(KERN_INFO "pmalloc_exp: Block %d - Order=%u, Pages=%lu, Size=%luKB (%luMB)\n",
++		       block_count, order, num_pages, block_size/1024, block_size/(1024*1024));
++		       
++		printk(KERN_INFO "pmalloc_exp:          Virtual Addr:  %p\n", memory);
++		printk(KERN_INFO "pmalloc_exp:          Physical Addr: 0x%lx\n", phys_addr);
++		
++		/* Test memory access */
++		if (memory) {
++			/* Write test pattern to verify memory is accessible */
++			*((u32*)memory) = 0xDEADBEEF;
++			if (*((u32*)memory) == 0xDEADBEEF) {
++				printk(KERN_INFO "pmalloc_exp:          Memory test: PASSED\n");
++			} else {
++				printk(KERN_ERR "pmalloc_exp:          Memory test: FAILED\n");
++			}
++		}
++		
++		total_allocated += block_size;
++	}
++	
++	printk(KERN_INFO "pmalloc_exp: Total allocated: %d blocks, %luMB\n", 
++	       block_count, total_allocated / (1024 * 1024));
++	
++	pages_allocated = true;
++	mutex_unlock(&page_list_mutex);
++	
++	return 0;
++}
++
++/*
++ * pmalloc_free - Free previously allocated memory
++ */
++static int pmalloc_free(void)
++{
++	mutex_lock(&page_list_mutex);
++	
++	if (!pages_allocated) {
++		printk(KERN_WARNING "pmalloc_exp: No pages to free. Allocate first with cmd=0 size=X\n");
++		mutex_unlock(&page_list_mutex);
++		return -EINVAL;
++	}
++	
++	printk(KERN_INFO "pmalloc_exp: Freeing all allocated pages...\n");
++	
++	/* Free all pages using pmalloc interface */
++	pmalloc_free_pages_with_info(&global_page_list);
++	
++	pages_allocated = false;
++	
++	printk(KERN_INFO "pmalloc_exp: All pages freed successfully\n");
++	
++	mutex_unlock(&page_list_mutex);
++	
++	return 0;
++}
++
++static int __init pmalloc_exp_init(void)
++{
++	int ret = 0;
++	
++	printk(KERN_INFO "pmalloc_exp: Module loaded with cmd=%d, size=%d\n", cmd, size);
++	
++	switch (cmd) {
++	case 0:
++		/* Allocate memory */
++		if (size <= 0) {
++			printk(KERN_ERR "pmalloc_exp: Invalid size=%d. Use: insmod exp.ko cmd=0 size=1024\n", size);
++			return -EINVAL;
++		}
++		ret = pmalloc_allocate(size);
++		if (ret) {
++			printk(KERN_ERR "pmalloc_exp: Allocation failed with error %d\n", ret);
++			return ret;
++		}
++		break;
++		
++	case 1:
++		/* Free memory */
++		ret = pmalloc_free();
++		if (ret) {
++			printk(KERN_ERR "pmalloc_exp: Free failed with error %d\n", ret);
++			return ret;
++		}
++		break;
++		
++	default:
++		printk(KERN_INFO "pmalloc_exp: Usage:\n");
++		printk(KERN_INFO "  Allocate: insmod exp.ko cmd=0 size=1024 [use_dma=0/1]\n");
++		printk(KERN_INFO "  Free:     insmod exp.ko cmd=1\n");
++		printk(KERN_INFO "  Current:  cmd=%d, size=%d, use_dma=%d\n", cmd, size, use_dma);
++		break;
++	}
++	
++	return 0;
++}
++
++static void __exit pmalloc_exp_exit(void)
++{
++	/* Clean up any remaining allocated pages on module exit */
++	if (pages_allocated) {
++		printk(KERN_INFO "pmalloc_exp: Cleanup: freeing remaining pages...\n");
++		pmalloc_free();
++	}
++	
++	printk(KERN_INFO "pmalloc_exp: Module unloaded\n");
++}
++
++module_init(pmalloc_exp_init);
++module_exit(pmalloc_exp_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("pmalloc test module");
++MODULE_DESCRIPTION("Test module for pmalloc interface with cmd/size parameters");
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 9669f1309..35b7e1f63 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3844,7 +3844,7 @@ EXPORT_SYMBOL_GPL(fs_reclaim_release);
+  * Zonelists may change due to hotplug during allocation. Detect when zonelists
+  * have been rebuilt so allocation retries. Reader side does not lock and
+  * retries the allocation if zonelist changes. Writer side is protected by the
+- * embedded spin_lock.
++ * embedded spinlock.
+  */
+ static DEFINE_SEQLOCK(zonelist_update_seq);
+ 
+@@ -5708,6 +5708,105 @@ void setup_pcp_cacheinfo(unsigned int cpu)
+ 		zone_pcp_update_cacheinfo(zone, cpu);
+ }
+ 
++/*
++ * pmalloc reserved memory buffer for page info structures
++ * This prevents deadlocks by avoiding kmalloc() while holding zone locks
++ */
++#define PMALLOC_MAX_INFO_STRUCTS 4096  /* Support up to 4096 concurrent allocations */
++
++static struct pmalloc_page_info pmalloc_info_buffer[PMALLOC_MAX_INFO_STRUCTS];
++static struct list_head pmalloc_free_info_list;
++static DEFINE_SPINLOCK(pmalloc_info_lock);
++static bool pmalloc_buffer_initialized = false;
++
++/*
++ * pmalloc_init_info_buffer - Initialize the reserved buffer for page info structures
++ * This should be called during memory system initialization
++ */
++static void __init pmalloc_init_info_buffer(void)
++{
++	int i;
++	
++	INIT_LIST_HEAD(&pmalloc_free_info_list);
++	
++	/* Add all structures to the free list */
++	for (i = 0; i < PMALLOC_MAX_INFO_STRUCTS; i++) {
++		INIT_LIST_HEAD(&pmalloc_info_buffer[i].list);
++		list_add(&pmalloc_info_buffer[i].list, &pmalloc_free_info_list);
++	}
++	
++	pmalloc_buffer_initialized = true;
++	
++	printk(KERN_INFO "pmalloc: Initialized reserved buffer with %d page info structures\n", 
++	       PMALLOC_MAX_INFO_STRUCTS);
++}
++
++/*
++ * pmalloc_alloc_info - Allocate a page info structure from reserved buffer
++ * Returns NULL if no structures available
++ */
++static struct pmalloc_page_info *pmalloc_alloc_info(void)
++{
++	struct pmalloc_page_info *info = NULL;
++	unsigned long flags;
++	
++	if (!pmalloc_buffer_initialized)
++		return NULL;
++		
++	spin_lock_irqsave(&pmalloc_info_lock, flags);
++	
++	if (!list_empty(&pmalloc_free_info_list)) {
++		info = list_first_entry(&pmalloc_free_info_list, 
++					 struct pmalloc_page_info, list);
++		list_del(&info->list);
++	}
++	
++	spin_unlock_irqrestore(&pmalloc_info_lock, flags);
++	
++	return info;
++}
++
++/*
++ * pmalloc_free_info - Return a page info structure to the reserved buffer
++ */
++static void pmalloc_free_info(struct pmalloc_page_info *info)
++{
++	unsigned long flags;
++	
++	if (!info || !pmalloc_buffer_initialized)
++		return;
++		
++	/* Clear the structure */
++	memset(info, 0, sizeof(*info));
++	INIT_LIST_HEAD(&info->list);
++	
++	spin_lock_irqsave(&pmalloc_info_lock, flags);
++	list_add(&info->list, &pmalloc_free_info_list);
++	spin_unlock_irqrestore(&pmalloc_info_lock, flags);
++}
++
++/*
++ * pmalloc_get_available_info_count - Get number of available info structures
++ */
++int pmalloc_get_available_info_count(void)
++{
++	struct pmalloc_page_info *info;
++	int count = 0;
++	unsigned long flags;
++	
++	if (!pmalloc_buffer_initialized)
++		return 0;
++		
++	spin_lock_irqsave(&pmalloc_info_lock, flags);
++	list_for_each_entry(info, &pmalloc_free_info_list, list) {
++		count++;
++	}
++	spin_unlock_irqrestore(&pmalloc_info_lock, flags);
++	
++	return count;
++}
++EXPORT_SYMBOL_GPL(pmalloc_get_available_info_count);
++
+ /*
+  * Allocate per cpu pagesets and initialize them.
+  * Before this call only boot pagesets were available.
+@@ -5738,6 +5837,9 @@ void __init setup_per_cpu_pageset(void)
+ 	for_each_online_pgdat(pgdat)
+ 		pgdat->per_cpu_nodestats =
+ 			alloc_percpu(struct per_cpu_nodestat);
++			
++	/* Initialize pmalloc reserved buffer */
++	pmalloc_init_info_buffer();
+ }
+ 
+ __meminit void zone_pcp_init(struct zone *zone)
+@@ -7024,3 +7126,215 @@ static bool __free_unaccepted(struct page *page)
+ }
+ 
+ #endif /* CONFIG_UNACCEPTED_MEMORY */
++
++
++
++/*
++ * pmalloc_get_pages_with_info - Allocate pages with order preservation and info
++ * @gfp: gfp_t flags for allocation
++ * @preferred_nid: preferred NUMA node
++ * @nodemask: nodemask for allowed nodes  
++ * @page_info_list: list to store pmalloc_page_info structures
++ * @target_size: target size in bytes to allocate
++ * @max_pages: maximum individual pages to allocate (0 = no limit)
++ * 
++ * This function allocates pages to meet the target size, prioritizing larger
++ * orders first. Instead of splitting large pages, it preserves them as compound
++ * pages and provides detailed information about each allocated block.
++ * 
++ * For example, to get 22MB:
++ * - Get 5 pages of order=10 (4MB each) = 20MB
++ * - Get 1 page of order=9 (2MB each) = 2MB  
++ * - Total = 22MB
++ * 
++ * Each page_info contains the original order, size, and virtual address
++ * for direct memory access.
++ * 
++ * Returns the total number of individual pages allocated.
++ */
++unsigned long pmalloc_get_pages_with_info(gfp_t gfp, int preferred_nid,
++				   nodemask_t *nodemask, 
++				   struct list_head *page_info_list,
++				   unsigned long target_size,
++				   unsigned long max_pages)
++{
++	struct zonelist *zonelist;
++	struct zoneref *z;
++	struct zone *zone;
++	unsigned long allocated_bytes = 0;
++	unsigned long total_pages = 0;
++	int order;
++	
++	if (!page_info_list)
++		return 0;
++		
++	INIT_LIST_HEAD(page_info_list);
++	
++	/* Use current node if preferred_nid not specified */
++	if (preferred_nid < 0)
++		preferred_nid = numa_node_id();
++		
++	/* Create zonelist that includes all zones including DMA */
++	zonelist = node_zonelist(preferred_nid, gfp | __GFP_DMA);
++	
++	/* Iterate through orders from highest to lowest (biggest first) */
++	for (order = NR_PAGE_ORDERS - 1; order >= 0 && allocated_bytes < target_size; order--) {
++        printk("order:%d\n", order);
++		unsigned long order_size = PAGE_SIZE << order;
++		unsigned long pages_for_order = 1UL << order;
++		
++		/* Skip if this order would exceed our target */
++		if (allocated_bytes + order_size > target_size && order > 0)
++			continue;
++			
++		/* Try to allocate from ALL zones including DMA zone */
++		for_each_zone_zonelist_nodemask(zone, z, zonelist, MAX_NR_ZONES - 1, nodemask) {
++			struct free_area *area = &zone->free_area[order];
++            printk("zone name:%s\n",zone->name);
++			struct page *page;
++			unsigned long flags;
++			int mt;
++			
++			if (allocated_bytes >= target_size)
++				break;
++				
++			if (max_pages && total_pages >= max_pages)
++				break;
++				
++			spin_lock_irqsave(&zone->lock, flags);
++			
++			/* Try different migration types: MOVABLE, UNMOVABLE, RECLAIMABLE */
++			for (mt = MIGRATE_MOVABLE; mt <= MIGRATE_RECLAIMABLE; mt++) {
++                printk("md:%d\n", mt);
++				/* Get pages from this order while available */
++				while (!list_empty(&area->free_list[mt]) && 
++				       allocated_bytes + order_size <= target_size) {
++				       
++				struct pmalloc_page_info *info;
++				
++				if (max_pages && total_pages >= max_pages)
++					break;
++					
++                printk("get page\n");
++				page = get_page_from_free_area(area, mt);
++				if (!page)
++					break;
++					
++                printk("1\n");
++				/* Remove from free list */
++				del_page_from_free_list(page, zone, order, mt);
++                printk("2\n");
++				
++				/* Create info structure for this allocation */
++				/* Get info structure from reserved buffer */
++				info = pmalloc_alloc_info();
++				if (!info) {
++					/* Put page back if we can't track it */
++					__add_to_free_list(page, zone, order, mt, false);
++					break;
++				}
++                printk("4\n");
++				
++				/* Initialize the page */
++				set_page_refcounted(page);
++				prep_compound_page(page, order);
++                printk("5\n");
++				
++				/* Fill in the info structure */
++				info->page = page;
++				info->order = order;
++				info->size_bytes = order_size;
++				info->virt_addr = page_address(page);
++				info->phys_addr = page_to_phys(page);
++				INIT_LIST_HEAD(&info->list);
++                printk("6\n");
++				
++				/* Add to our list */
++				list_add_tail(&info->list, page_info_list);
++				
++				allocated_bytes += order_size;
++				total_pages += pages_for_order;
++				
++                printk("7\n");
++				if (allocated_bytes >= target_size)
++					break;
++				}
++				
++				if (allocated_bytes >= target_size)
++					break;
++			}
++			
++                printk("8\n");
++			spin_unlock_irqrestore(&zone->lock, flags);
++                printk("9\n");
++		}
++	}
++	
++	return total_pages;
++}
++EXPORT_SYMBOL_GPL(pmalloc_get_pages_with_info);
++
++/*
++ * pmalloc_get_size_with_info - Simple interface to allocate specific size
++ * @size_mb: size in megabytes to allocate  
++ * @page_info_list: list to store pmalloc_page_info structures
++ * 
++ * Returns the total number of individual pages allocated.
++ */
++unsigned long pmalloc_get_size_with_info(unsigned long size_mb, 
++					  struct list_head *page_info_list)
++{
++	unsigned long target_size = size_mb * 1024 * 1024; /* Convert MB to bytes */
++	return pmalloc_get_pages_with_info(GFP_KERNEL | __GFP_DMA, -1, NULL, 
++					   page_info_list, target_size, 0);
++}
++EXPORT_SYMBOL_GPL(pmalloc_get_size_with_info);
++
++/*
++ * pmalloc_get_dma_pages - Specifically get pages from DMA zone
++ * @size_mb: size in megabytes to allocate  
++ * @page_info_list: list to store pmalloc_page_info structures
++ * 
++ * This function specifically targets DMA zone pages.
++ * Returns the total number of individual pages allocated.
++ */
++unsigned long pmalloc_get_dma_pages(unsigned long size_mb, 
++				     struct list_head *page_info_list)
++{
++	unsigned long target_size = size_mb * 1024 * 1024; /* Convert MB to bytes */
++	/* Force DMA allocation with GFP_DMA flag */
++	return pmalloc_get_pages_with_info(GFP_DMA, -1, NULL, 
++					   page_info_list, target_size, 0);
++}
++EXPORT_SYMBOL_GPL(pmalloc_get_dma_pages);
++
++/*
++ * pmalloc_free_pages_with_info - Free pages allocated with pmalloc_get_pages_with_info
++ * @page_info_list: list of pmalloc_page_info structures to free
++ * 
++ * This function properly frees all pages and cleans up the info structures.
++ */
++void pmalloc_free_pages_with_info(struct list_head *page_info_list)
++{
++	struct pmalloc_page_info *info, *tmp;
++	
++	if (!page_info_list)
++		return;
++		
++	list_for_each_entry_safe(info, tmp, page_info_list, list) {
++		if (info->page) {
++			/* Free the page back to the system */
++			__free_pages(info->page, info->order);
++		}
++		
++		/* Remove from list and return info structure to reserved buffer */
++		list_del(&info->list);
++		pmalloc_free_info(info);
++	}
++}
++EXPORT_SYMBOL_GPL(pmalloc_free_pages_with_info);
++
++
++
++
++
+-- 
+2.25.1
+
