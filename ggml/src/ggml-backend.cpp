@@ -23,6 +23,10 @@
 #include <vector>
 #include <algorithm>
 
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -1942,17 +1946,31 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 void* model_addr = NULL;
 size_t model_size = 0;
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
-
-    if (data == NULL) {
-        GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
-        return NULL;
-    }
-
+    void * data;
     if(size/1024/1024>400){
+        int memfd = open("/dev/mem", O_RDWR | O_SYNC);
+    	if (memfd == -1) {
+			GGML_LOG_ERROR("open memfd failed:%d\n",memfd);
+			return NULL;
+    	}
+        data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0xe3e00000);
+		if (data == MAP_FAILED){
+			GGML_LOG_ERROR("mmap failed:%d\n", data);
+			close(memfd);
+			return NULL;
+		}
+        GGML_LOG_INFO("mmap success\n");
         model_addr = data;
         model_size = size;
+		close(memfd);
+    } else{
+        data = ggml_aligned_malloc(size);
+        if (data == NULL) {
+            GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
+            return NULL;
+        }
     }
+
 
     return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
 }

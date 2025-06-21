@@ -914,10 +914,13 @@ int main(int argc, char ** argv) {
                 LOG("model addr:%lx madvise addr:%lx, size:%ld\n", model_addr, start_addr, madvise_size);
 
                 if (layer != 255) {
+                    /*
                     int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
 				    if (m_ret){
 					    LOG("madvise failed:%d %s\n", m_ret, strerror(errno));
 				    }
+                    */
+                    memset((void*)start_addr, 0,madvise_size);
                 }
 
                 std::string line;
@@ -928,10 +931,12 @@ int main(int argc, char ** argv) {
                 } while (another_line);
 
                 if (layer != 255) {
+                    /*
                     int m_ret = madvise((void*)start_addr,madvise_size,MADV_WILLNEED);
 				    if (m_ret){
 					    LOG("madvise failed:%d\n", m_ret);
 				    }
+                    */
                 }
                 auto reload_s = ggml_time_us();
                 if (layer !=255)
