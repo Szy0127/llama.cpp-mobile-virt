@@ -1953,7 +1953,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
 			GGML_LOG_ERROR("open memfd failed:%d\n",memfd);
 			return NULL;
     	}
-        data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0xa9450000);
+        data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0xa9400000);
 		if (data == MAP_FAILED){
 			GGML_LOG_ERROR("mmap failed:%d\n", data);
 			close(memfd);
