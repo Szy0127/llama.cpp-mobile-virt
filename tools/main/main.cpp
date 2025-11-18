@@ -920,7 +920,7 @@ int main(int argc, char ** argv) {
 					    LOG("madvise failed:%d %s\n", m_ret, strerror(errno));
 				    }
                     */
-                    memset((void*)start_addr, 0,madvise_size);
+                    //memset((void*)start_addr, 0,madvise_size);
                 }
 
                 std::string line;
@@ -943,9 +943,9 @@ int main(int argc, char ** argv) {
                 if ( layer == 254 ) {
                     sync_reload_all();
                 } else {
-                    std::thread t(async_reload, layer2index[layer]);
+                    //std::thread t(async_reload, layer2index[layer]);
                     //async_reload(layer);
-                    t.detach();
+                    //t.detach();
                 }
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);

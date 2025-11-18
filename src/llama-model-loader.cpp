@@ -977,7 +977,7 @@ void async_reload(int tensor_index)
             cb->aio_buf = (__u64)cur->data;
             to_submit++;
             g_finish_flags[index].store(true, std::memory_order_release);
-            //cur->need_wait = 1;
+            cur->need_wait = 1;
 #ifdef ENC_MODEL
             cb->aio_sigevent.sigev_notify=SIGEV_THREAD;
             cb->aio_sigevent.sigev_notify_function=aio_completion_handler;
@@ -1014,12 +1014,12 @@ void async_reload(int tensor_index)
             }else{
                 int tensor_idx = (int)(events[j].data);
                 g_finish_flags[tensor_idx].store(false, std::memory_order_release);
-                LLAMA_LOG_INFO("finish %d\n", tensor_idx);
+                //LLAMA_LOG_INFO("finish %d\n", tensor_idx);
             }
         }
-        LLAMA_LOG_INFO("io finish:%d\n", num_events);
+        //LLAMA_LOG_INFO("io finish:%d\n", num_events);
         total += num_events;
-        LLAMA_LOG_INFO("%d %d\n", total, to_submit);
+        //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
         if (total >= to_submit)break;
     }
     LLAMA_LOG_INFO("finish aio\n");
