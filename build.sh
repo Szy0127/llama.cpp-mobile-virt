@@ -3,7 +3,7 @@
 #CXX=g++-12-aarch64-linux-gnu
 cmake -Bbuild -H. \
     -DCMAKE_TOOLCHAIN_FILE=./aarch64-toolchain.cmake\
-    -DCMAKE_BUILD_TYPE=Debug\
+    -DCMAKE_BUILD_TYPE=Release\
     -DGGML_STATIC=ON \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_NATIVE=OFF \
@@ -16,4 +16,4 @@ cmake -Bbuild -H. \
 
 
 
-cmake --build build -j20
+cmake --build build -j20 --target llama-cli

@@ -916,7 +916,7 @@ uint8_t nonce[] = {
 //TODO bug if encrypt last tensor
 #endif
 
-#define N_TENSOR 291
+#define N_TENSOR 435
 struct ggml_context *g_ctx;
 
 #ifdef ENC_MODEL
@@ -954,7 +954,8 @@ void async_reload(int tensor_index)
 {
 
     LLAMA_LOG_INFO("async reload\n");
-    int fd = open(model_fname.c_str(), O_RDONLY | O_DIRECT);
+    int fd = open(model_fname.c_str(), O_RDONLY );
+    //int fd = open(model_fname.c_str(), O_RDONLY | O_DIRECT);
     int to_submit = 0;
     struct ggml_context *ctx = g_ctx;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -971,11 +972,12 @@ void async_reload(int tensor_index)
             cb->aio_lio_opcode = IOCB_CMD_PREAD;
             cb->aio_fildes = fd;    
             cb->aio_nbytes = n_size;
-            cb->aio_offset = (cur->weight_offs+511)&~511;
+            //cb->aio_offset = (cur->weight_offs+511)&~511;
+            cb->aio_offset = cur->weight_offs;
             cb->aio_buf = (__u64)cur->data;
             to_submit++;
             g_finish_flags[index].store(true, std::memory_order_release);
-            cur->need_wait = 1;
+            //cur->need_wait = 1;
 #ifdef ENC_MODEL
             cb->aio_sigevent.sigev_notify=SIGEV_THREAD;
             cb->aio_sigevent.sigev_notify_function=aio_completion_handler;
@@ -1012,14 +1014,15 @@ void async_reload(int tensor_index)
             }else{
                 int tensor_idx = (int)(events[j].data);
                 g_finish_flags[tensor_idx].store(false, std::memory_order_release);
+                LLAMA_LOG_INFO("finish %d\n", tensor_idx);
             }
         }
-        //LLAMA_LOG_INFO("io finish:%d\n", num_events);
+        LLAMA_LOG_INFO("io finish:%d\n", num_events);
         total += num_events;
-        //LLAMA_LOG_INFO("%d %d\n", total, to_submit);
+        LLAMA_LOG_INFO("%d %d\n", total, to_submit);
         if (total >= to_submit)break;
     }
-    //LLAMA_LOG_INFO("finish aio\n");
+    LLAMA_LOG_INFO("finish aio\n");
     
 
 }

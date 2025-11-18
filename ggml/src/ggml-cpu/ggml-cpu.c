@@ -2846,6 +2846,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+        //GGML_LOG_INFO("compute\n");
         //uint64_t wait_total = 0;
         /*
         if (node->src[0] && node->src[0]->data > model_addr)
@@ -2855,7 +2856,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
             //uint64_t wait_start = ggml_time_us();
             int idx = node->src[0]->index;
-            //GGML_LOG_INFO("wait %d\n", idx);
+            GGML_LOG_INFO("wait %d\n", idx);
             while(atomic_load(&g_finish_flags[idx]));
             node->src[0]->need_wait = 0;
             //GGML_LOG_INFO("wait %d finish\n", idx);
@@ -2869,7 +2870,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node->src[1] && node->src[1]->need_wait){
             //uint64_t wait_start = ggml_time_us();
             int idx = node->src[1]->index;
-            //GGML_LOG_INFO("wait %d\n", idx);
+            GGML_LOG_INFO("wait %d\n", idx);
             while(atomic_load(&g_finish_flags[idx]));
             node->src[1]->need_wait = 0;
             //GGML_LOG_INFO("wait %d finish\n", idx);
