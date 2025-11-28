@@ -916,7 +916,7 @@ uint8_t nonce[] = {
 //TODO bug if encrypt last tensor
 #endif
 
-#define N_TENSOR 435
+#define N_TENSOR 434
 struct ggml_context *g_ctx;
 
 #ifdef ENC_MODEL

@@ -34,6 +34,7 @@ for i, tensor in enumerate(reader.tensors):
     #print(f"  Data offset: {tensor.data.offset}")
     #print(f"  Data offset: {tensor.data_offset}")
     #print(f"  Data size (bytes): {tensor.data.nbytes}")
+    #print(f"offset:{tensor.data_offset} size:{tensor.data.nbytes} {tensor.name}")
     print(f"offset:{tensor.data_offset} size:{tensor.data.nbytes}")
     size += tensor.data.nbytes
     last_size = tensor.data.nbytes

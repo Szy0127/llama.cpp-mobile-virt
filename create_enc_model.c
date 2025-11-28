@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
     int count = 0;
     char line[MAX_LINE_LENGTH];
 
-    while (fgets(line, sizeof(line), fp_offset)&& count < 291) {
+    while (fgets(line, sizeof(line), fp_offset)&& count < 435) {
         char *offset_str = strstr(line, "offset:");
         if (!offset_str) offset_str = strstr(line, ".offset:");
         if (offset_str) {
@@ -83,9 +83,11 @@ int main(int argc, char *argv[]) {
         unsigned long offset = blocks[i].offset;
         unsigned long size = blocks[i].size;
         printf("%ld %ld\n", offset,size);
+        /*
         if (i == 0){
             pad = ALIGN(offset) - offset;
         }
+        */
 
         if (fseek(fp_input, offset, SEEK_SET) != 0) {
             perror("Failed to seek input file");

@@ -1947,7 +1947,7 @@ void* model_addr = NULL;
 size_t model_size = 0;
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * data;
-    if(size/1024/1024>=1899){
+    if(size == 1736671232){
         int memfd = open("/dev/mem", O_RDWR);
     	if (memfd == -1) {
 			GGML_LOG_ERROR("open memfd failed:%d\n",memfd);
