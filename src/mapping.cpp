@@ -9,7 +9,6 @@
 #include <optional>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <atomic>
 #include "interface.h"
@@ -17,17 +16,10 @@
 #define ROUND_UP(x, n)   (((x) + (n)-1) & ~((n)-1))
 #define PAGE_SIZE 0x1000
 
-#define DEVICE_NAME "/dev/tc_ns_client"
-#define TC_NS_CLIENT_IOC_MAGIC  't'
-#define LLM_CLIENT_IOCTL_PUSH_PAGES \
-	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 25, unsigned long)
-#define LLM_CLIENT_IOCTL_POP_PAGES \
-	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 26, unsigned long)
-#define LLM_CLIENT_IOCTL_SET_PAGES \
-	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 27, int)
-
 cma_region::cma_region(int tzd_fd, size_t size, std::function<void(void)> destructor)
-    : done(false), len(size), destructor(destructor), tzd_fd(tzd_fd) {}
+    : done(false), len(size), destructor(destructor) {
+    (void) tzd_fd; // No longer used, kept for API compatibility
+}
 
 std::atomic<int64_t> cma_time;
 
@@ -37,24 +29,9 @@ void cma_region::ready(void) {
     auto start = get_micro();
 #endif
 
-    int ret;
-    ret = ioctl(tzd_fd, LLM_CLIENT_IOCTL_PUSH_PAGES, &len);
-    if (ret < 0) {
-        printf("%s %d err %d\n", __func__, __LINE__, errno);
-    }
-    GGML_ASSERT(ret >= 0);
-
-    int index = ret;
-    ret = ioctl(tzd_fd, LLM_CLIENT_IOCTL_SET_PAGES, &index);
-    if (ret < 0) {
-        printf("%s %d err %d\n", __func__, __LINE__, errno);
-    }
-    GGML_ASSERT(ret >= 0);
-
-    addr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, tzd_fd, 0);
-    GGML_ASSERT(addr);
-
-    // addr = malloc(len);
+    // Simple memory allocation using anonymous mmap
+    addr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    GGML_ASSERT(addr != MAP_FAILED);
 
     done = true;
 
@@ -64,25 +41,23 @@ void cma_region::ready(void) {
 }
 
 cma_region::~cma_region() {
-    munmap(addr, len);
-    int ret = ioctl(tzd_fd, LLM_CLIENT_IOCTL_PUSH_PAGES, &len);
-    if (ret < 0) {
-        printf("%s %d err %d\n", __func__, __LINE__, errno);
+    if (addr) {
+        munmap(addr, len);
     }
-    GGML_ASSERT(ret >= 0);
     destructor();
 }
 
 mappings::mappings(void) {
-    const char *path = "/dev/dma_heap/reserved";
-    fd = open(path, O_RDWR);
-    GGML_ASSERT(fd > 0);
+    // No device needed, fd is not used anymore
+    fd = -1;
 }
 
 mappings::~mappings(void) {
     while (!tensors.empty())
         tensors.pop_back();
-    close(fd);
+    if (fd >= 0) {
+        close(fd);
+    }
 }
 
 void mappings::push(size_t offset, size_t size, std::function<void(void)> destructor) {

@@ -29,7 +29,6 @@ list(APPEND LLAMA_SOURCE_FILES
     pipeline.cpp
     layer-sched.cpp
     io-stage.cpp
-    decrypt-stage.cpp
 )
 
 if (LLAMA_CHCORE_API)
@@ -72,11 +71,11 @@ list(APPEND LLAMA_INCLUDE_DIR
     /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/include
 )
     #/home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so
+    #/home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libcrypto.so.3
+    #/home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libssl.so.3
+    #/home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
 list(APPEND LLAMA_LINK_DIR
     /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Android/librknn_api/arm64-v8a/librknnrt.so
-    /home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libcrypto.so.3
-    /home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libssl.so.3
-    /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
 )
 endif()
 

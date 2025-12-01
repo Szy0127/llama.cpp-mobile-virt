@@ -3,7 +3,6 @@
 
 void Pipeline::rollback(void)
 {
-    decrypt->rollback();
     io->rollback();
     alloc->rollback();
     current_stage = alloc;
@@ -21,10 +20,7 @@ void Pipeline::finish_stage(void)
         io->start(alloc->get_msg());
         current_stage = io;
     } else if (std::dynamic_pointer_cast<IOStage>(current_stage)) {
-        decrypt->start(io->get_msg());
-        current_stage = decrypt;
-    } else if (std::dynamic_pointer_cast<DecryptStage>(current_stage)) {
-        final_msg = decrypt->get_msg();
+        final_msg = io->get_msg();
         current_stage = nullptr;
     } else {
         GGML_ASSERT(false);

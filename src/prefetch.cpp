@@ -117,16 +117,12 @@ void sched_step(void) {
 #endif
 }
 
-extern std::atomic<int64_t> decrypt_time;
-extern std::atomic<size_t> decrypt_size;
 extern std::atomic<int64_t> cma_time;
 extern std::atomic<size_t> cma_size;
 extern std::atomic<int64_t> io_time;
 extern std::atomic<size_t> io_size;
 
 void clear_measure(void) {
-    decrypt_time = 0;
-    decrypt_size = 0;
     cma_time = 0;
     cma_size = 0;
     io_time = 0;
@@ -136,8 +132,6 @@ void clear_measure(void) {
 }
 
 void dump_measure(void) {
-    printf("decrypt time %d ms\n", decrypt_time / 1000);
-    printf("decrypt size %d MB\n", decrypt_size / 1024 / 1024);
     printf("cma time %d ms\n", cma_time / 1000);
     printf("cma size %d MB\n", cma_size / 1024 / 1024);
     printf("io time %d ms\n", io_time / 1000);
@@ -179,7 +173,6 @@ void register_param_tensor(
     auto pipeline = std::make_shared<Pipeline>(
         std::make_shared<AllocStage>(off, len),
         std::make_shared<IOStage>(off, len),
-        std::make_shared<DecryptStage>(len),
         (void *)((int64_t)layer << 32 | (cnt++))
     );
     // printf("%s %d: %s %p\n", __func__, __LINE__, tensor->name, pipeline->get_sched_info());

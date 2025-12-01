@@ -14,8 +14,6 @@ struct cma_region {
     size_t len;
     std::function<void(void)> destructor;
 
-    int tzd_fd;
-
     cma_region(int tzd_fd, size_t size, std::function<void(void)> destructor);
     void ready(void);
     ~cma_region();

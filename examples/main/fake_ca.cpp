@@ -130,6 +130,7 @@ int main(int argc, char *argv[]) {
     } else if (model_string == "llama") {
         io_model_path = "/data/ssd/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
     } else {
+        io_model_path = "/data/data/com.termux/files/home/qwen2.5-3b-instruct-q4_0.gguf";
         GGML_ABORT("invalid model %s\n", model);
     }
 

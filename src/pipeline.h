@@ -38,7 +38,6 @@ private:
     size_t size;
     void *addr;
     alloc_io_msg msg;
-    int tzd_fd;
 
     std::mutex submit_pos_mtx;
     size_t submit_pos;
@@ -85,29 +84,10 @@ public:
 
 };
 
-class DecryptStage : public Stage {
-private:
-    void *buf;
-    size_t size;
-    int block_nr;
-    std::atomic<int> finished_nr;
-    size_t submit_pos;
-
-public:
-    DecryptStage(size_t size);
-    void start(void *input) override;
-    std::pair<std::shared_ptr<Task>, bool> get_task(void *) override;
-    bool submit(std::shared_ptr<Task> task) override;
-    void *get_msg(void) override;
-    void rollback(void) override;
-
-};
-
 class Pipeline : public std::enable_shared_from_this<Pipeline> {
 private:
     std::shared_ptr<AllocStage> alloc;
     std::shared_ptr<IOStage> io;
-    std::shared_ptr<DecryptStage> decrypt;
     void *sched_info;
     std::shared_ptr<Stage> current_stage;
     void *final_msg;
@@ -116,9 +96,8 @@ public:
     Pipeline(
         std::shared_ptr<AllocStage> alloc,
         std::shared_ptr<IOStage> io,
-        std::shared_ptr<DecryptStage> decrypt,
         void *sched_info
-    ) : alloc(alloc), io(io), decrypt(decrypt), sched_info(sched_info), current_stage(alloc) {}
+    ) : alloc(alloc), io(io), sched_info(sched_info), current_stage(alloc) {}
 
     void rollback(void);
     std::shared_ptr<Stage> get_current_stage(void);
@@ -148,7 +127,7 @@ class LayerScheduler : public Scheduler {
     typedef std::priority_queue<std::shared_ptr<Pipeline>, std::vector<std::shared_ptr<Pipeline>>, pipeline_cmp> layer_queue_t;
 
 private:
-    layer_queue_t alloc, io, decrypt;
+    layer_queue_t alloc, io;
     std::mutex lock;
 
 public:

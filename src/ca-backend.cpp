@@ -3,23 +3,18 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <cstring>
 #include <thread>
 #include <mutex>
 #include "interface.h"
 
-static int tzd_fd;
 static int shm_fd;
 static std::once_flag once_flag;
 static all_ring_buffer *task_queues;
 
-#define DEVICE_NAME "/dev/tc_ns_client"
-
 void ca_backend_init(const char *io_model_path) {
-    tzd_fd = open(DEVICE_NAME, O_RDWR);
-    GGML_ASSERT(tzd_fd >= 0);
-    void *addr = mmap(NULL, CMD_QUEUE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tzd_fd, 0);
+    // Use anonymous shared memory instead of device
+    void *addr = mmap(NULL, CMD_QUEUE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     GGML_ASSERT(addr != MAP_FAILED);
     task_queues = (struct all_ring_buffer *)addr;
     task_queues->init();

@@ -76,8 +76,6 @@ if (!is_strawman) {
                     break;
                 }
             }
-            res = get_task(decrypt, NULL);
-            if (res.first) break;
             GGML_ASSERT(main_tid != -1);
 #ifdef LLAMA_USE_CHCORE_API
             res = get_task(alloc, (void *)(long)get_cma_index());
@@ -141,9 +139,6 @@ if (!is_strawman) {
                 is_io = true;
                 break;
             }
-            
-            res = get_task(decrypt, NULL);
-            if (res.first) break;
             return false;
         }
     }
@@ -176,8 +171,6 @@ void LayerScheduler::enqueue(std::shared_ptr<Pipeline> pipeline)
         alloc.push(pipeline);
     } else if (std::dynamic_pointer_cast<IOStage>(current_stage)) {
         io.push(pipeline);
-    } else if (std::dynamic_pointer_cast<DecryptStage>(current_stage)) {
-        decrypt.push(pipeline);
     } else {
         GGML_ASSERT(false);
     }

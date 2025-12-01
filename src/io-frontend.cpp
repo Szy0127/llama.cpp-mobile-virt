@@ -11,8 +11,9 @@
 #include <memory>
 #include "pipeline.h"
 #include <mutex>
-
-#define DEVICE_NAME "/dev/tc_ns_client"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 #define ROUND_UP(x, n)   (((x) + (n)-1) & ~((n)-1))
 #define ROUND_DOWN(x, n) ((x) & ~((n)-1))
@@ -33,11 +34,18 @@ static void init(void)
 #else
 static void init(void)
 {
-    int tzd_fd = open(DEVICE_NAME, O_RDWR);
-    GGML_ASSERT(tzd_fd >= 0);
-    void *addr = mmap(NULL, CMD_QUEUE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tzd_fd, 0);
-    GGML_ASSERT(addr != MAP_FAILED);
-    task_queue = (struct all_ring_buffer *)addr;
+    // Use anonymous shared memory instead of device
+    static all_ring_buffer static_task_queue;
+    void *addr = mmap(NULL, CMD_QUEUE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        fprintf(stderr, "Failed to mmap anonymous memory: %s (errno=%d)\n", strerror(errno), errno);
+        perror("mmap");
+        // Fallback to static allocation
+        task_queue = &static_task_queue;
+    } else {
+        task_queue = (struct all_ring_buffer *)addr;
+    }
+    task_queue->init();
 }
 #endif
 
