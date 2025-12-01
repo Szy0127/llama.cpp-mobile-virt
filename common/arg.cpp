@@ -413,7 +413,7 @@ void parse_prompt(gpt_params & params, const std::string & value) {
         } else if (model == "llama") {
             params.io_model_path = "/data/ssd/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
         } else {
-            GGML_ABORT("invalid prompt %s\n", value);
+            GGML_ABORT("invalid prompt %s\n", value.c_str());
         }
         
         GGML_ASSERT(len >= 0);
@@ -589,10 +589,10 @@ out:
                 GGML_ABORT("invalid len %d", len);
             }
         } else {
-            GGML_ABORT("invalid prompt %s\n", value);
+            GGML_ABORT("invalid prompt %s\n", value.c_str());
         }
     } else {
-        GGML_ABORT("invalid prompt %s\n", value);
+        GGML_ABORT("invalid prompt %s\n", value.c_str());
     }
     {
         // tinyllama-1.1b-chat-v1.0.Q8_0

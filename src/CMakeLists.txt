@@ -66,12 +66,14 @@ list(APPEND LLAMA_LINK_DIR
     /home/vectorxj/openssl/openssl-3.4.1/install/lib/libssl.so.3
 )
 else()
+    #/home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/include
 list(APPEND LLAMA_INCLUDE_DIR
-    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/include
+    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Android/librknn_api/include
     /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/include
 )
+    #/home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so
 list(APPEND LLAMA_LINK_DIR
-    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so
+    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Android/librknn_api/arm64-v8a/librknnrt.so
     /home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libcrypto.so.3
     /home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libssl.so.3
     /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
