@@ -165,6 +165,7 @@ void io_init(const char *model_path) {
 
 static void write_measurement(const io_task &task) {
     // Use POSIX shared memory object under /dev/shm
+    /*
     const char *shm_name = "/current_measure";  // results in /dev/shm/current_measure
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
@@ -178,13 +179,15 @@ static void write_measurement(const io_task &task) {
         close(fd);
         return;
     }
+    */
 
     // Overwrite with the latest measurement (no append)
     // Exact format requested by user
-    fprintf(fp, "ttft: %.2f\ndecoding_thpt: %.2f\n", task.ttft, task.decoding_thpt);
-    fflush(fp);
-    fsync(fd);
-    fclose(fp); // also closes fd
+    //fprintf(fp, "ttft: %.2f\ndecoding_thpt: %.2f\n", task.ttft, task.decoding_thpt);
+    printf("ttft: %.2f\ndecoding_thpt: %.2f\n", task.ttft, task.decoding_thpt);
+    //fflush(fp);
+    //fsync(fd);
+    //fclose(fp); // also closes fd
 }
 
 void io_step(all_ring_buffer *task_queue) {

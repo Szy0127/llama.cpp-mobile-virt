@@ -871,7 +871,7 @@ struct rknn_mem {
     uint64_t dma, obj;
     uint64_t handle;
     float scale;
-    pthread_spinlock_t scale_lock;
+    pthread_mutex_t scale_lock;
 
     std::atomic<int> pre_scale_cnt;
     std::atomic<int> pre1_cnt;
@@ -887,7 +887,7 @@ struct rknn_mem {
 #endif
         GGML_ASSERT(dma_ptr);
         scale = 1.0;
-        pthread_spin_init(&scale_lock, 0);
+        pthread_mutex_init(&scale_lock, 0);
     }
     ~rknn_mem(void) {
 #ifdef FAKE_CACHE
@@ -897,9 +897,9 @@ struct rknn_mem {
     }
     void init_scale(void) { scale = SCALE_MIN; }
     void commit_scale(float _scale) {
-        pthread_spin_lock(&scale_lock);
+        pthread_mutex_lock(&scale_lock);
         scale = std::max(scale, _scale);
-        pthread_spin_unlock(&scale_lock);
+        pthread_mutex_unlock(&scale_lock);
     }
     void reset_cnt(void) {
         pre_scale_cnt = 0;
@@ -1461,7 +1461,7 @@ void npu_worker(int tid) {
     CPU_ZERO(&cpuset);
     CPU_SET(tid + 4, &cpuset);
     printf("npu worker: bind to core %d\n", tid + 4);
-    GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0);
+    //GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0);
 #else
     usys_set_prio(0, 54);
 #endif

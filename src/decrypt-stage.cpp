@@ -3,6 +3,7 @@
 #include "interface.h"
 #include <atomic>
 #include <cstring>
+#include <algorithm>
 #include <openssl/evp.h>
 #include <openssl/aes.h>
 
@@ -140,7 +141,10 @@ void DecryptStage::start(void *input)
 std::pair<std::shared_ptr<Task>, bool> DecryptStage::get_task(void *)
 {
     GGML_ASSERT(submit_pos < size);
-    auto task = std::make_shared<DecryptTask>(buf + submit_pos, std::min(BLOCK_SIZE, size - submit_pos));
+    auto task = std::make_shared<DecryptTask>(
+        static_cast<unsigned char *>(buf) + submit_pos,
+        std::min(static_cast<size_t>(BLOCK_SIZE), size - submit_pos)
+    );
     submit_pos += BLOCK_SIZE;
     return { task, submit_pos >= size };
 }

@@ -62,7 +62,7 @@ bool IOStage::submit(std::shared_ptr<Task> task)
 void *IOStage::get_msg(void)
 {
     GGML_ASSERT(buf);
-    id_msg.buf = buf + off - io_align_down(off);
+    id_msg.buf = static_cast<unsigned char *>(buf) + off - io_align_down(off);
     return &id_msg;
 }
 

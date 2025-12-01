@@ -81,27 +81,27 @@ endif()
 target_include_directories(llama PUBLIC ${LLAMA_INCLUDE_DIR})
 target_link_libraries(llama PUBLIC ${LLAMA_LINK_DIR})
 
-if (NOT LLAMA_CHCORE_API)
-add_library(
-    remoting_backend
-    interface.h
-    io.h
-    io-backend.cpp
-    ca-backend.cpp
-)
-target_compile_features(remoting_backend PUBLIC cxx_std_17)
-target_include_directories(
-    remoting_backend
-    PUBLIC
-    /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/include
-    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/include
-)
-target_link_libraries(
-    remoting_backend
-    PUBLIC
-    /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
-)
-endif()
+#if (NOT LLAMA_CHCORE_API)
+#add_library(
+#    #remoting_backend
+#    interface.h
+#    io.h
+#    io-backend.cpp
+#    ca-backend.cpp
+#)
+##target_compile_features(remoting_backend PUBLIC cxx_std_17)
+#target_include_directories(
+#    remoting_backend
+#    PUBLIC
+#    /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/include
+#    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Linux/librknn_api/include
+#)
+#target_link_libraries(
+#    remoting_backend
+#    PUBLIC
+#    /home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
+#)
+#endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

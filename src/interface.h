@@ -170,6 +170,7 @@ static inline int64_t get_micro(void) {
 
 static_assert(sizeof(all_ring_buffer) <= CMD_QUEUE_SHM_SIZE, "sizeof(all_ring_buffer) > CMD_QUEUE_SHM_SIZE");
 
+/*
 static inline void *shm_client(const char *shm_name, size_t shm_size) {
     int shm_fd = shm_open(shm_name, O_RDWR, 0666);
     GGML_ASSERT(shm_fd != -1);
@@ -187,3 +188,4 @@ static inline void *shm_server(const char *shm_name, size_t shm_size) {
     GGML_ASSERT(ptr != MAP_FAILED);
     return ptr;
 }
+*/

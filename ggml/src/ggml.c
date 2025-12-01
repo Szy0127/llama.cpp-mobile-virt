@@ -20290,7 +20290,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(4, &cpuset);
-    GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0);
+    //GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0);
     printf("bind to core %d\n", 4);
 #endif
 #endif
@@ -20305,7 +20305,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         CPU_ZERO(&cpuset);
         CPU_SET(j + 4, &cpuset);
         printf("bind to core %d\n", j + 4);
-        GGML_ASSERT(pthread_setaffinity_np(workers[j].thrd, sizeof(cpuset), &cpuset) == 0);
+        //GGML_ASSERT(pthread_setaffinity_np(workers[j].thrd, sizeof(cpuset), &cpuset) == 0);
 #endif
 #endif
     }
