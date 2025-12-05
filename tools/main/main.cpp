@@ -939,13 +939,11 @@ int main(int argc, char ** argv) {
                     */
                 }
                 auto reload_s = ggml_time_us();
-                if (layer !=255)
-                if ( layer == 254 ) {
-                    sync_reload_all();
-                } else {
-                    //std::thread t(async_reload, layer2index[layer]);
-                    //async_reload(layer);
-                    //t.detach();
+                if (buffer.size() > 3 && buffer.substr(0, 2) == "##") {
+                    std::thread t(async_reload, 0);
+                    // async_reload(layer);
+                    t.detach();
+                    buffer = buffer.substr(2, buffer.size() - 2);
                 }
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);
