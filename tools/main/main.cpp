@@ -88,8 +88,96 @@ static void sigint_handler(int signo) {
 #define END_TOKEN 151645
 extern void* model_addr;
 extern size_t model_size;
-extern void async_reload(int layer);
+extern void async_reload(int tensor_index);
 extern void sync_reload_all();
+
+// Tensor info structures for memory management
+struct TensorInfo {
+    uint64_t offset;
+    size_t size;
+};
+
+static std::vector<TensorInfo> g_tensor_infos;
+static std::vector<uint64_t> g_reverse_prefix_sums; // Cumulative sizes from the end
+
+// Load and parse tensor_info file
+static bool load_tensor_info(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        LOG_ERR("Failed to open tensor_info file: %s\n", path.c_str());
+        return false;
+    }
+
+    g_tensor_infos.clear();
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        // Parse format: "offset:XXXXX size:YYYYY"
+        size_t offset_pos = line.find("offset:");
+        size_t size_pos = line.find(" size:");
+        
+        if (offset_pos == std::string::npos || size_pos == std::string::npos) {
+            LOG_WRN("Invalid tensor_info line: %s\n", line.c_str());
+            continue;
+        }
+        
+        TensorInfo info;
+        try {
+            info.offset = std::stoull(line.substr(offset_pos + 7, size_pos - offset_pos - 7));
+            info.size = std::stoull(line.substr(size_pos + 6));
+            g_tensor_infos.push_back(info);
+        } catch (const std::exception& e) {
+            LOG_WRN("Failed to parse tensor_info line: %s\n", line.c_str());
+            continue;
+        }
+    }
+    
+    // Build reverse prefix sum array (from the end)
+    if (g_tensor_infos.empty()) {
+        LOG_ERR("No valid tensor info loaded\n");
+        return false;
+    }
+    
+    g_reverse_prefix_sums.resize(g_tensor_infos.size());
+    uint64_t cumulative_size = 0;
+    for (int i = g_tensor_infos.size() - 1; i >= 0; --i) {
+        cumulative_size += g_tensor_infos[i].size;
+        g_reverse_prefix_sums[i] = cumulative_size;
+    }
+    
+    LOG_INF("Loaded %zu tensors from tensor_info\n", g_tensor_infos.size());
+    return true;
+}
+
+// Find tensor index from MB (returns the first tensor index that needs to be reloaded)
+// Returns -1 if MB is invalid or 0 (no reload needed), returns 0 if all tensors need to be reloaded
+static int find_tensor_index_from_mb(int mb) {
+    if (mb < 0 || mb > 10000) {
+        return -1;
+    }
+    if (mb == 0) {
+        return -1; // No reload needed
+    }
+    
+    if (g_tensor_infos.empty() || g_reverse_prefix_sums.empty()) {
+        LOG_ERR("Tensor info not loaded\n");
+        return -1;
+    }
+    
+    uint64_t target_bytes = static_cast<uint64_t>(mb) * 1024ULL * 1024ULL;
+    
+    // Find the first tensor index where cumulative size from end >= target_bytes
+    // We need to find the smallest index i such that reverse_prefix_sums[i] >= target_bytes
+    for (size_t i = 0; i < g_reverse_prefix_sums.size(); ++i) {
+        if (g_reverse_prefix_sums[i] >= target_bytes && g_reverse_prefix_sums[i+1] < target_bytes) {
+            return static_cast<int>(i);
+        }
+    }
+    
+    // If target_bytes is larger than total size, reload from index 0
+    return 0;
+}
 
 uint64_t layer_offsets[24]={
 0x0,
@@ -183,6 +271,11 @@ int main(int argc, char ** argv) {
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
         return 1;
+    }
+
+    // Load tensor_info file for memory management
+    if (!load_tensor_info("tensor_info")) {
+        LOG_WRN("%s: warning: failed to load tensor_info, memory-based reload will not work\n", __func__);
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -598,8 +691,12 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+
+    auto load_begin = ggml_time_us();
     std::thread t(async_reload, 0);
-    t.detach();
+    t.join();
+    auto load_end = ggml_time_us();
+    LOG("load and decrypt cost:%ld\n", load_end - load_begin);
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -940,10 +1037,40 @@ int main(int argc, char ** argv) {
                 }
                 auto reload_s = ggml_time_us();
                 if (buffer.size() > 3 && buffer.substr(0, 2) == "##") {
-                    std::thread t(async_reload, 0);
-                    // async_reload(layer);
-                    t.detach();
-                    buffer = buffer.substr(2, buffer.size() - 2);
+                    // Find the closing "##"
+                    size_t end_pos = buffer.find("##", 2);
+                    if (end_pos != std::string::npos && end_pos > 2) {
+                        // Extract the number between "##" and "##"
+                        std::string number_str = buffer.substr(2, end_pos - 2);
+                        try {
+                            int mb = std::stoi(number_str);
+                            if (mb >= 0 && mb <= 10000) {
+                                if (mb == 0) {
+                                    // No reload needed for 0 MB
+                                    LOG("MB value is 0, skipping reload\n");
+                                } else {
+                                    // Find tensor index from MB
+                                    int tensor_index = find_tensor_index_from_mb(mb);
+                                    if (tensor_index >= 0) {
+                                        std::thread t(async_reload, tensor_index);
+                                        t.detach();
+                                        LOG("Reloading tensors from index %d (last %d MB)\n", tensor_index, mb);
+                                    } else {
+                                        LOG_WRN("Failed to find tensor index for %d MB (tensor info may not be loaded)\n", mb);
+                                    }
+                                }
+                            } else {
+                                LOG_WRN("MB value out of range (0-10000): %d\n", mb);
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_WRN("Failed to parse MB value: %s\n", number_str.c_str());
+                        }
+                        // Remove the "##number##" prefix
+                        buffer = buffer.substr(end_pos + 2);
+                    } else {
+                        // No closing "##" found, just remove the leading "##"
+                        buffer = buffer.substr(2);
+                    }
                 }
                 auto reload_e = ggml_time_us();
                 LOG("reload cost:%ld\n", reload_e - reload_s);

@@ -953,7 +953,7 @@ void aio_setup()
 void async_reload(int tensor_index)
 {
 
-    LLAMA_LOG_INFO("async reload\n");
+    LLAMA_LOG_INFO("async reload %d\n", tensor_index);
     int fd = open(model_fname.c_str(), O_RDONLY );
     //int fd = open(model_fname.c_str(), O_RDONLY | O_DIRECT);
     int to_submit = 0;
