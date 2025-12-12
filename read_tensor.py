@@ -44,6 +44,7 @@ for i, tensor in enumerate(reader.tensors):
         print("not 512!!!")
     #print("-" * 40)
 
+print(size)
 #print(offsets[-1], offsets[-1]+last_size)
 #print(offsets[-1]+last_size-offsets[0],size)
 

@@ -32,6 +32,13 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifndef MODEL_BUFFER_SIZE
+#define MODEL_BUFFER_SIZE 1736671232
+#endif
+
+#ifndef MMAP_OFFSET
+#define MMAP_OFFSET 0xa9000000
+#endif
 
 // backend buffer type
 
@@ -1947,13 +1954,13 @@ void* model_addr = NULL;
 size_t model_size = 0;
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * data;
-    if(size == 1736671232){
+    if(size == MODEL_BUFFER_SIZE){
         int memfd = open("/dev/mem", O_RDWR);
     	if (memfd == -1) {
 			GGML_LOG_ERROR("open memfd failed:%d\n",memfd);
 			return NULL;
     	}
-        data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0xa9000000);
+        data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, MMAP_OFFSET);
 		if (data == MAP_FAILED){
 			GGML_LOG_ERROR("mmap failed:%d\n", data);
 			close(memfd);

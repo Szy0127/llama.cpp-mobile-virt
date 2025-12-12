@@ -178,37 +178,7 @@ static int find_tensor_index_from_mb(int mb) {
     // If target_bytes is larger than total size, reload from index 0
     return 0;
 }
-
-uint64_t layer_offsets[24]={
-0x0,
-0xdafbc00,
-0xe2fe200,
-0xeb00800,
-0xf302e00,
-0xfb05400,
-0x10307a00,
-0x10b0a000,
-0x1130c600,
-0x11b0ec00,
-0x12311200,
-0x12b13800,
-0x13315e00,
-0x13b18400,
-0x1431aa00,
-0x14b1d000,
-0x1531f600,
-0x15b21c00,
-0x16324200,
-0x16b26800,
-0x17328e00,
-0x17b2b400,
-0x1832da00,
-0x18b30000,
-};
-           
-int layer2index[24]={
-    0,15,27,39,51,63,75,87,99,111,123,135,147,159,171,183,195,207,219,231,243,255,267,279
-};
+      
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
@@ -1002,23 +972,6 @@ int main(int argc, char ** argv) {
                 // color user input only
                 console::set_display(console::user_input);
                 display = params.display_prompt;
-                auto layer = params.n_reload_layer;
-                //255:baseline
-                //254:vanilla
-				auto addr_offset = layer == 254 ? 0 : layer_offsets[layer];
-                unsigned long start_addr = (unsigned long)(model_addr+addr_offset+ 4095) & ~4095;
-                size_t madvise_size = ((unsigned long)(model_addr + model_size) & ~4095) - start_addr;
-                LOG("model addr:%lx madvise addr:%lx, size:%ld\n", model_addr, start_addr, madvise_size);
-
-                if (layer != 255) {
-                    /*
-                    int m_ret = madvise((void*)start_addr,madvise_size,MADV_DONTNEED);
-				    if (m_ret){
-					    LOG("madvise failed:%d %s\n", m_ret, strerror(errno));
-				    }
-                    */
-                    //memset((void*)start_addr, 0,madvise_size);
-                }
 
                 std::string line;
                 bool another_line = true;
@@ -1027,14 +980,6 @@ int main(int argc, char ** argv) {
                     buffer += line;
                 } while (another_line);
 
-                if (layer != 255) {
-                    /*
-                    int m_ret = madvise((void*)start_addr,madvise_size,MADV_WILLNEED);
-				    if (m_ret){
-					    LOG("madvise failed:%d\n", m_ret);
-				    }
-                    */
-                }
                 auto reload_s = ggml_time_us();
                 if (buffer.size() > 3 && buffer.substr(0, 2) == "##") {
                     // Find the closing "##"
