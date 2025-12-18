@@ -4,6 +4,8 @@ include(CheckIncludeFileCXX)
 
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
+add_link_options(-static)
+add_link_options(-static-libgcc -static-libstdc++)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

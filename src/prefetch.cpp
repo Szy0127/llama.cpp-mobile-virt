@@ -17,7 +17,7 @@
 #include <thread>
 #include "pipeline.h"
 
-bool is_strawman = false;
+//bool is_strawman = false;
 
 struct param_tensor_desc {
     ggml_tensor *tensor;

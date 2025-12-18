@@ -403,15 +403,15 @@ void parse_prompt(gpt_params & params, const std::string & value) {
         std::string model = value.substr(0, pos);
         int len = std::stoi(value.substr(pos + 1));
         if (model == "tinyllama") {
-            params.io_model_path = "/data/ssd/tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
         } else if (model == "gemma") {
-            params.io_model_path = "/data/ssd/gemma-2-2b-it-Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/gemma-2-2b-it-Q8_0.gguf";
         } else if (model == "qwen") {
-            params.io_model_path = "/data/ssd/qwen2.5-3b-instruct-q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/qwen2.5-3b-instruct-q8_0.gguf";
         } else if (model == "phi") {
-            params.io_model_path = "/data/ssd/Phi-3-mini-4k-instruct.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/Phi-3-mini-4k-instruct.Q8_0.gguf";
         } else if (model == "llama") {
-            params.io_model_path = "/data/ssd/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
         } else {
             GGML_ABORT("invalid prompt %s\n", value.c_str());
         }
@@ -445,7 +445,7 @@ out:
 
 
         if (model == "tinyllama") {
-            params.io_model_path = "/data/ssd/tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
             switch (len) {
             case 32:
                 params.prompt = "If you are submitting a revised paper because you received a revise-and-resubmit decision from the previous deadline, you should";
@@ -466,7 +466,7 @@ out:
                 GGML_ABORT("invalid len %d", len);
             }
         } else if (model == "gemma") {
-            params.io_model_path = "/data/ssd/gemma-2-2b-it-Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/gemma-2-2b-it-Q8_0.gguf";
             switch (len) {
             case 32:
                 params.prompt = "If you are submitting a revised paper because you received a revise-and-resubmit decision from the previous deadline, you should already have received instructions by email";
@@ -481,7 +481,7 @@ out:
                 GGML_ABORT("invalid len %d", len);
             }
         } else if (model == "qwen") {
-            params.io_model_path = "/data/ssd/qwen2.5-3b-instruct-q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/qwen2.5-3b-instruct-q8_0.gguf";
             switch (len) {
             case 1:
                 params.prompt = "I I";
@@ -517,7 +517,7 @@ out:
                 GGML_ABORT("invalid len %d", len);
             }
         } else if (model == "phi") {
-            params.io_model_path = "/data/ssd/Phi-3-mini-4k-instruct.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/Phi-3-mini-4k-instruct.Q8_0.gguf";
             switch (len) {
             case 32:
                 params.prompt = "If you are submitting a revised paper because you received a revise-and-resubmit decision from the previous deadline, you should ";
@@ -532,7 +532,7 @@ out:
                 GGML_ABORT("invalid len %d", len);
             }
         } else if (model == "llama") {
-            params.io_model_path = "/data/ssd/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
+            params.io_model_path = "/data/data/com.termux/files/home/Meta-Llama-3-8B-Instruct.Q8_0.gguf";
             switch (len) {
             case 1:
                 params.prompt = "I";

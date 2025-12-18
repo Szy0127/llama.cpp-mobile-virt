@@ -199,6 +199,7 @@ static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context* context, void
 }
 
 static void ggml_print_backtrace_symbols(void) {
+    /*
     const int max = 100;
     void* buffer[max];
 
@@ -218,6 +219,7 @@ static void ggml_print_backtrace_symbols(void) {
 
         fprintf(stderr, "%d: %p %s\n", idx, addr, symbol);
     }
+    */
 }
 #elif defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>

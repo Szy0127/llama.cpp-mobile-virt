@@ -74,9 +74,10 @@ list(APPEND LLAMA_INCLUDE_DIR
     #/home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libcrypto.so.3
     #/home/vectorxj/openharmony/third_party/openssl/install-glibc/lib/libssl.so.3
     #/home/vectorxj/chcore/opentrustee_llm/libaio-0.3.113/install-glibc/lib/libaio.so.1.0.2
-list(APPEND LLAMA_LINK_DIR
-    /home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Android/librknn_api/arm64-v8a/librknnrt.so
-)
+
+    #list(APPEND LLAMA_LINK_DIR
+    #/home/vectorxj/chcore/opentrustee_llm/rknn-toolkit2-2.3.0/rknpu2/runtime/Android/librknn_api/arm64-v8a/librknnrt.so
+    #)
 endif()
 
 target_include_directories(llama PUBLIC ${LLAMA_INCLUDE_DIR})
