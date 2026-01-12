@@ -125,7 +125,7 @@ const float SCALE_MIN = 1e-9;
 
 #ifndef MAT_COPY
 #ifndef GGML_USE_CHCORE
-#define FAKE_CACHE
+//#define FAKE_CACHE
 #endif
 #endif
 struct dma_heap_allocation_data {
@@ -1455,7 +1455,7 @@ void npu_worker(int tid) {
     int policy = SCHED_FIFO;
     int priority = 40;
     param.sched_priority = priority;
-    GGML_ASSERT(pthread_setschedparam(pthread_self(), policy, &param) == 0);
+    // GGML_ASSERT(pthread_setschedparam(pthread_self(), policy, &param) == 0); // removed: pthread sched config
 
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);

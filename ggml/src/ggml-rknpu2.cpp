@@ -1131,7 +1131,7 @@ static void worker(int tid) {
     int policy = SCHED_FIFO;
     int priority = 40;
     param.sched_priority = priority;
-    GGML_ASSERT(pthread_setschedparam(pthread_self(), policy, &param) == 0);
+    // GGML_ASSERT(pthread_setschedparam(pthread_self(), policy, &param) == 0); // removed: pthread sched config
 
     ttid = tid;
     set_to_big_core();

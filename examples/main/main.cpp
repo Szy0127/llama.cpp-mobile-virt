@@ -880,14 +880,14 @@ int main(int argc, char **argv)
                 extern bool is_pipelining;
                 is_pipelining = true;
 #endif
-
+                //LOG("before llama_decode\n");
                 if (llama_decode(
                         ctx,
                         llama_batch_get_one(&embd[i], n_eval, n_past, 0))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
                 }
-
+                //LOG("after llama_decode\n");
                 n_past += n_eval;
 
                 LOG_DBG("n_past = %d\n", n_past);
@@ -968,7 +968,7 @@ int main(int argc, char **argv)
                     llama_token_to_piece(ctx, id, params.special);
 
                 // Console/Stream Output
-                // LOG("%s", token_str.c_str());
+                LOG("%s", token_str.c_str());
 
                 // Record Displayed Tokens To Log
                 // Note: Generated tokens are created one by one hence this

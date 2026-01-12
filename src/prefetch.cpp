@@ -86,8 +86,8 @@ void use_param_tensor(
         }
 #endif
     }
-    if (ith == 0)
-        tensor->data = pipeline->get_final_msg();
+    // if (ith == 0)
+    //     tensor->data = pipeline->get_final_msg(); // removed: don't reassign tensor data
 #ifdef TZ_LLM_MEASURE
     if (ith == 0)
         use_wait_time += get_micro() - start;

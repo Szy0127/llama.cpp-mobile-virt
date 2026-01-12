@@ -5208,7 +5208,7 @@ struct llama_model_loader {
             for (size_t idx = 0; idx < n_buffers;++idx) {
                 ggml_backend_event_synchronize(events[idx]);
                 ggml_backend_event_free(events[idx]);
-                ggml_backend_buffer_free(host_buffers[idx]);
+                // ggml_backend_buffer_free(host_buffers[idx]); // removed: don't free default host buffer
             }
             ggml_backend_free(cuda_backend);
         }
@@ -8817,7 +8817,7 @@ static bool llm_load_tensors(
 #endif
         else {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-            ggml_backend_buffer_free_buffer(buf);
+            //ggml_backend_buffer_free_buffer(buf);
             if (buf == nullptr) {
                 throw std::runtime_error("unable to allocate backend buffer");
             }

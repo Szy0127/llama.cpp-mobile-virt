@@ -19689,7 +19689,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         return true;
     }
 
-    int32_t err = pthread_setschedparam(pthread_self(), policy, &p);
+    int32_t err = 0;//pthread_setschedparam(pthread_self(), policy, &p);
     if (err != 0) {
         fprintf(stderr, "warn: failed to set thread priority %d : %s (%d)\n", prio, strerror(err), err);
         return false;
@@ -19745,7 +19745,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         return true;
     }
 
-    int32_t err = pthread_setschedparam(pthread_self(), policy, &p);
+    int32_t err = 0;//pthread_setschedparam(pthread_self(), policy, &p);
     if (err != 0) {
         fprintf(stderr, "warn: failed to set thread priority %d : %s (%d)\n", prio, strerror(err), err);
         return false;
