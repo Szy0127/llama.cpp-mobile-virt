@@ -10,9 +10,10 @@ cmake -Bbuild -H. \
     -DGGML_OPENMP=OFF \
     -DLLAMA_CURL=OFF\
     -DCMAKE_C_FLAGS="-march=armv8-a"\
-    -DCMAKE_CXX_FLAGS="-march=armv8-a"\
+    -DCMAKE_CXX_FLAGS="-march=armv8-a -std=c++17"\
     -DLLAMA_CURL=OFF\
-    -DGGML_CPU_AARCH64=OFF
+    -DGGML_CPU_AARCH64=OFF \
+    -DGGML_RKNPU_RE=ON
 
 
 

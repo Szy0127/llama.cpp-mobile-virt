@@ -1254,17 +1254,48 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+extern void rknpu2_matmul_begin_measure(int ith);
+extern void rknpu2_matmul_end_measure(int ith);
+extern void rknpu2_matmul_begin_measure_npu(int ith);
+extern void rknpu2_matmul_end_measure_npu(int ith);
+extern bool ggml_backend_rknpure_supports_op_out(const struct ggml_tensor *op);
+extern void rknpu2_matmul_pre0(struct ggml_tensor * dst, int nth, int ith);
+extern void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith);
+extern void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith);
+extern void rknpu2_matmul_submit(struct ggml_tensor * dst, int nth, int ith);
+extern void rknpu2_matmul_post(struct ggml_tensor * dst, int nth, int ith);
+
+
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
 
-    GGML_TENSOR_BINARY_OP_LOCALS
+                const struct ggml_tensor * src0 = dst->src[0];
+                const struct ggml_tensor * src1 = dst->src[1];
+            
+                GGML_TENSOR_BINARY_OP_LOCALS
+            
+                const int ith = params->ith;
+                const int nth = params->nth;
+                if (ggml_backend_rknpure_supports_op_out(dst)) {
+                    rknpu2_matmul_begin_measure(ith);
+                    rknpu2_matmul_pre0(dst, nth, ith);
+                    ggml_barrier(params->threadpool);
+                    rknpu2_matmul_pre_scale(dst, nth, ith);
+                    ggml_barrier(params->threadpool);
+                    rknpu2_matmul_pre1(dst, nth, ith);
+                    rknpu2_matmul_begin_measure_npu(ith);
+                    ggml_barrier(params->threadpool);
+                    rknpu2_matmul_submit(dst, nth, ith);
+                    ggml_barrier(params->threadpool);
+                    rknpu2_matmul_end_measure_npu(ith);
+                    rknpu2_matmul_post(dst, nth, ith);
+                    rknpu2_matmul_end_measure(ith);
+                    return;
+                }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+
 
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;

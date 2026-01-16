@@ -29,6 +29,11 @@
 #include "ggml-cpu.h"
 #endif
 
+// Forward declaration for rknpu2 backend
+extern "C" {
+    ggml_backend_reg_t ggml_backend_rknpu2_reg();
+}
+
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -190,6 +195,8 @@ struct ggml_backend_registry {
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
 #endif
+        // Register RKNPU2 backend (always available if compiled in)
+        register_backend(ggml_backend_rknpu2_reg());
     }
 
     ~ggml_backend_registry() {
