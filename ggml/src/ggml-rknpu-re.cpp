@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <sched.h>
 
 // Minimal RKNPURE backend implementation for element-wise operations
 
@@ -27,14 +30,24 @@ static inline void ggml_thread_cpu_relax_out(void) {
 
 
 static uint64_t npu_count = 0;
+static uint64_t npu_total_count = 0;
+static uint64_t npu_total_failed_count = 0;
  static bool ggml_backend_rknpure_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst = op;
-
+    //src0->name
+    // if(src0 && src1 && dst){
+    // fprintf(stderr, "src0->name=%s\n", src0->name ? src0->name : "NULL");
+    // fprintf(stderr, "src1->name=%s\n", src1->name ? src1->name : "NULL");
+    // fprintf(stderr, "dst->name=%s\n", dst->name ? dst->name : "NULL");
+    // }
+    npu_total_count++;
     //return false;
     if (op->op != GGML_OP_MUL_MAT) {
         // printf("zzh: op is %d, not mul mat\n", op->op);
+        npu_total_failed_count++;
+        // fprintf(stderr, "NPU failed0! npu_total_failed_count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
         return false;
     }
 
@@ -48,8 +61,11 @@ static uint64_t npu_count = 0;
         const int64_t k = src0->ne[0];
         const int64_t n = dst->ne[0];
         /* can not allocate large B buffers for large vocab_size. just use cpu to perform these matmuls */
-        if (k >= 50000 || n >= 50000)
+        if (k >= 50000 || n >= 50000){
+            npu_total_failed_count++;
+            // fprintf(stderr, "NPU failed1! npu_total_failed_count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
             return false;
+        }
     }
 
     // printf("ggml_backend_rknpure_supports_op, %d, %d, %p\n", src1->type, dst->type, src0->extra);
@@ -60,22 +76,45 @@ static uint64_t npu_count = 0;
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
 
+    if(!ggml_is_contiguous(src0)){
+        // fprintf(stderr,"src0 is not contiguous: name=%s, type=%d, ne=[%ld,%ld,%ld,%ld], nb=[%ld,%ld,%ld,%ld], "
+        //         "view_src=%p, op=%d, is_permuted=%d, is_transposed=%d\n",
+        //         src0->name ? src0->name : "NULL",
+        //         src0->type,
+        //         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+        //         src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+        //         src0->view_src,
+        //         src0->op,
+        //         ggml_is_permuted(src0),
+        //         ggml_is_transposed(src0));
+        return false;
+    }
+    if(!ggml_is_contiguous(src1)){
+        fprintf(stderr,"src1 is not contiguous\n");
+        return false;
+    }
+    
     if (ggml_is_contiguous(src0) &&
         ggml_is_contiguous(src1) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         const int64_t k = src0->ne[0];
         const int64_t n = src0->ne[1];
         // return false;
-        if (npu_count < 1118) {
+        // fprintf(stderr, "NPU support!  npu failed count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
+        return true;
+        if (npu_count < 1123) {
             npu_count++;
+            //fprintf(stderr, "NPU support! npu_count=%llu\n", (unsigned long long)npu_count);
             // return false;
             return true;
         }
-        return false;
+        // fprintf(stderr, "NPU support! npu_count=%llu\n", (unsigned long long)npu_count);
+        return true;
         // k > 8192 时，B 会被分成 T 段，int T = std::ceil(K / 8192)，推荐使用 rknn_B_normal_layout_to_native_layout 接口直接进行数据转换
         if(k > 8192 || n > 4096) // RKNPU2 limit （原来是10240）
         {
             // printf("oversize: k=%ld, n=%ld\n", k, n);
+
             return 0;
         }
 
@@ -99,14 +138,11 @@ static uint64_t npu_count = 0;
         }
 
         /*printf("RKNPU2: %d %d %d %d %d\n", ne0, ne1, ne10, ne00, ne01);*/
-        if (npu_count < 200) {
-            npu_count++;
-            // return false;
             return true;
-        }
-        return false;
-    }
 
+    }
+    npu_total_failed_count++;
+    // fprintf(stderr, "NPU failed2! npu_total_failed_count=%llu/%llu type:%d %d %d\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count, src0->type, src1->type, dst->type);
     // printf("rknpu2 not support this MUL_MAT\n");
     return false;
 
@@ -117,7 +153,45 @@ extern "C" {
 bool ggml_backend_rknpure_supports_op_out(const struct ggml_tensor *op) {
     // Force CPU computation for debugging - always return false to skip NPU
     ggml_backend_t backend;
+    
+    // // Print call stack for debugging with symbol resolution
+    // void *buffer[32];
+    // int nptrs = backtrace(buffer, 32);
+    
+    // int cpu_id = sched_getcpu();
+    // fprintf(stderr, "ggml_backend_rknpure_supports_op_out, op->op=%d,cpuid=%d\n", op->op, cpu_id);
+    // fprintf(stderr, "Call stack (%d frames):\n", nptrs);
+    
+    // for (int i = 0; i < nptrs && i < 10; i++) {  // Print first 10 frames
+    //     void *addr = buffer[i];
+    //     Dl_info info;
+        
+    //     if (dladdr(addr, &info) && info.dli_sname) {
+    //         // Successfully resolved symbol name
+    //         fprintf(stderr, "  [%d] %p %s", i, addr, info.dli_sname);
+    //         if (info.dli_saddr) {
+    //             void *offset = (void*)((char*)addr - (char*)info.dli_saddr);
+    //             fprintf(stderr, "+%p", offset);
+    //         }
+    //         if (info.dli_fname) {
+    //             fprintf(stderr, " (%s)", info.dli_fname);
+    //         }
+    //         fprintf(stderr, "\n");
+    //     } else {
+    //         // Fallback: print address only
+    //         fprintf(stderr, "  [%d] %p <unresolved>\n", i, addr);
+    //     }
+    // }
+    
+    // if (nptrs > 10) {
+    //     fprintf(stderr, "  ... (%d more frames)\n", nptrs - 10);
+    // }
+    
     return ggml_backend_rknpure_supports_op(backend, op);
+}
+
+uint64_t ggml_backend_rknpure_get_npu_count(void) {
+    return npu_count;
 }
 }
 #include <thread>
@@ -991,8 +1065,9 @@ struct rknn_mem {
     std::atomic<int> post_cnt;
 
     rknn_mem(size_t size): size(size) {
+        // Use NON_CACHEABLE memory like rknpu-tests, so no cache sync needed after NPU computation
         dma_ptr = mem_allocate(size, &dma, &obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT | RKNPU_MEM_CACHEABLE, &handle);
+            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle);
 #ifdef FAKE_CACHE
         GGML_ASSERT(dma_alloc(size, &fd, &ptr) == 0);
 #else
@@ -1181,24 +1256,45 @@ struct npu_task {
         usys_cache_flush((unsigned long)output->ptr, C_buf_size, CACHE_CLEAN_AND_INV);
     }
 #else
-    void flush_cache(void) {
+    void flush_cache_before_submit(void) {
 #ifdef FAKE_CACHE
         GGML_ASSERT(dma_sync_cpu_to_device(input->fd) == 0);
 #ifdef MAT_COPY
         GGML_ASSERT(dma_sync_cpu_to_device(weight->fd) == 0);
 #endif
         GGML_ASSERT(dma_sync_cpu_to_device(output->fd) == 0);
+#endif
+    }
+    void flush_cache_after_submit(void) {
+#ifdef FAKE_CACHE
+        // Sync output from device to CPU after NPU computation completes
         GGML_ASSERT(dma_sync_device_to_cpu(output->fd) == 0);
+#else
+        // For NON_CACHEABLE memory (like rknpu-tests), no cache sync needed
+        // NPU writes are directly visible to CPU after ioctl returns
 #endif
     }
     void submit(int core_mask) {
-        flush_cache();
+        flush_cache_before_submit();
         int ret = npu_submit(tasks_obj, (__u32)core_mask);
         if (ret) {
             printf("RKNPU_SUBMIT returned %d, submitted m=%hu, k=%hu, n=%hu, errno %d\n",
                 ret, M, K, N, errno);
         }
         GGML_ASSERT(ret == 0);
+        // After npu_submit returns (blocking call), sync output from device to CPU
+        flush_cache_after_submit();
+        
+        // Log NPU computation result immediately after completion
+        // Print first 5 8-byte values from output buffer
+        const uint64_t * output_bytes = (const uint64_t *)output->ptr;
+        const size_t output_size = output->size;
+        const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
+        fprintf(stderr, "[NPU_TASK] NPU computation type=%d completed! M=%d, N=%d, K=%d, output first 5 8bytes: ",type, M, N, K);
+        for (int i = 0; i < num_8bytes; i++) {
+            fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+        }
+        fprintf(stderr, "\n");
     }
 #endif
 
@@ -1229,6 +1325,20 @@ struct npu_task_multi_core {
         }
         int ret = npu_submit_multi(tasks_objs.data(), tasks_objs.size(), (void *)ggml_thread_cpu_relax_out);
         GGML_ASSERT(ret == 0);
+        
+        // Log NPU computation result immediately after completion
+        for (size_t idx = 0; idx < npu_tasks.size(); idx++) {
+            auto npu_task = npu_tasks[idx];
+            const uint64_t * output_bytes = (const uint64_t *)npu_task->output->ptr;
+            const size_t output_size = npu_task->output->size;
+            const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
+            fprintf(stderr, "[NPU_TASK_MULTI] Task %zu, M=%d, N=%d, K=%d, output first 5 8bytes: ", 
+                    idx, npu_task->M, npu_task->N, npu_task->K);
+            for (int i = 0; i < num_8bytes; i++) {
+                fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 #endif
     void apply_scale(void) {
@@ -1989,6 +2099,29 @@ void rknpu2_matmul_post(struct ggml_tensor * dst, int nth, int ith) {
     kernel->for_all_outputs(
         [&](int mm, int nn, int M, int N, std::shared_ptr<rknn_mem> output_mem) {
             auto output = output_mem->ptr;
+            
+            // Ensure NPU computation results are visible to CPU
+            // For FAKE_CACHE mode, sync DMA buffer from device to CPU
+            // For NON_CACHEABLE memory (like rknpu-tests), no sync needed
+#ifdef FAKE_CACHE
+            if (output_mem->fd >= 0) {
+                dma_sync_device_to_cpu(output_mem->fd);
+            }
+#else
+            // For NON_CACHEABLE memory, NPU writes are directly visible to CPU
+            // No cache sync needed, just like rknpu-tests/matmul_int8.c
+#endif
+            
+            // Log NPU output result immediately after sync (closest to NPU completion)
+            const uint64_t * output_bytes = (const uint64_t *)output;
+            const size_t output_size = output_mem->size;
+            const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
+            fprintf(stderr, "[NPU_POST] Output block mm=%d, nn=%d, M=%d, N=%d, first 5 8bytes: ", mm, nn, M, N);
+            for (int i = 0; i < num_8bytes; i++) {
+                fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+            }
+            fprintf(stderr, "\n");
+            
             if (tensor_type == RKNN_TENSOR_FLOAT32) {
                 GGML_ASSERT(n % 4 == 0);
                 for (int i = output_mem->post_cnt.fetch_add(1); i < M; i = output_mem->post_cnt.fetch_add(1)) {
@@ -2201,6 +2334,7 @@ static ggml_backend_buffer_type_t ggml_backend_rknpu2_device_get_host_buffer_typ
 
 static bool ggml_backend_rknpu2_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
+    // fprintf(stderr, "ggml_backend_rknpu2_device_supports_op, op->op=%d\n", op->op);
     return ggml_backend_rknpure_supports_op_out(op);
 }
 
@@ -2333,11 +2467,11 @@ static ggml_guid_t ggml_backend_rknpu2_guid(void) {
     return &guid;
 }
 
-static ggml_backend_t ggml_backend_rknpu2_reg_init(const char *params, void * user_data) {
-    GGML_UNUSED(params);
-    ggml_backend_t rknpu2_backend = ggml_backend_rknpure_init((int) (unsigned long) user_data);
-    return rknpu2_backend;
-}
+// static ggml_backend_t ggml_backend_rknpu2_reg_init(const char *params, void * user_data) {
+//     GGML_UNUSED(params);
+//     ggml_backend_t rknpu2_backend = ggml_backend_rknpure_init((int) (unsigned long) user_data);
+//     return rknpu2_backend;
+// }
 
 } // end extern "C" for rknpu2_matmul functions
 

@@ -196,7 +196,8 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_cpu_reg());
 #endif
         // Register RKNPU2 backend (always available if compiled in)
-        register_backend(ggml_backend_rknpu2_reg());
+        // DISABLED: Using NPU directly in CPU compute functions instead of as a separate backend
+        // register_backend(ggml_backend_rknpu2_reg());
     }
 
     ~ggml_backend_registry() {

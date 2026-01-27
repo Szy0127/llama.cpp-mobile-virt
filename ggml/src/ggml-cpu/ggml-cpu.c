@@ -1264,8 +1264,9 @@ extern void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith);
 extern void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith);
 extern void rknpu2_matmul_submit(struct ggml_tensor * dst, int nth, int ith);
 extern void rknpu2_matmul_post(struct ggml_tensor * dst, int nth, int ith);
+extern uint64_t ggml_backend_rknpure_get_npu_count(void);
 
-
+#define CHECK_NPU_RESULT 1
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1278,7 +1279,18 @@ static void ggml_compute_forward_mul_mat(
             
                 const int ith = params->ith;
                 const int nth = params->nth;
+                
+                // Debug: Print tensor types
+                if (ith == 0 && src0->name != NULL) {
+                    // fprintf(stderr, "DEBUG mul_mat: src0->name=%s, src0->type=%d (%s), src1->type=%d, dst->type=%d\n",
+                    //         src0->name, src0->type, 
+                    //         src0->type == GGML_TYPE_Q8_0 ? "Q8_0" : 
+                    //         src0->type == GGML_TYPE_F16 ? "F16" : "OTHER",
+                    //         src1->type, dst->type);
+                }
+                // fprintf(stderr, "before support npu_count=%llu\n", (unsigned long long)ggml_backend_rknpure_get_npu_count());
                 if (ggml_backend_rknpure_supports_op_out(dst)) {
+                    // fprintf(stderr, "NPU matmul begin measure! npu_count=%llu\n", (unsigned long long)ggml_backend_rknpure_get_npu_count());
                     rknpu2_matmul_begin_measure(ith);
                     rknpu2_matmul_pre0(dst, nth, ith);
                     ggml_barrier(params->threadpool);
@@ -1292,6 +1304,130 @@ static void ggml_compute_forward_mul_mat(
                     rknpu2_matmul_end_measure_npu(ith);
                     rknpu2_matmul_post(dst, nth, ith);
                     rknpu2_matmul_end_measure(ith);
+                    // fprintf(stderr, "NPU matmul end measure! npu_count=%llu\n", (unsigned long long)ggml_backend_rknpure_get_npu_count());
+                    
+                    // Verify NPU result with CPU computation
+                    // Only verify in the main thread (ith == 0) to avoid duplicate verification
+                    #ifdef CHECK_NPU_RESULT
+                    if (ith == 0) {
+                        const size_t dst_size = ggml_nbytes(dst);
+                        const int64_t nelements = (int64_t)(dst_size / sizeof(float));
+                        
+                        // Allocate temporary buffer for NPU result
+                        float * npu_result = (float *)malloc(dst_size);
+                        if (npu_result != NULL) {
+                            // Save NPU result
+                            memcpy(npu_result, dst->data, dst_size);
+                            
+                            // Allocate temporary buffer for CPU result
+                            float * cpu_result = (float *)malloc(dst_size);
+                            if (cpu_result != NULL) {
+                                // Clear CPU result buffer
+                                memset(cpu_result, 0, dst_size);
+                                
+                                // Temporarily save original data pointer
+                                void * original_data = dst->data;
+                                
+                                // Point dst to CPU result buffer for computation
+                                dst->data = cpu_result;
+                                
+                                // Perform CPU computation using the existing CPU path
+                                // We'll call the CPU computation logic directly
+                                enum ggml_type const vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                                int64_t const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
+                                
+                                // Prepare wdata if needed (similar to CPU path)
+                                if (src1->type != vec_dot_type) {
+                                    char * wdata = params->wdata;
+                                    const size_t nbw0 = ggml_type_size(vec_dot_type);
+                                    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+                                    const size_t nbw2 = nbw1*ne11;
+                                    const size_t nbw3 = nbw2*ne12;
+                                    
+                                    ggml_from_float_t const from_float = type_traits_cpu[vec_dot_type].from_float;
+                                    
+                                    for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                                        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                                            for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                                                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                                                           (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                                                            ne10);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Compute full result using CPU
+                                // Use the one_chunk function to compute the entire result
+                                ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, vec_dot_num_rows, 0, ne0, 0, ne1 * ne2 * ne3);
+                                
+                                // Restore original data pointer
+                                dst->data = original_data;
+                                
+                                // Compare results
+                                const float tolerance = 1e-3f; // Tolerance for floating point comparison
+                                bool mismatch = false;
+                                int mismatch_count = 0;
+                                int64_t first_mismatch_idx = -1;
+                                float max_diff = 0.0f;
+                                
+                                for (int64_t i = 0; i < nelements; i++) {
+                                    const float npu_val = npu_result[i];
+                                    const float cpu_val = cpu_result[i];
+                                    const float diff = fabsf(npu_val - cpu_val);
+                                    if (diff > tolerance) {
+                                        if (!mismatch) {
+                                            mismatch = true;
+                                            first_mismatch_idx = i;
+                                        }
+                                        mismatch_count++;
+                                        if (diff > max_diff) {
+                                            max_diff = diff;
+                                        }
+                                    }
+                                }
+                                
+                                // Helper function to print first 5 8-byte values
+                                const uint64_t * npu_bytes = (const uint64_t *)npu_result;
+                                const uint64_t * cpu_bytes = (const uint64_t *)cpu_result;
+                                const int num_8bytes = (dst_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(dst_size / sizeof(uint64_t));
+                                
+                                if (mismatch) {
+                                    fprintf(stderr, "NPU verification failed! mismatch_count=%d/%lld, first_mismatch_idx=%lld, max_diff=%.6f\n", 
+                                           mismatch_count, (long long)nelements, (long long)first_mismatch_idx, max_diff);
+                                    fprintf(stderr, "  NPU first 5 8bytes: ");
+                                    for (int i = 0; i < num_8bytes; i++) {
+                                        fprintf(stderr, "0x%016llx ", (unsigned long long)npu_bytes[i]);
+                                    }
+                                    fprintf(stderr, "\n");
+                                    if (first_mismatch_idx >= 0 && first_mismatch_idx < nelements) {
+                                        fprintf(stderr, "  First mismatch at idx %lld: NPU=%.6f, CPU=%.6f, diff=%.6f\n",
+                                               (long long)first_mismatch_idx,
+                                               npu_result[first_mismatch_idx], 
+                                               cpu_result[first_mismatch_idx],
+                                               fabsf(npu_result[first_mismatch_idx] - cpu_result[first_mismatch_idx]));
+                                    }
+                                }else{
+                                    fprintf(stderr, "NPU verification passed!\n");
+                                    fprintf(stderr, "  NPU first 5 8bytes: ");
+                                    for (int i = 0; i < num_8bytes; i++) {
+                                        fprintf(stderr, "0x%016llx ", (unsigned long long)npu_bytes[i]);
+                                    }
+                                    fprintf(stderr, "\n");
+                                    fprintf(stderr, "  CPU first 5 8bytes: ");
+                                    for (int i = 0; i < num_8bytes; i++) {
+                                        fprintf(stderr, "0x%016llx ", (unsigned long long)cpu_bytes[i]);
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                                
+                                free(cpu_result);
+                            }
+                            free(npu_result);
+                        }
+                    }
+                    #endif
+                    
                     return;
                 }
 
