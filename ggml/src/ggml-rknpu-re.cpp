@@ -306,7 +306,7 @@ typedef int rknn_core_mask;
 
 const float SCALE_MIN = 1e-9;
 
-// #define MAT_COPY
+#define MAT_COPY
 
 #include <sys/ioctl.h>
 
@@ -1202,21 +1202,32 @@ struct npu_task {
     uint64_t npu_regs[112];
     matmul_params_t params;
     rknn_tensor_type type;
+    void *output_ptr;
+    uint64_t output_obj;
+    uint64_t output_handle;
 
     npu_task(int M, int N, int K, rknn_tensor_type type,
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
         : M(M), N(N), K(K), type(type), input(input), weight(weight), output(output) {
+            uint64_t output_dma;
+            output_ptr = mem_allocate(M*N*sizeof(int32_t), &output_dma, &output_obj, 0, &output_handle);
+          
         regcmd = (uint64_t*)mem_allocate(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle);
         GGML_ASSERT(regcmd);
 
         tasks = (rknpu_task *)mem_allocate(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle);
         GGML_ASSERT(tasks);
-
+        
+        // memset(input->ptr, 1, input->size);
+        //memset(weight->ptr, 1, 1);
+        // *((int32_t*)weight->ptr) = 1;
+        // memset(output_ptr, 1, M*N*sizeof(int32_t));
         params.m = M;
         params.k = K;
         params.n = N;
         params.input_dma = input->dma;
         params.weights_dma = weight->dma;
+        // params.output_dma = output_dma;
         params.output_dma = output->dma;
         params.tasks = (uint64_t *)&npu_regs;
         if (type == RKNN_TENSOR_FLOAT32) {
@@ -1240,11 +1251,16 @@ struct npu_task {
         tasks[0].regcfg_amount = sizeof(npu_regs)/sizeof(uint64_t)-(RKNPU_PC_DATA_EXTRA_AMOUNT+4);
         tasks[0].regcfg_offset = 0;
         tasks[0].regcmd_addr = regcmd_dma;
+
+        // memset(input->ptr, 1, input->size);
+        // memset(weight->ptr, 1, weight->size);
+        // memset(output_ptr, 1, M*N*sizeof(int32_t));
     }
 
     ~npu_task(void) {
         mem_destroy(regcmd, 1024, regcmd_handle, regcmd_obj);
         mem_destroy(tasks, 1024, tasks_handle, tasks_obj);
+        mem_destroy(output_ptr, M*N*sizeof(int32_t), output_handle, output_obj);
     }
 
 #ifdef GGML_USE_CHCORE
@@ -1276,6 +1292,10 @@ struct npu_task {
     }
     void submit(int core_mask) {
         flush_cache_before_submit();
+        // for(int i = 0; i < 4; i++){
+        //     fprintf(stderr, "weight->ptr[%d] = %d\n", i, ((int32_t*)weight->ptr)[i]);
+        // }
+        // *((int32_t*)weight->ptr) = 1;
         int ret = npu_submit(tasks_obj, (__u32)core_mask);
         if (ret) {
             printf("RKNPU_SUBMIT returned %d, submitted m=%hu, k=%hu, n=%hu, errno %d\n",
@@ -1288,13 +1308,13 @@ struct npu_task {
         // Log NPU computation result immediately after completion
         // Print first 5 8-byte values from output buffer
         const uint64_t * output_bytes = (const uint64_t *)output->ptr;
-        const size_t output_size = output->size;
+        const size_t output_size = M*N*sizeof(int32_t);
         const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
-        fprintf(stderr, "[NPU_TASK] NPU computation type=%d completed! M=%d, N=%d, K=%d, output first 5 8bytes: ",type, M, N, K);
-        for (int i = 0; i < num_8bytes; i++) {
-            fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
-        }
-        fprintf(stderr, "\n");
+        // fprintf(stderr, "[NPU_TASK] NPU computation type=%d completed! M=%d, N=%d, K=%d, output first 5 8bytes: ",type, M, N, K);
+        // for (int i = 0; i < num_8bytes; i++) {
+        //     fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+        // }
+        // fprintf(stderr, "\n");
     }
 #endif
 
@@ -1332,12 +1352,12 @@ struct npu_task_multi_core {
             const uint64_t * output_bytes = (const uint64_t *)npu_task->output->ptr;
             const size_t output_size = npu_task->output->size;
             const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
-            fprintf(stderr, "[NPU_TASK_MULTI] Task %zu, M=%d, N=%d, K=%d, output first 5 8bytes: ", 
-                    idx, npu_task->M, npu_task->N, npu_task->K);
-            for (int i = 0; i < num_8bytes; i++) {
-                fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
-            }
-            fprintf(stderr, "\n");
+            // fprintf(stderr, "[NPU_TASK_MULTI] Task %zu, M=%d, N=%d, K=%d, output first 5 8bytes: ", 
+            //         idx, npu_task->M, npu_task->N, npu_task->K);
+            // for (int i = 0; i < num_8bytes; i++) {
+            //     fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+            // }
+            // fprintf(stderr, "\n");
         }
     }
 #endif
@@ -1950,7 +1970,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     /* src0 => matrix B */
     /*const */struct ggml_tensor * src0 = dst->src[0];
     /*const*/ struct ggml_tensor * src1 = dst->src[1];
-
+// fprintf(stderr, "rknpu2_matmul_pre1\n");
     const int64_t m = src1->ne[1];
     const int64_t k = src0->ne[0];
     const int64_t n = dst->ne[0];
@@ -1984,6 +2004,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
             } else {
                 GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
                 GGML_ASSERT(k % 16 == 0);
+                // fprintf(stderr, "set input->ptr[0] = %d\n", ((int32_t*)input)[0]);
                 for (int i = input_mem->pre1_cnt.fetch_add(1); i < M; i = input_mem->pre1_cnt.fetch_add(1)) {
                     int ii = mm + i;
                     int off_in_sub_mat = i * 16;
@@ -2002,6 +2023,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     );
     kernel->for_all_weights(
         [&](int nn, int kk, int N, int K, std::shared_ptr<rknn_mem> weight_mem) {
+            // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight_mem->ptr)[0]);
             auto weight = weight_mem->ptr;
             if (tensor_type == RKNN_TENSOR_FLOAT32) {
                 for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
@@ -2012,6 +2034,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                         ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
                     }
             } else if (tensor_type == RKNN_TENSOR_INT8) {
+                // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight)[0]);
                 const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
                 GGML_ASSERT(traits->to_float != NULL);
                 int nele = k * n;
@@ -2025,6 +2048,8 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                         ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], weight_mem->scale);
                     }
                 free(fB);
+            }else{
+                fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
             }
         }
     );
@@ -2116,11 +2141,11 @@ void rknpu2_matmul_post(struct ggml_tensor * dst, int nth, int ith) {
             const uint64_t * output_bytes = (const uint64_t *)output;
             const size_t output_size = output_mem->size;
             const int num_8bytes = (output_size >= 5 * sizeof(uint64_t)) ? 5 : (int)(output_size / sizeof(uint64_t));
-            fprintf(stderr, "[NPU_POST] Output block mm=%d, nn=%d, M=%d, N=%d, first 5 8bytes: ", mm, nn, M, N);
-            for (int i = 0; i < num_8bytes; i++) {
-                fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
-            }
-            fprintf(stderr, "\n");
+            // fprintf(stderr, "[NPU_POST] Output block mm=%d, nn=%d, M=%d, N=%d, first 5 8bytes: ", mm, nn, M, N);
+            // for (int i = 0; i < num_8bytes; i++) {
+            //     fprintf(stderr, "0x%016llx ", (unsigned long long)output_bytes[i]);
+            // }
+            // fprintf(stderr, "\n");
             
             if (tensor_type == RKNN_TENSOR_FLOAT32) {
                 GGML_ASSERT(n % 4 == 0);

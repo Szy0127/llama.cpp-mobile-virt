@@ -1266,7 +1266,7 @@ extern void rknpu2_matmul_submit(struct ggml_tensor * dst, int nth, int ith);
 extern void rknpu2_matmul_post(struct ggml_tensor * dst, int nth, int ith);
 extern uint64_t ggml_backend_rknpure_get_npu_count(void);
 
-#define CHECK_NPU_RESULT 1
+// #define CHECK_NPU_RESULT 1
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
