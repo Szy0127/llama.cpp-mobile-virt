@@ -1920,6 +1920,17 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
 
     float *A = (float*)src1->data;
     void *B = src0->data;
+    const float *fB = nullptr;
+    std::unique_ptr<float[]> fB_storage;
+
+    if (tensor_type == RKNN_TENSOR_INT8) {
+        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+        GGML_ASSERT(traits->to_float != NULL);
+        const int nele = k * n;
+        fB_storage.reset(new float[nele]);
+        traits->to_float(B, fB_storage.get(), nele);
+        fB = fB_storage.get();
+    }
 
     kernel->for_all_inputs(
         [&](int mm, int kk, int M, int K, std::shared_ptr<rknn_mem> input_mem) {
@@ -1943,11 +1954,6 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
             auto weight = weight_mem->ptr;
             if (tensor_type == RKNN_TENSOR_INT8) {
                 float scale = SCALE_MIN;
-                const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-                GGML_ASSERT(traits->to_float != NULL);
-                int nele = k * n;
-                float *fB = (float *)malloc(nele * sizeof(*fB));
-                traits->to_float(B, fB, nele);
                 for (int i = weight_mem->pre_scale_cnt.fetch_add(1); i < N; i = weight_mem->pre_scale_cnt.fetch_add(1))
                     for (int j = 0; j < K; j++) {
                         int ii = nn + i;
@@ -1956,7 +1962,6 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
                         scale = std::max(scale, std::abs(fB[ii * k + jj]));
                     }
                 weight_mem->commit_scale(scale / 127.f);
-                free(fB);
             }
         }
     );
@@ -1977,8 +1982,19 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
 
     float *A = (float*)src1->data;
     void *B = src0->data;
+    const float *fB = nullptr;
+    std::unique_ptr<float[]> fB_storage;
 
     rknn_tensor_type tensor_type = ggml_type_to_rknn_type(src0->type);
+
+    if (tensor_type == RKNN_TENSOR_INT8) {
+        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+        GGML_ASSERT(traits->to_float != NULL);
+        const int nele = k * n;
+        fB_storage.reset(new float[nele]);
+        traits->to_float(B, fB_storage.get(), nele);
+        fB = fB_storage.get();
+    }
 
     auto kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, tensor_type);
     GGML_ASSERT(kernel);
@@ -2024,6 +2040,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     kernel->for_all_weights(
         [&](int nn, int kk, int N, int K, std::shared_ptr<rknn_mem> weight_mem) {
             // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight_mem->ptr)[0]);
+            // fprintf(stderr, "n = %d, k = %d, pre1 weight: nn=%d kk=%d N=%d K=%d\n", n, k, nn, kk, N, K);
             auto weight = weight_mem->ptr;
             if (tensor_type == RKNN_TENSOR_FLOAT32) {
                 for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
@@ -2034,12 +2051,6 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                         ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
                     }
             } else if (tensor_type == RKNN_TENSOR_INT8) {
-                // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight)[0]);
-                const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-                GGML_ASSERT(traits->to_float != NULL);
-                int nele = k * n;
-                float *fB = (float *)malloc(nele * sizeof(*fB));
-                traits->to_float(B, fB, nele);
                 for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
                     for (int j = 0; j < K; j++) {
                         int ii = nn + i;
@@ -2047,7 +2058,6 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                         if (ii >= n || jj >= k) continue;
                         ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], weight_mem->scale);
                     }
-                free(fB);
             }else{
                 fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
             }
