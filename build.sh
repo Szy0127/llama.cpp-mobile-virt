@@ -18,3 +18,4 @@ cmake -Bbuild -H. \
 
 
 cmake --build build -j20 --target llama-cli
+scp build/bin/llama-cli opi5:~

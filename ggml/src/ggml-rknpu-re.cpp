@@ -1825,6 +1825,23 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
     return cache;
 }
 
+static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_find_weight_prepack_cache(
+    const ggml_tensor * src0,
+    int64_t k,
+    int64_t n,
+    int K,
+    int N,
+    rknn_tensor_type tensor_type) {
+
+    rknpu_weight_prepack_key cache_key = { src0, k, n, K, N, tensor_type };
+    std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
+    auto it = g_weight_prepack_cache.find(cache_key);
+    if (it == g_weight_prepack_cache.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
 static inline const rknpu_weight_prepack_block * ggml_rknpu2_find_weight_prepack_block(
     const std::shared_ptr<rknpu_weight_prepack_cache> & cache,
     int nn,
@@ -2125,7 +2142,8 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
     auto kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, tensor_type);
     GGML_ASSERT(kernel);
 
-    auto weight_prepack = ggml_rknpu2_get_weight_prepack(src0, k, n, kernel->K, kernel->N, tensor_type);
+    // pre0 already built/prepared this cache; here we only reuse it.
+    auto weight_prepack = ggml_rknpu2_find_weight_prepack_cache(src0, k, n, kernel->K, kernel->N, tensor_type);
 
     float *A = (float*)src1->data;
     void *B = src0->data;
@@ -2167,26 +2185,26 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
         [&](int nn, int kk, int N, int K, std::shared_ptr<rknn_mem> weight_mem) {
             if (tensor_type == RKNN_TENSOR_INT8) {
                 const rknpu_weight_prepack_block * block = ggml_rknpu2_find_weight_prepack_block(weight_prepack, nn, kk);
-                if (block) {
-                    if (ith == 0) {
-                        g_weight_block_hit_prescale_cnt.fetch_add(1);
-                    }
-                    weight_mem->commit_scale(block->scale);
-                    return;
-                }
+                GGML_ASSERT(block && "cache missed at pre_scale, but it should have been built at pre0");
+
                 if (ith == 0) {
-                    g_weight_block_miss_prescale_cnt.fetch_add(1);
+                    g_weight_block_hit_prescale_cnt.fetch_add(1);
                 }
-                const float *fB_local = ensure_fB();
-                float scale = SCALE_MIN;
-                for (int i = weight_mem->pre_scale_cnt.fetch_add(1); i < N; i = weight_mem->pre_scale_cnt.fetch_add(1))
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) continue;
-                        scale = std::max(scale, std::abs(fB_local[ii * k + jj]));
-                    }
-                weight_mem->commit_scale(scale / 127.f);
+                weight_mem->commit_scale(block->scale);
+
+                // if (ith == 0) {
+                //     g_weight_block_miss_prescale_cnt.fetch_add(1);
+                // }
+                // const float *fB_local = ensure_fB();
+                // float scale = SCALE_MIN;
+                // for (int i = weight_mem->pre_scale_cnt.fetch_add(1); i < N; i = weight_mem->pre_scale_cnt.fetch_add(1))
+                //     for (int j = 0; j < K; j++) {
+                //         int ii = nn + i;
+                //         int jj = kk + j;
+                //         if (ii >= n || jj >= k) continue;
+                //         scale = std::max(scale, std::abs(fB_local[ii * k + jj]));
+                //     }
+                // weight_mem->commit_scale(scale / 127.f);
             }
         }
     );
@@ -2229,7 +2247,8 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     auto kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, tensor_type);
     GGML_ASSERT(kernel);
 
-    auto weight_prepack = ggml_rknpu2_get_weight_prepack(src0, k, n, kernel->K, kernel->N, tensor_type);
+    // pre0 already built/prepared this cache; here we only reuse it.
+    auto weight_prepack = ggml_rknpu2_find_weight_prepack_cache(src0, k, n, kernel->K, kernel->N, tensor_type);
 
     kernel->for_all_inputs(
         [&](int mm, int kk, int M, int K, std::shared_ptr<rknn_mem> input_mem) {
@@ -2274,44 +2293,42 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
             // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight_mem->ptr)[0]);
             // fprintf(stderr, "n = %d, k = %d, pre1 weight: nn=%d kk=%d N=%d K=%d\n", n, k, nn, kk, N, K);
             const rknpu_weight_prepack_block * block = ggml_rknpu2_find_weight_prepack_block(weight_prepack, nn, kk);
-            if (block) {
-                if (ith == 0) {
-                    g_weight_block_hit_pre1_cnt.fetch_add(1);
-                }
-                if (ith == 0) {
-                    memcpy(weight_mem->ptr, block->packed.data(), block->packed.size());
-                    if (tensor_type == RKNN_TENSOR_INT8) {
-                        weight_mem->scale = block->scale;
-                    }
-                }
-                return;
-            }
-
+            GGML_ASSERT(block && "cache missed at pre1, but it should have been built at pre0");
             if (ith == 0) {
-                g_weight_block_miss_pre1_cnt.fetch_add(1);
+                g_weight_block_hit_pre1_cnt.fetch_add(1);
+            }
+            if (ith == 0) {
+                memcpy(weight_mem->ptr, block->packed.data(), block->packed.size());
+                if (tensor_type == RKNN_TENSOR_INT8) {
+                    weight_mem->scale = block->scale;
+                }
             }
 
-            auto weight = weight_mem->ptr;
-            if (tensor_type == RKNN_TENSOR_FLOAT32) {
-                for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) continue;
-                        ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
-                    }
-            } else if (tensor_type == RKNN_TENSOR_INT8) {
-                const float *fB_local = ensure_fB();
-                for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) continue;
-                        ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB_local[ii * k + jj], weight_mem->scale);
-                    }
-            }else{
-                fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
-            }
+            // if (ith == 0) {
+            //     g_weight_block_miss_pre1_cnt.fetch_add(1);
+            // }
+
+            // auto weight = weight_mem->ptr;
+            // if (tensor_type == RKNN_TENSOR_FLOAT32) {
+            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
+            //         for (int j = 0; j < K; j++) {
+            //             int ii = nn + i;
+            //             int jj = kk + j;
+            //             if (ii >= n || jj >= k) continue;
+            //             ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
+            //         }
+            // } else if (tensor_type == RKNN_TENSOR_INT8) {
+            //     const float *fB_local = ensure_fB();
+            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
+            //         for (int j = 0; j < K; j++) {
+            //             int ii = nn + i;
+            //             int jj = kk + j;
+            //             if (ii >= n || jj >= k) continue;
+            //             ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB_local[ii * k + jj], weight_mem->scale);
+            //         }
+            // }else{
+            //     fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
+            // }
         }
     );
     END_MEASURE_0;
