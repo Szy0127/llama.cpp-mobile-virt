@@ -1051,6 +1051,7 @@ inline size_t rknn_type_size_C(rknn_tensor_type type) {
     GGML_ASSERT(false);
 }
 
+static uint64_t total_allocated = 0;
 struct rknn_mem {
     size_t size;
     void *ptr;
@@ -1074,7 +1075,9 @@ struct rknn_mem {
 #else
         ptr = dma_ptr;
 #endif
-        GGML_ASSERT(dma_ptr);
+        // GGML_ASSERT(dma_ptr);
+        total_allocated += size;
+        fprintf(stderr, "rknn_mem allocated: %lu bytes, total allocated: %lu bytes\n", size, total_allocated);
         scale = 1.0;
         pthread_mutex_init(&scale_lock, 0);
     }
@@ -1191,6 +1194,7 @@ static struct matmul_buffer_mgr matmul_buffer_mgr;
 
 struct npu_task {
     int M, N, K;
+    int nn, kk;
     uint64_t *regcmd;
     uint64_t regcmd_dma, regcmd_obj;
     uint64_t regcmd_handle;
@@ -1207,9 +1211,9 @@ struct npu_task {
     uint64_t output_obj;
     uint64_t output_handle;
 
-    npu_task(int M, int N, int K, rknn_tensor_type type,
+    npu_task(int M, int N, int K, int nn, int kk, rknn_tensor_type type,
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
-        : M(M), N(N), K(K), type(type), input(input), weight(weight), output(output) {
+        : M(M), N(N), K(K), nn(nn), kk(kk), input(input), weight(weight), output(output), type(type) {
             uint64_t output_dma;
             output_ptr = mem_allocate(M*N*sizeof(int32_t), &output_dma, &output_obj, 0, &output_handle);
           
@@ -1321,6 +1325,26 @@ struct npu_task {
 
     void apply_scale(void) {
         output->scale = input->scale * weight->scale;
+    }
+
+    void set_weight_dma(uint64_t weights_dma) {
+        if (params.weights_dma == weights_dma) {
+            return;
+        }
+
+        params.weights_dma = weights_dma;
+        if (type == RKNN_TENSOR_FLOAT32) {
+            params.fp32tofp16 = 0;
+            int ret = gen_matmul_fp16(&params);
+            GGML_ASSERT(ret == 0);
+        } else if (type == RKNN_TENSOR_INT8) {
+            int ret = gen_matmul_int8(&params);
+            GGML_ASSERT(ret == 0);
+        } else {
+            GGML_ASSERT(false);
+        }
+
+        memcpy(regcmd, npu_regs, sizeof(npu_regs));
     }
 };
 
@@ -1591,7 +1615,7 @@ struct matmul_kernel {
                     std::shared_ptr<rknn_mem> weight(global_weight);
 #endif
                     auto output = outputs->Cs.find(std::make_tuple(mm, nn, kk))->second;
-                    tmp_tasks.emplace_back(std::make_shared<npu_task>(M, N, K, type, input, weight, output));
+                    tmp_tasks.emplace_back(std::make_shared<npu_task>(M, N, K, nn, kk, type, input, weight, output));
                     if (tmp_tasks.size() == NPU_CORE_NUM || nn + N >= n) {
                         npu_tasks.emplace_back(std::make_shared<npu_task_multi_core>(tmp_tasks));
                         tmp_tasks.clear();
@@ -1650,7 +1674,7 @@ struct rknpu_weight_prepack_block {
     int nn;
     int kk;
     float scale;
-    std::vector<uint8_t> packed;
+    std::shared_ptr<rknn_mem> dma_mem;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1766,11 +1790,12 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
             block.nn = nn;
             block.kk = kk;
             block.scale = 1.0f;
-            block.packed.resize(packed_size);
-            memset(block.packed.data(), 0, packed_size);
+            block.dma_mem = std::make_shared<rknn_mem>(packed_size);
+            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
+            memset(block.dma_mem->ptr, 0, packed_size);
 
             if (tensor_type == RKNN_TENSOR_FLOAT32) {
-                __fp16 * packed = (__fp16 *)block.packed.data();
+                __fp16 * packed = (__fp16 *)block.dma_mem->ptr;
                 const __fp16 * src_fp16 = (const __fp16 *)B;
                 for (int i = 0; i < N; i++) {
                     for (int j = 0; j < K; j++) {
@@ -1797,7 +1822,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
                 }
 
                 block.scale = scale / 127.f;
-                int8_t * packed = (int8_t *)block.packed.data();
+                int8_t * packed = (int8_t *)block.dma_mem->ptr;
                 for (int i = 0; i < N; i++) {
                     for (int j = 0; j < K; j++) {
                         int ii = nn + i;
@@ -2298,9 +2323,18 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
-                memcpy(weight_mem->ptr, block->packed.data(), block->packed.size());
+                GGML_ASSERT(block->dma_mem);
+                GGML_ASSERT(block->dma_mem->dma != 0);
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
+                }
+
+                for (const auto & task_group : kernel->npu_tasks) {
+                    for (const auto & task : task_group->npu_tasks) {
+                        if (task->nn == nn && task->kk == kk) {
+                            task->set_weight_dma(block->dma_mem->dma);
+                        }
+                    }
                 }
             }
 
