@@ -18,6 +18,7 @@
  *
  */
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -33,68 +34,86 @@
 
 #include <pthread.h>
 
-int fd;
-pthread_once_t fd_once;
+#define NPU_DEVICE "/dev/dri/card0"
+#define PREALLOC_PFN_BASE 0xa9000ULL
+#define PAGE_SIZE_BYTES   0x1000UL
+
+static int fd = -1;
+static int dev_mem_fd = -1;
+static size_t prealloc_used = 0;
+static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int npu_open(void);
 
-void fd_init(void)
-{
+static size_t page_align_up(size_t n) {
+  return (n + PAGE_SIZE_BYTES - 1) & ~(size_t)(PAGE_SIZE_BYTES - 1);
+}
+
+static void fd_init(void) {
   fd = npu_open();
   printf("%s %d: fd %d\n", __func__, __LINE__, fd);
 }
 
+static int ensure_dev_mem_open(void) {
+  if (dev_mem_fd >= 0) {
+    return 0;
+  }
+
+  dev_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+  if (dev_mem_fd < 0) {
+    printf("Failed to open /dev/mem, errno=%d\n", errno);
+    return -1;
+  }
+
+  return 0;
+}
+
 void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle) {
+  (void)flags;
+
   pthread_once(&fd_once, fd_init);
-  int ret;
-  struct rknpu_mem_create mem_create = {
-    0,
-    .flags = flags | RKNPU_MEM_NON_CACHEABLE,
-    .size = size,
-    0,0,0
-  };
-
-  ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_CREATE, &mem_create);
-  if(ret < 0)  {
-    printf("RKNPU_MEM_CREATE failed %d\n",ret);
+  if (size == 0) {
     return NULL;
   }
 
-  struct rknpu_mem_map mem_map = { .handle = mem_create.handle, 0, .offset=0 };
-  ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_MAP, &mem_map);
-  if(ret < 0) {
-    printf("RKNPU_MEM_MAP failed %d\n",ret);
+  pthread_mutex_lock(&mem_lock);
+  if (ensure_dev_mem_open() != 0) {
+    pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
 
-  void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mem_map.offset);
+  const size_t map_size = page_align_up(size);
+  const uint64_t phys_addr = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES + (uint64_t)prealloc_used;
+  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev_mem_fd, (off_t)phys_addr);
   if (map == MAP_FAILED) {
-    printf("Error: mmap failed, len=%zu, offset=%llu, errno %d\n", size, mem_map.offset, errno);
+    printf("mmap failed phys=0x%llx len=%zu errno=%d\n",
+           (unsigned long long)phys_addr, map_size, errno);
+    pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
+  prealloc_used += map_size;
+  pthread_mutex_unlock(&mem_lock);
 
-  *dma_addr = mem_create.dma_addr;
-  *obj = mem_create.obj_addr;
-  *handle = mem_create.handle;
-  static uint64_t sum = 0;
-  sum += size;
-  // printf("%s %d sum %ldMB dma %p va %p\n", __func__, __LINE__, sum / 1024 / 1024, (void *)mem_create.dma_addr, map);
+  if (dma_addr) {
+    *dma_addr = phys_addr;
+  }
+  if (obj) {
+    *obj = phys_addr;
+  }
+  if (handle) {
+    *handle = 0;
+  }
+
   return map;
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
-  pthread_once(&fd_once, fd_init);
-  munmap(addr, len);
+  (void)handle;
+  (void)obj_addr;
 
-  int ret;
-  struct rknpu_mem_destroy destroy = {
-    .handle = handle ,
-    0,
-    .obj_addr = obj_addr
-  };
-
-  ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &destroy);
-  if (ret <0) {
-    printf("RKNPU_MEM_DESTROY failed %d\n",ret);
+  if (addr && len) {
+    munmap(addr, page_align_up(len));
   }
 }
 
@@ -107,9 +126,9 @@ int npu_open(void) {
   memset(buf3, 0, sizeof(buf3));
 
   // Open DRI called "rknpu"
-  int local_fd = open("/dev/dri/card1", O_RDWR);
+  int local_fd = open(NPU_DEVICE, O_RDWR);
   if(local_fd<0) {
-    printf("Failed to open /dev/dri/card1 %d\n",errno);
+    printf("Failed to open %s %d\n", NPU_DEVICE, errno);
     return local_fd;
   }
 
@@ -142,9 +161,17 @@ int npu_reset(void) {
   return ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &act);	
 }
 
-int npu_submit(__u64 task_obj_addr, __u32 core_mask)
+int npu_submit(__u64 regcfg_obj_addr, __u32 core_mask)
 {
   pthread_once(&fd_once, fd_init);
+  struct rknpu_subcore_task subcore_tasks[5] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
+  for (int i = 0; i < 5; ++i) {
+    if (core_mask & (1u << i)) {
+      subcore_tasks[i].task_start = 0;
+      subcore_tasks[i].task_number = 1;
+    }
+  }
+
   struct rknpu_submit submit = {
     .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
     .timeout = 6000,
@@ -152,17 +179,18 @@ int npu_submit(__u64 task_obj_addr, __u32 core_mask)
     .task_number = 1,
     .task_counter = 0,
     .priority = 0,
-    .task_obj_addr = task_obj_addr,
-    .regcfg_obj_addr = 0,
+    .task_obj_addr = 0,
+    .regcfg_obj_addr = regcfg_obj_addr,
     .task_base_addr = 0,
     .user_data = 0,
     .core_mask = core_mask,
     .fence_fd = -1,
     .subcore_task = {
-      {
-        .task_start = 0,
-        .task_number = 1,
-      }, {0, 1}, {0, 1}, {0, 0}, {0, 0}
+      subcore_tasks[0],
+      subcore_tasks[1],
+      subcore_tasks[2],
+      subcore_tasks[3],
+      subcore_tasks[4]
     },
   };
   return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
