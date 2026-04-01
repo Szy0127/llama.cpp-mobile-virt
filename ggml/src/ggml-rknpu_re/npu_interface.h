@@ -11,7 +11,7 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
 
 int npu_reset(void);
-int npu_submit(uint64_t task_obj_addr, uint32_t core_mask);
+int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask);
 
 #ifdef __cplusplus
 }
