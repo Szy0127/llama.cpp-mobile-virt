@@ -1358,16 +1358,25 @@ struct npu_task_multi_core {
     npu_task_multi_core(const std::vector<std::shared_ptr<npu_task>> &tasks)
         : npu_tasks(tasks) {}
 
-#ifdef GGML_USE_CHCORE
     void submit(void) {
         GGML_ASSERT(npu_tasks.size() <= NPU_CORE_NUM);
-        std::vector<uint64_t> tasks_objs;
+        std::vector<__u64> tasks_objs;
         for (auto npu_task: npu_tasks) {
+    #ifdef GGML_USE_CHCORE
             npu_task->flush_cache();
-            tasks_objs.push_back(npu_task->tasks_obj);
+            tasks_objs.push_back((__u64) npu_task->tasks_obj);
+    #else
+            npu_task->flush_cache_before_submit();
+            tasks_objs.push_back((__u64) npu_task->regcmd_dma);
+    #endif
         }
         int ret = npu_submit_multi(tasks_objs.data(), tasks_objs.size(), (void *)ggml_thread_cpu_relax_out);
         GGML_ASSERT(ret == 0);
+    #ifndef GGML_USE_CHCORE
+        for (auto npu_task: npu_tasks) {
+            npu_task->flush_cache_after_submit();
+        }
+    #endif
         
         // Log NPU computation result immediately after completion
         for (size_t idx = 0; idx < npu_tasks.size(); idx++) {
@@ -1383,7 +1392,6 @@ struct npu_task_multi_core {
             // fprintf(stderr, "\n");
         }
     }
-#endif
     void apply_scale(void) {
         for (auto task: npu_tasks) {
             task->apply_scale();
@@ -2387,30 +2395,10 @@ void rknpu2_matmul_submit(struct ggml_tensor * dst, int nth, int ith) {
     auto kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, tensor_type);
     GGML_ASSERT(kernel);
 
-#ifdef GGML_USE_CHCORE
     for (auto task: kernel->npu_tasks) {
         task->apply_scale();
         task->submit();
     }
-#else
-    auto tasks = kernel->to_multi_npu(THREAD_NR);
-    for (int i = 0; i < THREAD_NR; i++)
-        npu_tasks[i].assign(tasks[i].begin(), tasks[i].end());
-
-    std::call_once(once_flag, init_npu_thread, THREAD_NR);
-
-    finished_nr = 0;
-    for (int i = 0; i < THREAD_NR; i++)
-        ready[i] = true;
-    cv_worker.notify_all();
-    // std::unique_lock<std::mutex> lock(mtx);
-    // cv_master.wait(lock, [] { return finished_nr == THREAD_NR; });
-    while (finished_nr.load() != THREAD_NR) {
-        ggml_thread_cpu_relax_out();
-    }
-    for (int i = 0; i < THREAD_NR; i++)
-        npu_tasks[i].clear();
-#endif
     finish = true;
     END_MEASURE_0;
 }
