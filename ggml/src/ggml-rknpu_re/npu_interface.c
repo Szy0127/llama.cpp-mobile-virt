@@ -165,6 +165,7 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask)
 {
   pthread_once(&fd_once, fd_init);
   struct rknpu_subcore_task subcore_tasks[5] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
+  struct rknpu_submit_extend submit_ext;
   for (int i = 0; i < 5; ++i) {
     if (core_mask & (1u << i)) {
       subcore_tasks[i].task_start = 0;
@@ -172,7 +173,8 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask)
     }
   }
 
-  struct rknpu_submit submit = {
+  memset(&submit_ext, 0, sizeof(submit_ext));
+  submit_ext.submit = (struct rknpu_submit) {
     .flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG,
     .timeout = 6000,
     .task_start = 0,
@@ -193,5 +195,45 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask)
       subcore_tasks[4]
     },
   };
-  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit);
+  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
+}
+
+int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num, void *polling)
+{
+  struct rknpu_submit_extend submit_ext;
+
+  (void)polling;
+
+  pthread_once(&fd_once, fd_init);
+  if (task_num <= 0 || task_num > RKNPU_MAX_MULTI_CORE_TASKS) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  memset(&submit_ext, 0, sizeof(submit_ext));
+  submit_ext.submit.flags = RKNPU_JOB_PC | RKNPU_JOB_BLOCK | RKNPU_JOB_PINGPONG;
+  submit_ext.submit.timeout = 6000;
+  submit_ext.submit.task_start = 0;
+  submit_ext.submit.task_number = 1;
+  submit_ext.submit.task_counter = 0;
+  submit_ext.submit.priority = 0;
+  submit_ext.submit.task_obj_addr = 0;
+  submit_ext.submit.regcfg_obj_addr = 0;
+  submit_ext.submit.task_base_addr = 0;
+  submit_ext.submit.user_data = 0;
+  submit_ext.submit.core_mask = 0;
+  submit_ext.submit.fence_fd = -1;
+  submit_ext.submit.submit_task_num = (__u32) task_num;
+
+  for (int core_index = 0; core_index < task_num; ++core_index) {
+    submit_ext.tasks[core_index].regcfg_obj_addr = regcfg_obj_addr[core_index];
+    submit_ext.tasks[core_index].task_base_addr = 0;
+    submit_ext.tasks[core_index].regcfg_amount = 104;
+    submit_ext.tasks[core_index].core_mask = (1u << core_index);
+    submit_ext.submit.core_mask |= submit_ext.tasks[core_index].core_mask;
+    submit_ext.submit.subcore_task[core_index].task_start = 0;
+    submit_ext.submit.subcore_task[core_index].task_number = 1;
+  }
+
+  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
 }

@@ -12,6 +12,7 @@ void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
 
 int npu_reset(void);
 int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask);
+int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num, void *polling);
 
 #ifdef __cplusplus
 }

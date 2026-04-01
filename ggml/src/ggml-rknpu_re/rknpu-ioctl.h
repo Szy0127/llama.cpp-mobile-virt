@@ -286,6 +286,22 @@ struct rknpu_submit {
         __u32 core_mask;
         __s32 fence_fd;
         struct rknpu_subcore_task subcore_task[5];
+        __u32 submit_task_num;
+        __u32 done_mask;
+};
+
+#define RKNPU_MAX_MULTI_CORE_TASKS 3
+
+struct rknpu_submit_task {
+        __u64 regcfg_obj_addr;
+        __u64 task_base_addr;
+        __u32 regcfg_amount;
+        __u32 core_mask;
+};
+
+struct rknpu_submit_extend {
+        struct rknpu_submit submit;
+        struct rknpu_submit_task tasks[RKNPU_MAX_MULTI_CORE_TASKS];
 };
 
 /**
@@ -306,6 +322,7 @@ struct rknpu_action {
 #define RKNPU_MEM_MAP 0x03
 #define RKNPU_MEM_DESTROY 0x04
 #define RKNPU_MEM_SYNC 0x05
+#define RKNPU_SUBMIT_EXT 0x06
 
 #define RKNPU_IOC_MAGIC 'r'
 #define RKNPU_IOW(nr, type) _IOW(RKNPU_IOC_MAGIC, nr, type)
@@ -349,6 +366,8 @@ struct drm_version {
         DRM_IOWR(DRM_COMMAND_BASE + RKNPU_MEM_DESTROY, struct rknpu_mem_destroy)
 #define DRM_IOCTL_RKNPU_MEM_SYNC                                               \
         DRM_IOWR(DRM_COMMAND_BASE + RKNPU_MEM_SYNC, struct rknpu_mem_sync)
+#define DRM_IOCTL_RKNPU_SUBMIT_EXT                                             \
+        DRM_IOWR(DRM_COMMAND_BASE + RKNPU_SUBMIT_EXT, struct rknpu_submit_extend)
 
 #define IOCTL_RKNPU_ACTION RKNPU_IOWR(RKNPU_ACTION, struct rknpu_action)
 #define IOCTL_RKNPU_SUBMIT RKNPU_IOWR(RKNPU_SUBMIT, struct rknpu_submit)
@@ -358,5 +377,7 @@ struct drm_version {
 #define IOCTL_RKNPU_MEM_DESTROY                                                \
         RKNPU_IOWR(RKNPU_MEM_DESTROY, struct rknpu_mem_destroy)
 #define IOCTL_RKNPU_MEM_SYNC RKNPU_IOWR(RKNPU_MEM_SYNC, struct rknpu_mem_sync)
+#define IOCTL_RKNPU_SUBMIT_EXT                                                 \
+        RKNPU_IOWR(RKNPU_SUBMIT_EXT, struct rknpu_submit_extend)
 
 #endif // RKNPU_IOCTL_H
