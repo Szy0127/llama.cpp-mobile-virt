@@ -1047,6 +1047,8 @@ inline size_t rknn_type_size_C(rknn_tensor_type type) {
     GGML_ASSERT(false);
 }
 
+static uint64_t total_allocated = 0;
+
 struct rknn_mem {
     size_t size;
     void *ptr;
@@ -1071,6 +1073,8 @@ struct rknn_mem {
         ptr = dma_ptr;
 #endif
         // GGML_ASSERT(dma_ptr);
+        total_allocated += size;
+        //fprintf(stderr, "rknn_mem allocated: %lu bytes, total allocated: %lu bytes\n", size, total_allocated);
         scale = 1.0;
         pthread_mutex_init(&scale_lock, 0);
     }
@@ -1191,41 +1195,37 @@ struct npu_task {
     uint64_t *regcmd;
     uint64_t regcmd_dma, regcmd_obj;
     uint64_t regcmd_handle;
+#ifdef GGML_USE_CHCORE
     struct rknpu_task *tasks;
     uint64_t tasks_dma, tasks_obj;
     uint64_t tasks_handle;
+#endif
     std::shared_ptr<rknn_mem> input; // A
     std::shared_ptr<rknn_mem> weight; // B
     std::shared_ptr<rknn_mem> output; // C
     uint64_t npu_regs[112];
     matmul_params_t params;
     rknn_tensor_type type;
-    void *output_ptr;
-    uint64_t output_obj;
-    uint64_t output_handle;
 
     npu_task(int M, int N, int K, int nn, int kk, rknn_tensor_type type,
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
         : M(M), N(N), K(K), nn(nn), kk(kk), input(input), weight(weight), output(output), type(type) {
-            uint64_t output_dma;
-            output_ptr = mem_allocate(M*N*sizeof(int32_t), &output_dma, &output_obj, 0, &output_handle);
-          
         regcmd = (uint64_t*)mem_allocate(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle);
         GGML_ASSERT(regcmd);
 
+#ifdef GGML_USE_CHCORE
         tasks = (rknpu_task *)mem_allocate(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle);
         GGML_ASSERT(tasks);
+#endif
         
         // memset(input->ptr, 1, input->size);
         //memset(weight->ptr, 1, 1);
         // *((int32_t*)weight->ptr) = 1;
-        // memset(output_ptr, 1, M*N*sizeof(int32_t));
         params.m = M;
         params.k = K;
         params.n = N;
         params.input_dma = input->dma;
         params.weights_dma = weight->dma;
-        // params.output_dma = output_dma;
         params.output_dma = output->dma;
         params.tasks = (uint64_t *)&npu_regs;
         if (type == RKNN_TENSOR_FLOAT32) {
@@ -1240,6 +1240,7 @@ struct npu_task {
         }
         memcpy(regcmd, npu_regs,sizeof(npu_regs));
 
+#ifdef GGML_USE_CHCORE
         tasks[0].flags  = 0;
         tasks[0].op_idx = 0;
         tasks[0].enable_mask = 0xd;
@@ -1249,16 +1250,17 @@ struct npu_task {
         tasks[0].regcfg_amount = sizeof(npu_regs)/sizeof(uint64_t)-(RKNPU_PC_DATA_EXTRA_AMOUNT+4);
         tasks[0].regcfg_offset = 0;
         tasks[0].regcmd_addr = regcmd_dma;
+#endif
 
         // memset(input->ptr, 1, input->size);
         // memset(weight->ptr, 1, weight->size);
-        // memset(output_ptr, 1, M*N*sizeof(int32_t));
     }
 
     ~npu_task(void) {
         mem_destroy(regcmd, 1024, regcmd_handle, regcmd_obj);
+#ifdef GGML_USE_CHCORE
         mem_destroy(tasks, 1024, tasks_handle, tasks_obj);
-        mem_destroy(output_ptr, M*N*sizeof(int32_t), output_handle, output_obj);
+#endif
     }
 
 #ifdef GGML_USE_CHCORE
@@ -1294,7 +1296,7 @@ struct npu_task {
         //     fprintf(stderr, "weight->ptr[%d] = %d\n", i, ((int32_t*)weight->ptr)[i]);
         // }
         // *((int32_t*)weight->ptr) = 1;
-        int ret = npu_submit(tasks_obj, (__u32)core_mask);
+        int ret = npu_submit(regcmd_dma, (__u32)core_mask);
         if (ret) {
             printf("RKNPU_SUBMIT returned %d, submitted m=%hu, k=%hu, n=%hu, errno %d\n",
                 ret, M, K, N, errno);
