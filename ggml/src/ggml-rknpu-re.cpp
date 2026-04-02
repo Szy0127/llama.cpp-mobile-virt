@@ -1051,7 +1051,6 @@ inline size_t rknn_type_size_C(rknn_tensor_type type) {
     GGML_ASSERT(false);
 }
 
-static uint64_t total_allocated = 0;
 struct rknn_mem {
     size_t size;
     void *ptr;
@@ -1076,8 +1075,6 @@ struct rknn_mem {
         ptr = dma_ptr;
 #endif
         // GGML_ASSERT(dma_ptr);
-        total_allocated += size;
-        fprintf(stderr, "rknn_mem allocated: %lu bytes, total allocated: %lu bytes\n", size, total_allocated);
         scale = 1.0;
         pthread_mutex_init(&scale_lock, 0);
     }
