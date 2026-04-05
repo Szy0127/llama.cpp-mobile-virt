@@ -290,6 +290,7 @@ void ggml_rknpu_dump_measure(void) {
 #include "rknpu-ioctl.h"
 #include "npu_interface.h"
 #include "npu_matmul.h"
+#include "rknpu-prepack-common.h"
 #ifdef USE_CPU_CHECK
 #include "matmul_cpu_check.h"
 #endif
@@ -304,7 +305,6 @@ void ggml_rknpu_dump_measure(void) {
 typedef int rknn_tensor_type;
 typedef int rknn_core_mask;
 
-const float SCALE_MIN = 1e-9;
 
 #define MAT_COPY
 
@@ -404,7 +404,7 @@ void dma_buf_free(size_t size, int *fd, void *va) {
 #define NPU_CORE_NUM (3)
 #define THREAD_NR (1)
 #else
-#define THREAD_NR (3)
+#define THREAD_NR (RKNPU_PREPACK_NPU_CORE_NUM)
 #define NPU_CORE_NUM THREAD_NR
 #endif
 #define NON_NPU_THREAD 0xdeadbeef
@@ -1084,7 +1084,7 @@ struct rknn_mem {
 #endif
         mem_destroy(dma_ptr, size, handle, obj);
     }
-    void init_scale(void) { scale = SCALE_MIN; }
+    void init_scale(void) { scale = RKNPU_PREPACK_SCALE_MIN; }
     void commit_scale(float _scale) {
         pthread_mutex_lock(&scale_lock);
         scale = std::max(scale, _scale);
@@ -1403,10 +1403,7 @@ struct matmul_kernel {
     std::shared_ptr<B_bufs> weights;
     std::shared_ptr<C_bufs> outputs;
     static inline int partition(int num, int max, int align) {
-        int div = (num + max - 1) / max;
-        int part = ((num + div - 1) / div + align - 1) / align * align;
-        GGML_ASSERT(part <= max && part % align == 0);
-        return part;
+        return rknpu_prepack_partition(num, max, align);
     }
     matmul_kernel(int m, int n, int k, rknn_tensor_type type)
         : m(m), n(n), k(k), type(type) {
@@ -1806,7 +1803,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
                 }
             } else {
                 GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
-                float scale = SCALE_MIN;
+                float scale = RKNPU_PREPACK_SCALE_MIN;
                 for (int i = 0; i < N; i++) {
                     for (int j = 0; j < K; j++) {
                         int ii = nn + i;
@@ -2189,7 +2186,7 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
     kernel->for_all_inputs(
         [&](int mm, int kk, int M, int K, std::shared_ptr<rknn_mem> input_mem) {
             if (tensor_type == RKNN_TENSOR_INT8) {
-                float scale = SCALE_MIN;
+                float scale = RKNPU_PREPACK_SCALE_MIN;
                 for (int i = input_mem->pre_scale_cnt.fetch_add(1); i < M; i = input_mem->pre_scale_cnt.fetch_add(1)) {
                     int ii = mm + i;
                     if (ii >= m) break;
@@ -2218,7 +2215,7 @@ void rknpu2_matmul_pre_scale(struct ggml_tensor * dst, int nth, int ith) {
                 //     g_weight_block_miss_prescale_cnt.fetch_add(1);
                 // }
                 // const float *fB_local = ensure_fB();
-                // float scale = SCALE_MIN;
+                // float scale = RKNPU_PREPACK_SCALE_MIN;
                 // for (int i = weight_mem->pre_scale_cnt.fetch_add(1); i < N; i = weight_mem->pre_scale_cnt.fetch_add(1))
                 //     for (int j = 0; j < K; j++) {
                 //         int ii = nn + i;

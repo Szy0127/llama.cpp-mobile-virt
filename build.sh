@@ -16,6 +16,7 @@ cmake -Bbuild -H. \
     -DGGML_RKNPU_RE=ON
 
 
+# cmake --build build -j10 --target llama-rknpu-prepack
 
 cmake --build build -j20 --target llama-cli
 scp build/bin/llama-cli opi5:~
