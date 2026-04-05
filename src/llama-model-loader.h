@@ -12,6 +12,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -24,6 +25,21 @@ enum llama_fver {
 const char * llama_file_version_name(llama_fver version);
 
 struct llama_model_loader {
+    struct llama_rknpu_prepack_meta {
+        bool enabled = false;
+        std::string blob_tensor;
+        std::string layout;
+        uint32_t K = 0;
+        uint32_t N = 0;
+        uint32_t block_count = 0;
+        uint32_t weight_bytes_per_block = 0;
+        uint32_t scale_type = 0;
+        uint32_t scales_offset = 0;
+        uint32_t packed_offset = 0;
+        uint32_t scales_bytes_total = 0;
+        uint32_t packed_bytes_total = 0;
+    };
+
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
@@ -78,6 +94,9 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    std::map<std::string, llama_tensor_weight, weight_name_comparer> auxiliary_weights_map; // for RKNPU prepack blobs
+    std::unordered_map<std::string, llama_rknpu_prepack_meta> rknpu_prepack_meta_map; // key: original tensor name (e.g. "model.layers.0.attention.wq.weight"), value: prepack meta
+    bool rknpu_prepack_present = false;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -135,6 +154,14 @@ struct llama_model_loader {
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
+
+    const llama_tensor_weight * get_aux_weight(const char * name) const;
+
+    const llama_rknpu_prepack_meta * get_rknpu_prepack_meta(const char * name) const;
+
+    const std::unordered_map<std::string, llama_rknpu_prepack_meta> & get_rknpu_prepack_metas() const;
+
+    bool get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const;
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 

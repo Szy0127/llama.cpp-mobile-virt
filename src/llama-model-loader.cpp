@@ -7,6 +7,74 @@
 #include <cstring>
 #include <future>
 
+namespace {
+
+static constexpr const char * RKNPU_PREPACK_BLOB_SUFFIX = ".__rknpu_blob";
+
+static bool llama_is_rknpu_prepack_blob_name(const char * name) {
+    if (name == nullptr) {
+        return false;
+    }
+
+    const std::string s(name);
+    const std::string suffix = RKNPU_PREPACK_BLOB_SUFFIX;
+    return s.size() > suffix.size() && s.rfind(suffix) == s.size() - suffix.size();
+}
+
+static bool llama_try_get_u32(const gguf_context * meta, const std::string & key, uint32_t & out) {
+    const int kid = gguf_find_key(meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_UINT32) {
+        return false;
+    }
+    out = gguf_get_val_u32(meta, kid);
+    return true;
+}
+
+static bool llama_try_get_bool(const gguf_context * meta, const std::string & key, bool & out) {
+    const int kid = gguf_find_key(meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_BOOL) {
+        return false;
+    }
+    out = gguf_get_val_bool(meta, kid);
+    return true;
+}
+
+static bool llama_try_get_str(const gguf_context * meta, const std::string & key, std::string & out) {
+    const int kid = gguf_find_key(meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_STRING) {
+        return false;
+    }
+    out = gguf_get_val_str(meta, kid);
+    return true;
+}
+
+static bool llama_try_load_rknpu_prepack_meta(const gguf_context * meta, const std::string & tensor_name, llama_model_loader::llama_rknpu_prepack_meta & out) {
+    const std::string prefix = "rknpu.tensor." + tensor_name + ".";
+    bool enabled = false;
+    if (!llama_try_get_bool(meta, prefix + "enabled", enabled) || !enabled) {
+        return false;
+    }
+
+    if (!llama_try_get_str(meta, prefix + "blob_tensor", out.blob_tensor) ||
+        !llama_try_get_str(meta, prefix + "layout", out.layout) ||
+        !llama_try_get_u32(meta, prefix + "K", out.K) ||
+        !llama_try_get_u32(meta, prefix + "N", out.N) ||
+        !llama_try_get_u32(meta, prefix + "block_count", out.block_count) ||
+        !llama_try_get_u32(meta, prefix + "weight_bytes_per_block", out.weight_bytes_per_block) ||
+        !llama_try_get_u32(meta, prefix + "scale_type", out.scale_type) ||
+        !llama_try_get_u32(meta, prefix + "scales_offset", out.scales_offset) ||
+        !llama_try_get_u32(meta, prefix + "packed_offset", out.packed_offset) ||
+        !llama_try_get_u32(meta, prefix + "scales_bytes_total", out.scales_bytes_total) ||
+        !llama_try_get_u32(meta, prefix + "packed_bytes_total", out.packed_bytes_total)) {
+        return false;
+    }
+
+    out.enabled = true;
+    return true;
+}
+
+} // namespace
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -483,13 +551,20 @@ llama_model_loader::llama_model_loader(
     // so we build a unified tensors index for weights.
     for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string tensor_name = std::string(cur->name);
-        // make sure there is no duplicated tensor names
-        if (weights_map.find(tensor_name) != weights_map.end()) {
+        const bool is_aux = llama_is_rknpu_prepack_blob_name(cur->name);
+        auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;
+        if (tensor_map.find(tensor_name) != tensor_map.end()) {
             throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
         }
         n_elements += ggml_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
-        weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
+        tensor_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
+        if (!is_aux) {
+            llama_rknpu_prepack_meta prepack_meta;
+            if (llama_try_load_rknpu_prepack_meta(meta.get(), tensor_name, prepack_meta)) {
+                rknpu_prepack_meta_map.emplace(tensor_name, std::move(prepack_meta));
+            }
+        }
     }
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -549,27 +624,40 @@ llama_model_loader::llama_model_loader(
             // Save tensors data offset info of the shard.
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                 std::string tensor_name = std::string(cur->name);
-                // make sure there is no duplicated tensor names
-                if (weights_map.find(tensor_name) != weights_map.end()) {
+                const bool is_aux = llama_is_rknpu_prepack_blob_name(cur->name);
+                auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;
+                if (tensor_map.find(tensor_name) != tensor_map.end()) {
                     throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                 }
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
-                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                tensor_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
             }
         }
 
-        get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
-
-        // sanity check
         {
-            const int n_tensors_loaded = (int) weights_map.size();
-            if (n_tensors != n_tensors_loaded) {
-                throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
+            uint32_t n_tensors_total = 0;
+            get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors_total);
+
+            const uint32_t n_tensors_loaded = weights_map.size() + auxiliary_weights_map.size();
+            if (n_tensors_total != n_tensors_loaded) {
+                throw std::runtime_error(format("corrupted model: %u tensors expected but %u found", n_tensors_total, n_tensors_loaded));
             }
         }
 
         LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+    }
+
+    {
+        uint32_t prepack_version = 0;
+        std::string prepack_backend;
+        std::string prepack_format;
+        rknpu_prepack_present =
+            llama_try_get_u32(meta.get(), "rknpu.prepack.version", prepack_version) &&
+            llama_try_get_str(meta.get(), "rknpu.prepack.backend", prepack_backend) &&
+            llama_try_get_str(meta.get(), "rknpu.prepack.format", prepack_format) &&
+            prepack_backend == "rknpu2" &&
+            prepack_format == "blob-v1";
     }
 
     n_kv      = gguf_get_n_kv(meta.get());
@@ -713,6 +801,52 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
     }
     return *weight;
+}
+
+const llama_model_loader::llama_tensor_weight * llama_model_loader::get_aux_weight(const char * name) const {
+    auto pos = auxiliary_weights_map.find(name);
+    if (pos != auxiliary_weights_map.end()) {
+        return &pos->second;
+    }
+
+    return nullptr;
+}
+
+const llama_model_loader::llama_rknpu_prepack_meta * llama_model_loader::get_rknpu_prepack_meta(const char * name) const {
+    if (!rknpu_prepack_present) {
+        return nullptr;
+    }
+    auto it = rknpu_prepack_meta_map.find(name);
+    if (it == rknpu_prepack_meta_map.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+const std::unordered_map<std::string, llama_model_loader::llama_rknpu_prepack_meta> & llama_model_loader::get_rknpu_prepack_metas() const {
+    return rknpu_prepack_meta_map;
+}
+
+bool llama_model_loader::get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const {
+    const llama_tensor_weight * weight = get_aux_weight(tensor_name);
+    if (!weight) {
+        return false;
+    }
+
+    const size_t n_size = ggml_nbytes(weight->tensor);
+    data.resize(n_size);
+
+    if (use_mmap) {
+        const auto & mapping = mappings.at(weight->idx);
+        std::memcpy(data.data(), (const uint8_t *) mapping->addr() + weight->offs, n_size);
+    } else {
+        GGML_ASSERT(weight->idx < files.size());
+        const auto & file = files.at(weight->idx);
+        file->seek(weight->offs, SEEK_SET);
+        file->read_raw(data.data(), n_size);
+    }
+
+    return true;
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {

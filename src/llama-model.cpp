@@ -8,6 +8,7 @@
 #include "llama-kv-cache.h"
 
 #include "ggml-cpp.h"
+#include "ggml-rknpu-re.h"
 
 #include <algorithm>
 #include <cassert>
@@ -403,7 +404,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
-llama_model::~llama_model() {}
+llama_model::~llama_model() {
+    ggml_rknpu2_clear_offline_prepack_registry();
+}
 
 void llama_model::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
@@ -4119,6 +4122,40 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+    ggml_rknpu2_clear_offline_prepack_registry();
+    size_t rknpu_blob_bytes_total = 0;
+    size_t rknpu_blob_count = 0;
+    for (const auto & it : ml.get_rknpu_prepack_metas()) {
+        const std::string & tensor_name = it.first;
+        const auto & meta = it.second;
+        std::vector<uint8_t> blob_data;
+        if (!ml.get_rknpu_prepack_data(meta.blob_tensor.c_str(), blob_data)) {
+            continue;
+        }
+
+        ggml_rknpu_prepack_meta backend_meta = {
+            tensor_name.c_str(),
+            meta.blob_tensor.c_str(),
+            meta.layout.c_str(),
+            meta.K,
+            meta.N,
+            meta.block_count,
+            meta.weight_bytes_per_block,
+            meta.scale_type,
+            meta.scales_offset,
+            meta.packed_offset,
+            meta.scales_bytes_total,
+            meta.packed_bytes_total,
+        };
+        if (ggml_rknpu2_register_offline_prepack(&backend_meta, blob_data.data(), blob_data.size())) {
+            rknpu_blob_bytes_total += blob_data.size();
+            rknpu_blob_count += 1;
+        }
+    }
+    if (rknpu_blob_count > 0) {
+        LLAMA_LOG_INFO("%s: registered %zu RKNPU prepack blobs, total size = %8.2f MiB\n", __func__, rknpu_blob_count, rknpu_blob_bytes_total / 1024.0 / 1024.0);
+    }
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
