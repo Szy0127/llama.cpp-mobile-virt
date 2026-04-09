@@ -264,6 +264,22 @@ void llama_file::read_raw(void * ptr, size_t len) const { pimpl->read_raw(ptr, l
 
 uint32_t llama_file::read_u32() const { return pimpl->read_u32(); }
 
+void llama_file::advise_dontneed(size_t offset, size_t len) const {
+#if defined(__linux__)
+    if (len == 0) {
+        return;
+    }
+
+    if (posix_fadvise(file_id(), offset, len, POSIX_FADV_DONTNEED) != 0) {
+        LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n",
+                strerror(errno));
+    }
+#else
+    GGML_UNUSED(offset);
+    GGML_UNUSED(len);
+#endif
+}
+
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 

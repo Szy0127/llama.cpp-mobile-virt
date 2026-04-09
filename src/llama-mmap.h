@@ -26,6 +26,8 @@ struct llama_file {
     void read_raw(void * ptr, size_t len) const;
     uint32_t read_u32() const;
 
+    void advise_dontneed(size_t offset, size_t len) const;
+
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
