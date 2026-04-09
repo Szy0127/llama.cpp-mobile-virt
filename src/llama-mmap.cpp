@@ -270,9 +270,25 @@ void llama_file::advise_dontneed(size_t offset, size_t len) const {
         return;
     }
 
-    if (posix_fadvise(file_id(), offset, len, POSIX_FADV_DONTNEED) != 0) {
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        return;
+    }
+
+    const size_t page_size = static_cast<size_t>(page_size_long);
+    const size_t aligned_offset = offset / page_size * page_size;
+    const size_t end = offset + len;
+    const size_t aligned_end = ((end + page_size - 1) / page_size) * page_size;
+
+    if (aligned_end <= aligned_offset) {
+        return;
+    }
+
+    errno = 0;
+    const int ret = posix_fadvise(file_id(), aligned_offset, aligned_end - aligned_offset, POSIX_FADV_DONTNEED);
+    if (ret != 0) {
         LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n",
-                strerror(errno));
+                strerror(ret));
     }
 #else
     GGML_UNUSED(offset);
