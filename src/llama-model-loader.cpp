@@ -1102,6 +1102,12 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (!use_mmap) {
+            for (const auto & file : files) {
+                file->advise_dontneed(0, file->size());
+            }
+        }
+
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
