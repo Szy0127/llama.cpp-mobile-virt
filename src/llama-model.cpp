@@ -1661,6 +1661,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             ggml_backend_buffer_type_t buft = nullptr;
+            const bool is_rknpu_only = (t_meta->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY) != 0;
 
             // check overrides
             if (ml.tensor_buft_overrides) {
@@ -1675,6 +1676,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_buft_name(buft));
                         break;
                     }
+                }
+            }
+
+            if (is_rknpu_only) {
+                if (buft != nullptr && std::strcmp(ggml_backend_buft_name(buft), GGML_RKNPU2_NAME) != 0) {
+                    throw std::runtime_error(format("RKNPU-only tensor %s must use %s buffer type", tn.str().c_str(), GGML_RKNPU2_NAME));
+                }
+                if (buft == nullptr) {
+                    for (const auto & cur : *buft_list) {
+                        if (std::strcmp(ggml_backend_buft_name(cur.second), GGML_RKNPU2_NAME) == 0) {
+                            buft = cur.second;
+                            break;
+                        }
+                    }
+                }
+                if (buft == nullptr) {
+                    throw std::runtime_error(format("RKNPU-only tensor %s requires %s buffer type", tn.str().c_str(), GGML_RKNPU2_NAME));
                 }
             }
 
@@ -4131,7 +4149,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         const auto & meta = it.second;
         std::vector<uint8_t> blob_data;
         if (!ml.get_rknpu_prepack_data(meta.blob_tensor.c_str(), blob_data)) {
-            continue;
+            throw std::runtime_error(format("%s: missing RKNPU blob tensor '%s' for tensor '%s'", __func__, meta.blob_tensor.c_str(), tensor_name.c_str()));
         }
 
         ggml_rknpu_prepack_meta backend_meta = {
@@ -4149,6 +4167,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             meta.packed_bytes_total,
         };
         if (ggml_rknpu2_register_offline_prepack(&backend_meta, blob_data.data(), blob_data.size())) {
+            LLAMA_LOG_DEBUG("%s: registered RKNPU blob '%s' for tensor '%s' size=%zu bytes\n",
+                    __func__, meta.blob_tensor.c_str(), tensor_name.c_str(), blob_data.size());
             rknpu_blob_bytes_total += blob_data.size();
             rknpu_blob_count += 1;
         }

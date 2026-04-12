@@ -22,6 +22,8 @@ GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_buffer_type(void);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpure_buffer_type(int32_t dev_num);
 GGML_API  int32_t ggml_backend_rknpu2_get_device_count(void);
 
+#define GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY    (1u << 16)
+
 struct ggml_rknpu_prepack_meta {
     const char * tensor_name;
     const char * blob_tensor_name;

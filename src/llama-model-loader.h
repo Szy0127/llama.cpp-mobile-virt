@@ -27,6 +27,8 @@ const char * llama_file_version_name(llama_fver version);
 struct llama_model_loader {
     struct llama_rknpu_prepack_meta {
         bool enabled = false;
+        uint32_t orig_type = 0;
+        int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         std::string blob_tensor;
         std::string layout;
         uint32_t K = 0;
@@ -42,10 +44,13 @@ struct llama_model_loader {
 
     // Holds information on a model weight
     struct llama_tensor_weight {
-        uint16_t  idx; // source file index
-        size_t   offs; // tensor data offset in the original file
+        uint16_t  idx = 0; // source file index
+        size_t   offs = 0; // tensor data offset in the original file
+        bool is_rknpu_only = false;
 
-        ggml_tensor * tensor;
+        ggml_tensor * tensor = nullptr;
+
+        llama_tensor_weight() = default;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
@@ -57,6 +62,9 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+        }
+
+        explicit llama_tensor_weight(ggml_tensor * tensor) : idx(UINT16_MAX), offs(0), is_rknpu_only(true), tensor(tensor) {
         }
     };
 
@@ -97,6 +105,7 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> auxiliary_weights_map; // for RKNPU prepack blobs
     std::unordered_map<std::string, llama_rknpu_prepack_meta> rknpu_prepack_meta_map; // key: original tensor name (e.g. "model.layers.0.attention.wq.weight"), value: prepack meta
     bool rknpu_prepack_present = false;
+    uint32_t n_tensors_physical = 0;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 

@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+#include "ggml-rknpu-re.h"
 
 #include <array>
 #include <cinttypes>
@@ -10,6 +11,8 @@
 namespace {
 
 static constexpr const char * RKNPU_PREPACK_BLOB_SUFFIX = ".__rknpu_blob";
+static constexpr const char * RKNPU_PREPACK_TENSOR_PREFIX = "rknpu.tensor.";
+static constexpr const char * RKNPU_PREPACK_ENABLED_SUFFIX = ".enabled";
 
 static bool llama_is_rknpu_prepack_blob_name(const char * name) {
     if (name == nullptr) {
@@ -27,6 +30,15 @@ static bool llama_try_get_u32(const gguf_context * meta, const std::string & key
         return false;
     }
     out = gguf_get_val_u32(meta, kid);
+    return true;
+}
+
+static bool llama_try_get_i64(const gguf_context * meta, const std::string & key, int64_t & out) {
+    const int kid = gguf_find_key(meta, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(meta, kid) != GGUF_TYPE_INT64) {
+        return false;
+    }
+    out = gguf_get_val_i64(meta, kid);
     return true;
 }
 
@@ -67,6 +79,23 @@ static bool llama_try_load_rknpu_prepack_meta(const gguf_context * meta, const s
         !llama_try_get_u32(meta, prefix + "scales_bytes_total", out.scales_bytes_total) ||
         !llama_try_get_u32(meta, prefix + "packed_bytes_total", out.packed_bytes_total)) {
         return false;
+    }
+
+    if (!llama_try_get_u32(meta, prefix + "orig_type", out.orig_type) ||
+        !llama_try_get_i64(meta, prefix + "ne0", out.ne[0]) ||
+        !llama_try_get_i64(meta, prefix + "ne1", out.ne[1]) ||
+        !llama_try_get_i64(meta, prefix + "ne2", out.ne[2]) ||
+        !llama_try_get_i64(meta, prefix + "ne3", out.ne[3])) {
+        return false;
+    }
+
+    if (out.orig_type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (out.ne[i] <= 0) {
+            return false;
+        }
     }
 
     out.enabled = true;
@@ -558,13 +587,8 @@ llama_model_loader::llama_model_loader(
         }
         n_elements += ggml_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
+        ++n_tensors_physical;
         tensor_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
-        if (!is_aux) {
-            llama_rknpu_prepack_meta prepack_meta;
-            if (llama_try_load_rknpu_prepack_meta(meta.get(), tensor_name, prepack_meta)) {
-                rknpu_prepack_meta_map.emplace(tensor_name, std::move(prepack_meta));
-            }
-        }
     }
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -631,6 +655,7 @@ llama_model_loader::llama_model_loader(
                 }
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
+                ++n_tensors_physical;
                 tensor_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
             }
         }
@@ -639,9 +664,8 @@ llama_model_loader::llama_model_loader(
             uint32_t n_tensors_total = 0;
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors_total);
 
-            const uint32_t n_tensors_loaded = weights_map.size() + auxiliary_weights_map.size();
-            if (n_tensors_total != n_tensors_loaded) {
-                throw std::runtime_error(format("corrupted model: %u tensors expected but %u found", n_tensors_total, n_tensors_loaded));
+            if (n_tensors_total != n_tensors_physical) {
+                throw std::runtime_error(format("corrupted model: %u tensors expected but %u found", n_tensors_total, n_tensors_physical));
             }
         }
 
@@ -658,6 +682,58 @@ llama_model_loader::llama_model_loader(
             llama_try_get_str(meta.get(), "rknpu.prepack.format", prepack_format) &&
             prepack_backend == "rknpu2" &&
             prepack_format == "blob-v1";
+    }
+
+    if (rknpu_prepack_present) {
+        size_t rknpu_prepack_meta_count = 0;
+        size_t rknpu_only_tensor_count = 0;
+
+        for (int i = 0; i < gguf_get_n_kv(meta.get()); ++i) {
+            const char * key = gguf_get_key(meta.get(), i);
+            if (key == nullptr) {
+                continue;
+            }
+            const std::string key_str(key);
+            if (key_str.rfind(RKNPU_PREPACK_TENSOR_PREFIX, 0) != 0) {
+                continue;
+            }
+            if (key_str.size() <= strlen(RKNPU_PREPACK_ENABLED_SUFFIX) ||
+                key_str.rfind(RKNPU_PREPACK_ENABLED_SUFFIX) != key_str.size() - strlen(RKNPU_PREPACK_ENABLED_SUFFIX)) {
+                continue;
+            }
+
+            const std::string tensor_name = key_str.substr(
+                strlen(RKNPU_PREPACK_TENSOR_PREFIX),
+                key_str.size() - strlen(RKNPU_PREPACK_TENSOR_PREFIX) - strlen(RKNPU_PREPACK_ENABLED_SUFFIX));
+
+            llama_rknpu_prepack_meta meta_out;
+            if (llama_try_load_rknpu_prepack_meta(meta.get(), tensor_name, meta_out)) {
+                rknpu_prepack_meta_map[tensor_name] = std::move(meta_out);
+                ++rknpu_prepack_meta_count;
+            }
+        }
+
+        for (const auto & it : rknpu_prepack_meta_map) {
+            const std::string & tensor_name = it.first;
+            const auto & meta_prepack = it.second;
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("%s: tensor '%s' still has canonical GGUF data; RKNPU-prepacked tensors must drop the CPU weight", __func__, tensor_name.c_str()));
+            }
+
+            ggml_tensor * tensor = ggml_new_tensor(contexts.front().get(), static_cast<ggml_type>(meta_prepack.orig_type), GGML_MAX_DIMS, meta_prepack.ne);
+            if (tensor == nullptr) {
+                throw std::runtime_error(format("%s: failed to synthesize canonical tensor '%s' from RKNPU metadata", __func__, tensor_name.c_str()));
+            }
+            ggml_set_name(tensor, tensor_name.c_str());
+            tensor->flags |= GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY;
+            weights_map.emplace(tensor_name, llama_tensor_weight(tensor));
+            ++rknpu_only_tensor_count;
+            LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s blob=%s\n",
+                    __func__, tensor_name.c_str(), ggml_type_name(tensor->type), llama_format_tensor_shape(tensor).c_str(), meta_prepack.blob_tensor.c_str());
+        }
+
+        LLAMA_LOG_INFO("%s: found %zu RKNPU prepack metadata entries, synthesized %zu canonical tensors\n",
+                __func__, rknpu_prepack_meta_count, rknpu_only_tensor_count);
     }
 
     n_kv      = gguf_get_n_kv(meta.get());
@@ -906,9 +982,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+    tensor->flags |= (cur->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY);
 
     if (duplicated) {
-        size_data += ggml_nbytes(cur);
+        if ((cur->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY) == 0) {
+            size_data += ggml_nbytes(cur);
+        }
     } else {
         n_created++;
     }
@@ -980,6 +1059,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
+        if (it.second.is_rknpu_only) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }
@@ -1003,6 +1085,11 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
+
+    if (w.is_rknpu_only) {
+        LLAMA_LOG_DEBUG("%s: skipping RKNPU-only tensor '%s'\n", __func__, ggml_get_name(cur));
+        return;
+    }
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1138,6 +1225,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->is_rknpu_only) {
+            LLAMA_LOG_DEBUG("%s: skipping RKNPU-only tensor '%s' during bulk load\n", __func__, ggml_get_name(cur));
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

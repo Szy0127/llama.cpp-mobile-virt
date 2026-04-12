@@ -60,7 +60,6 @@ struct params {
     std::unordered_set<std::string> include_tensors;
     bool list_only = false;
 };
-
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
 using ggml_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 
@@ -147,7 +146,8 @@ static bool is_selected_tensor(const ggml_tensor * tensor, const params & p) {
     return p.include_tensors.count(tensor->name) > 0;
 }
 
-static void set_tensor_meta(gguf_context * ctx, const std::string & prefix, const blob_result & blob, const char * blob_name) {
+static void set_tensor_meta(gguf_context * ctx, const std::string & prefix, const ggml_tensor * tensor, const blob_result & blob, const char * blob_name) {
+    // create NPU prepack metadata for this tensor.
     gguf_set_val_bool(ctx, (prefix + "enabled").c_str(), true);
     gguf_set_val_str (ctx, (prefix + "layout").c_str(), blob.layout_name);
     gguf_set_val_u32 (ctx, (prefix + "K").c_str(), blob.header.K);
@@ -160,6 +160,12 @@ static void set_tensor_meta(gguf_context * ctx, const std::string & prefix, cons
     gguf_set_val_u32 (ctx, (prefix + "packed_offset").c_str(), blob.packed_offset);
     gguf_set_val_u32 (ctx, (prefix + "scales_bytes_total").c_str(), blob.header.scales_bytes_total);
     gguf_set_val_u32 (ctx, (prefix + "packed_bytes_total").c_str(), blob.header.packed_bytes_total);
+    
+    gguf_set_val_u32(ctx, (prefix + "orig_type").c_str(), static_cast<uint32_t>(tensor->type));
+    gguf_set_val_i64(ctx, (prefix + "ne0").c_str(), tensor->ne[0]);
+    gguf_set_val_i64(ctx, (prefix + "ne1").c_str(), tensor->ne[1]);
+    gguf_set_val_i64(ctx, (prefix + "ne2").c_str(), tensor->ne[2]);
+    gguf_set_val_i64(ctx, (prefix + "ne3").c_str(), tensor->ne[3]);
 }
 
 static blob_result build_blob(const ggml_tensor * tensor) {
@@ -326,10 +332,15 @@ static int run(const params & p) {
     std::vector<std::vector<uint8_t>> blobs;
     blobs.reserve(selected_names.size());
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
+    const std::unordered_set<std::string> selected_set(selected_names.begin(), selected_names.end());
 
     for (int64_t i = 0; i < n_tensors; ++i) {
         ggml_tensor * src_tensor = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(ctx_in.get(), i));
         GGML_ASSERT(src_tensor != nullptr);
+
+        if (selected_set.count(src_tensor->name) > 0) {
+            continue;
+        }
 
         ggml_tensor * out_tensor = ggml_new_tensor(out_ctx.get(), src_tensor->type, ggml_n_dims(src_tensor), src_tensor->ne);
         GGML_ASSERT(out_tensor != nullptr);
@@ -371,7 +382,7 @@ static int run(const params & p) {
             layout_name,
         };
         const std::string prefix = "rknpu.tensor." + name + ".";
-        set_tensor_meta(ctx_out.get(), prefix, meta_blob, blob_name.c_str());
+        set_tensor_meta(ctx_out.get(), prefix, tensor, meta_blob, blob_name.c_str());
     }
 
     std::ofstream out(p.output, std::ios::binary);
