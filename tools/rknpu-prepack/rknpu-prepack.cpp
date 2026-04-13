@@ -352,6 +352,7 @@ static int run(const params & p) {
     }
 
     for (const auto & name : selected_names) {
+        std::fprintf(stderr, "converting tensor '%s'...\n", name.c_str());
         ggml_tensor * tensor = ggml_get_tensor(meta_ctx.get(), name.c_str());
         GGML_ASSERT(tensor != nullptr);
 

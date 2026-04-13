@@ -713,27 +713,41 @@ llama_model_loader::llama_model_loader(
             }
         }
 
-        for (const auto & it : rknpu_prepack_meta_map) {
-            const std::string & tensor_name = it.first;
-            const auto & meta_prepack = it.second;
-            if (weights_map.find(tensor_name) != weights_map.end()) {
-                throw std::runtime_error(format("%s: tensor '%s' still has canonical GGUF data; RKNPU-prepacked tensors must drop the CPU weight", __func__, tensor_name.c_str()));
+        if (!rknpu_prepack_meta_map.empty()) {
+            ggml_init_params meta_ctx_params = {
+                /*.mem_size   = */ rknpu_prepack_meta_map.size() * ggml_tensor_overhead(),
+                /*.mem_buffer = */ nullptr,
+                /*.no_alloc   = */ true,
+            };
+            ggml_context_ptr meta_ctx_ptr { ggml_init(meta_ctx_params) };
+            if (!meta_ctx_ptr) {
+                throw std::runtime_error(format("%s: failed to allocate metadata context for %zu RKNPU-only tensors", __func__, rknpu_prepack_meta_map.size()));
+            }
+            ggml_context * rknpu_only_meta_ctx = meta_ctx_ptr.get();
+            contexts.emplace_back(std::move(meta_ctx_ptr));
+        
+            for (const auto & it : rknpu_prepack_meta_map) {
+                const std::string & tensor_name = it.first;
+                const auto & meta_prepack = it.second;
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("%s: tensor '%s' still has canonical GGUF data; RKNPU-prepacked tensors must drop the CPU weight", __func__, tensor_name.c_str()));
+                }
+
+                ggml_tensor * tensor = ggml_new_tensor(rknpu_only_meta_ctx, static_cast<ggml_type>(meta_prepack.orig_type), GGML_MAX_DIMS, meta_prepack.ne);
+                if (tensor == nullptr) {
+                    throw std::runtime_error(format("%s: failed to synthesize canonical tensor '%s' from RKNPU metadata", __func__, tensor_name.c_str()));
+                }
+                ggml_set_name(tensor, tensor_name.c_str());
+                tensor->flags |= GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY;
+                weights_map.emplace(tensor_name, llama_tensor_weight(tensor));
+                ++rknpu_only_tensor_count;
+                LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s blob=%s\n",
+                        __func__, tensor_name.c_str(), ggml_type_name(tensor->type), llama_format_tensor_shape(tensor).c_str(), meta_prepack.blob_tensor.c_str());
             }
 
-            ggml_tensor * tensor = ggml_new_tensor(contexts.front().get(), static_cast<ggml_type>(meta_prepack.orig_type), GGML_MAX_DIMS, meta_prepack.ne);
-            if (tensor == nullptr) {
-                throw std::runtime_error(format("%s: failed to synthesize canonical tensor '%s' from RKNPU metadata", __func__, tensor_name.c_str()));
-            }
-            ggml_set_name(tensor, tensor_name.c_str());
-            tensor->flags |= GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY;
-            weights_map.emplace(tensor_name, llama_tensor_weight(tensor));
-            ++rknpu_only_tensor_count;
-            LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s blob=%s\n",
-                    __func__, tensor_name.c_str(), ggml_type_name(tensor->type), llama_format_tensor_shape(tensor).c_str(), meta_prepack.blob_tensor.c_str());
+            fprintf(stderr, "%s: found %zu RKNPU prepack metadata entries, synthesized %zu canonical tensors\n",
+                    __func__, rknpu_prepack_meta_count, rknpu_only_tensor_count);
         }
-
-        LLAMA_LOG_INFO("%s: found %zu RKNPU prepack metadata entries, synthesized %zu canonical tensors\n",
-                __func__, rknpu_prepack_meta_count, rknpu_only_tensor_count);
     }
 
     n_kv      = gguf_get_n_kv(meta.get());

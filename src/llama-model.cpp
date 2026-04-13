@@ -1680,20 +1680,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             if (is_rknpu_only) {
-                if (buft != nullptr && std::strcmp(ggml_backend_buft_name(buft), GGML_RKNPU2_NAME) != 0) {
-                    throw std::runtime_error(format("RKNPU-only tensor %s must use %s buffer type", tn.str().c_str(), GGML_RKNPU2_NAME));
+                ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+                if (buft != nullptr && buft != cpu_buft) {
+                    LLAMA_LOG_DEBUG("%s: overriding buffer type %s with %s for RKNPU-only tensor %s\n",
+                            __func__, ggml_backend_buft_name(buft), ggml_backend_buft_name(cpu_buft), tn.str().c_str());
                 }
-                if (buft == nullptr) {
-                    for (const auto & cur : *buft_list) {
-                        if (std::strcmp(ggml_backend_buft_name(cur.second), GGML_RKNPU2_NAME) == 0) {
-                            buft = cur.second;
-                            break;
-                        }
-                    }
-                }
-                if (buft == nullptr) {
-                    throw std::runtime_error(format("RKNPU-only tensor %s requires %s buffer type", tn.str().c_str(), GGML_RKNPU2_NAME));
-                }
+                buft = cpu_buft;
+                LLAMA_LOG_DEBUG("%s: using %s buffer for RKNPU-only tensor %s; offline prepack is consumed later by the CPU/NPU mul_mat path\n",
+                        __func__, ggml_backend_buft_name(buft), tn.str().c_str());
             }
 
             if (!buft) {
