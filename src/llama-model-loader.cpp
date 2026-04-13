@@ -1,7 +1,6 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
-#include "ggml-rknpu-re.h"
 
 #include <array>
 #include <cinttypes>
@@ -738,7 +737,6 @@ llama_model_loader::llama_model_loader(
                     throw std::runtime_error(format("%s: failed to synthesize canonical tensor '%s' from RKNPU metadata", __func__, tensor_name.c_str()));
                 }
                 ggml_set_name(tensor, tensor_name.c_str());
-                tensor->flags |= GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY;
                 weights_map.emplace(tensor_name, llama_tensor_weight(tensor));
                 ++rknpu_only_tensor_count;
                 LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s blob=%s\n",
@@ -993,13 +991,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
     }
 
     bool duplicated = flags & TENSOR_DUPLICATED;
+    const auto & weight = require_weight(ggml_get_name(cur));
+    const bool is_rknpu_only = weight.is_rknpu_only;
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
-    tensor->flags |= (cur->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY);
 
     if (duplicated) {
-        if ((cur->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY) == 0) {
+        if (!is_rknpu_only) {
             size_data += ggml_nbytes(cur);
         }
     } else {

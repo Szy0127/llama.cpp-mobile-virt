@@ -29,9 +29,6 @@ static inline void ggml_thread_cpu_relax_out(void) {
 }
 
 
-static bool ggml_rknpu2_tensor_is_rknpu_only(const ggml_tensor * tensor);
-static bool ggml_rknpu2_tensor_has_offline_prepack(const ggml_tensor * tensor);
-
 static uint64_t npu_count = 0;
 static uint64_t npu_total_count = 0;
 static uint64_t npu_total_failed_count = 0;
@@ -39,8 +36,6 @@ static uint64_t npu_total_failed_count = 0;
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst = op;
-    const bool src0_rknpu_only = ggml_rknpu2_tensor_is_rknpu_only(src0);
-    const bool src0_has_offline_prepack = ggml_rknpu2_tensor_has_offline_prepack(src0);
     //src0->name
     // if(src0 && src1 && dst){
     // fprintf(stderr, "src0->name=%s\n", src0->name ? src0->name : "NULL");
@@ -104,10 +99,6 @@ static uint64_t npu_total_failed_count = 0;
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         const int64_t k = src0->ne[0];
         const int64_t n = src0->ne[1];
-        if (src0_rknpu_only && !src0_has_offline_prepack) {
-            npu_total_failed_count++;
-            return false;
-        }
         // return false;
         // fprintf(stderr, "NPU support!  npu failed count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
         return true;
@@ -1792,14 +1783,6 @@ static const rknpu_offline_prepack_blob * ggml_rknpu2_find_offline_prepack(const
     return &it->second;
 }
 
-static bool ggml_rknpu2_tensor_is_rknpu_only(const ggml_tensor * tensor) {
-    return tensor != nullptr && (tensor->flags & GGML_RKNPU_TENSOR_FLAG_RKNPU_ONLY) != 0;
-}
-
-static bool ggml_rknpu2_tensor_has_offline_prepack(const ggml_tensor * tensor) {
-    return tensor != nullptr && ggml_rknpu2_find_offline_prepack(tensor->name) != nullptr;
-}
-
 static std::atomic<uint64_t> g_weight_prepack_lookup_cnt{0};
 static std::atomic<uint64_t> g_weight_prepack_hit_cnt{0};
 static std::atomic<uint64_t> g_weight_prepack_build_cnt{0};
@@ -1954,7 +1937,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
 
     auto cache = ggml_rknpu2_try_load_weight_prepack_from_offline(src0, k, n, K, N, tensor_type);
     if (!cache) {
-        if (ggml_rknpu2_tensor_is_rknpu_only(src0) || src0->data == nullptr) {
+        if (src0->data == nullptr) {
             GGML_LOG_ERROR("%s: tensor %s has no source weights and no offline prepack\n", __func__, src0->name);
             GGML_ABORT("%s: tensor %s has no source weights and no offline prepack", __func__, src0->name);
         }
