@@ -118,14 +118,6 @@ static bool is_selected_tensor(const ggml_tensor * tensor, const params & p) {
     return p.include_tensors.count(tensor->name) > 0;
 }
 
-static void set_manifest_str_array(gguf_context * ctx, const char * key, const std::vector<std::string> & values) {
-    std::vector<const char *> ptrs(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        ptrs[i] = values[i].c_str();
-    }
-    gguf_set_arr_str(ctx, key, ptrs.data(), ptrs.size());
-}
-
 static blob_result build_blob(const ggml_tensor * tensor) {
     const int64_t k64 = tensor->ne[0];
     const int64_t n64 = tensor->ne[1];
@@ -291,8 +283,6 @@ static int run(const params & p) {
     std::vector<std::vector<uint8_t>> blobs;
     blobs.reserve(selected_names.size());
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
-    std::vector<std::string> blob_tensor_names;
-    blob_tensor_names.reserve(selected_names.size());
     const std::unordered_set<std::string> selected_set(selected_names.begin(), selected_names.end());
 
     for (int64_t i = 0; i < n_tensors; ++i) {
@@ -330,11 +320,7 @@ static int run(const params & p) {
         blob_tensor->data = blob_storage.data();
         gguf_add_tensor(ctx_out.get(), blob_tensor);
         out_tensors[blob_name] = blob_tensor;
-        blob_tensor_names.push_back(blob_name);
     }
-
-    set_manifest_str_array(ctx_out.get(), RKNPU_PREPACK_TENSOR_NAMES_KEY, selected_names);
-    set_manifest_str_array(ctx_out.get(), RKNPU_PREPACK_BLOB_TENSOR_NAMES_KEY, blob_tensor_names);
 
     std::ofstream out(p.output, std::ios::binary);
     out.exceptions(std::ofstream::failbit | std::ofstream::badbit);

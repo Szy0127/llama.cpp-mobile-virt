@@ -22,15 +22,13 @@ static const uint32_t RKNPU_PREPACK_SCALE_TYPE_NONE = 0;
 static const uint32_t RKNPU_PREPACK_SCALE_TYPE_F32 = 1;
 static const uint32_t RKNPU_PREPACK_MAGIC = 0x31504b52u; // RKP1
 static const char * const RKNPU_PREPACK_FORMAT = "blob-v1";
-static const char * const RKNPU_PREPACK_META_FORMAT = "manifest-v1";
+static const char * const RKNPU_PREPACK_META_FORMAT = "suffix-v1";
 static const char * const RKNPU_PREPACK_BACKEND = "rknpu2";
 static const char * const RKNPU_PREPACK_BLOB_SUFFIX = ".__rknpu_blob";
 static const char * const RKNPU_PREPACK_VERSION_KEY = "rknpu.prepack.version";
 static const char * const RKNPU_PREPACK_BACKEND_KEY = "rknpu.prepack.backend";
 static const char * const RKNPU_PREPACK_FORMAT_KEY = "rknpu.prepack.format";
 static const char * const RKNPU_PREPACK_META_FORMAT_KEY = "rknpu.prepack.meta_format";
-static const char * const RKNPU_PREPACK_TENSOR_NAMES_KEY = "rknpu.prepack.tensor_names";
-static const char * const RKNPU_PREPACK_BLOB_TENSOR_NAMES_KEY = "rknpu.prepack.blob_tensor_names";
 
 struct rknpu_offline_blob_header {
     uint32_t magic;
