@@ -298,11 +298,7 @@ void ggml_rknpu_dump_measure(void) {
 #include <sys/syscall.h>
 #endif
 
-#define RKNN_TENSOR_INT8 0x9
-#define RKNN_TENSOR_FLOAT16 0x16
-#define RKNN_TENSOR_FLOAT32 0x33
 #define GGML_RKNPU2_INPUT_SCALE 9.0f
-typedef int rknn_tensor_type;
 typedef int rknn_core_mask;
 
 
@@ -1714,29 +1710,6 @@ struct rknpu_offline_prepack_blob {
     std::vector<uint8_t> bytes;
 };
 
-struct rknpu_offline_blob_header {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t layout;
-    uint32_t orig_type;
-    uint32_t k;
-    uint32_t n;
-    uint32_t K;
-    uint32_t N;
-    uint32_t block_count;
-    uint32_t weight_bytes_per_block;
-    uint32_t scale_type;
-    uint32_t scales_bytes_total;
-    uint32_t packed_bytes_total;
-};
-
-static constexpr uint32_t RKNPU_PREPACK_VERSION = 1;
-static constexpr uint32_t RKNPU_PREPACK_LAYOUT_FP16 = 1;
-static constexpr uint32_t RKNPU_PREPACK_LAYOUT_INT8_BLOCK_SCALE = 2;
-static constexpr uint32_t RKNPU_PREPACK_SCALE_TYPE_NONE = 0;
-static constexpr uint32_t RKNPU_PREPACK_SCALE_TYPE_F32 = 1;
-static constexpr uint32_t RKNPU_PREPACK_MAGIC = 0x31504b52u;
-
 static std::mutex g_weight_prepack_mtx;
 static std::mutex g_offline_prepack_mtx;
 static std::unordered_map<std::string, rknpu_offline_prepack_blob> g_offline_prepack_registry;
@@ -1837,8 +1810,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     }
 
     const auto * header = reinterpret_cast<const rknpu_offline_blob_header *>(offline->bytes.data());
-    if (header->magic != RKNPU_PREPACK_MAGIC ||
-        header->version != RKNPU_PREPACK_VERSION ||
+    if (!rknpu_prepack_header_is_valid(header) ||
         header->k != (uint32_t) k ||
         header->n != (uint32_t) n ||
         header->K != (uint32_t) K ||
@@ -1864,26 +1836,22 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
 
     if (offline->meta.K != header->K ||
         offline->meta.N != header->N ||
-        offline->meta.scales_offset < sizeof(rknpu_offline_blob_header) ||
-        offline->meta.packed_offset < offline->meta.scales_offset) {
+        offline->meta.scales_offset != rknpu_prepack_scales_offset(header) ||
+        offline->meta.packed_offset != rknpu_prepack_packed_offset(header)) {
         return nullptr;
     }
 
-    const size_t total_needed = size_t(offline->meta.packed_offset) + size_t(header->packed_bytes_total);
+    const size_t total_needed = rknpu_prepack_total_bytes(header);
     if (total_needed != offline->bytes.size()) {
         return nullptr;
     }
 
     if (tensor_type == RKNN_TENSOR_FLOAT32) {
-        if (header->layout != RKNPU_PREPACK_LAYOUT_FP16 ||
-            header->scale_type != RKNPU_PREPACK_SCALE_TYPE_NONE ||
-            header->scales_bytes_total != 0) {
+        if (header->layout != RKNPU_PREPACK_LAYOUT_FP16) {
             return nullptr;
         }
     } else if (tensor_type == RKNN_TENSOR_INT8) {
-        if (header->layout != RKNPU_PREPACK_LAYOUT_INT8_BLOCK_SCALE ||
-            header->scale_type != RKNPU_PREPACK_SCALE_TYPE_F32 ||
-            header->scales_bytes_total != header->block_count * sizeof(float)) {
+        if (header->layout != RKNPU_PREPACK_LAYOUT_INT8_BLOCK_SCALE) {
             return nullptr;
         }
     } else {

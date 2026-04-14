@@ -18,37 +18,9 @@
 
 namespace {
 
-static constexpr uint32_t RKNPU_PREPACK_VERSION = 1;
-static constexpr uint32_t RKNPU_PREPACK_LAYOUT_FP16 = 1;
-static constexpr uint32_t RKNPU_PREPACK_LAYOUT_INT8_BLOCK_SCALE = 2;
-static constexpr uint32_t RKNPU_PREPACK_SCALE_TYPE_NONE = 0;
-static constexpr uint32_t RKNPU_PREPACK_SCALE_TYPE_F32 = 1;
-static constexpr uint32_t RKNPU_PREPACK_MAGIC = 0x31504b52u; // RKP1
-static constexpr const char * RKNPU_PREPACK_FORMAT = "blob-v1";
-static constexpr const char * RKNPU_PREPACK_BACKEND = "rknpu2";
-static constexpr const char * RKNPU_PREPACK_BLOB_SUFFIX = ".__rknpu_blob";
-
-struct blob_header {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t layout;
-    uint32_t orig_type;
-    uint32_t k;
-    uint32_t n;
-    uint32_t K;
-    uint32_t N;
-    uint32_t block_count;
-    uint32_t weight_bytes_per_block;
-    uint32_t scale_type;
-    uint32_t scales_bytes_total;
-    uint32_t packed_bytes_total;
-};
-
-static_assert(sizeof(blob_header) == 52, "unexpected blob header size");
-
 struct blob_result {
     std::vector<uint8_t> bytes;
-    blob_header header;
+    rknpu_offline_blob_header header;
     uint32_t scales_offset;
     uint32_t packed_offset;
     const char * layout_name;
@@ -146,26 +118,12 @@ static bool is_selected_tensor(const ggml_tensor * tensor, const params & p) {
     return p.include_tensors.count(tensor->name) > 0;
 }
 
-static void set_tensor_meta(gguf_context * ctx, const std::string & prefix, const ggml_tensor * tensor, const blob_result & blob, const char * blob_name) {
-    // create NPU prepack metadata for this tensor.
-    gguf_set_val_bool(ctx, (prefix + "enabled").c_str(), true);
-    gguf_set_val_str (ctx, (prefix + "layout").c_str(), blob.layout_name);
-    gguf_set_val_u32 (ctx, (prefix + "K").c_str(), blob.header.K);
-    gguf_set_val_u32 (ctx, (prefix + "N").c_str(), blob.header.N);
-    gguf_set_val_u32 (ctx, (prefix + "block_count").c_str(), blob.header.block_count);
-    gguf_set_val_str (ctx, (prefix + "blob_tensor").c_str(), blob_name);
-    gguf_set_val_u32 (ctx, (prefix + "weight_bytes_per_block").c_str(), blob.header.weight_bytes_per_block);
-    gguf_set_val_u32 (ctx, (prefix + "scale_type").c_str(), blob.header.scale_type);
-    gguf_set_val_u32 (ctx, (prefix + "scales_offset").c_str(), blob.scales_offset);
-    gguf_set_val_u32 (ctx, (prefix + "packed_offset").c_str(), blob.packed_offset);
-    gguf_set_val_u32 (ctx, (prefix + "scales_bytes_total").c_str(), blob.header.scales_bytes_total);
-    gguf_set_val_u32 (ctx, (prefix + "packed_bytes_total").c_str(), blob.header.packed_bytes_total);
-    
-    gguf_set_val_u32(ctx, (prefix + "orig_type").c_str(), static_cast<uint32_t>(tensor->type));
-    gguf_set_val_i64(ctx, (prefix + "ne0").c_str(), tensor->ne[0]);
-    gguf_set_val_i64(ctx, (prefix + "ne1").c_str(), tensor->ne[1]);
-    gguf_set_val_i64(ctx, (prefix + "ne2").c_str(), tensor->ne[2]);
-    gguf_set_val_i64(ctx, (prefix + "ne3").c_str(), tensor->ne[3]);
+static void set_manifest_str_array(gguf_context * ctx, const char * key, const std::vector<std::string> & values) {
+    std::vector<const char *> ptrs(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        ptrs[i] = values[i].c_str();
+    }
+    gguf_set_arr_str(ctx, key, ptrs.data(), ptrs.size());
 }
 
 static blob_result build_blob(const ggml_tensor * tensor) {
@@ -200,12 +158,12 @@ static blob_result build_blob(const ggml_tensor * tensor) {
         result.header.scale_type = RKNPU_PREPACK_SCALE_TYPE_NONE;
         result.header.scales_bytes_total = 0;
         result.header.packed_bytes_total = block_count * weight_bytes_per_block;
-        result.scales_offset = sizeof(blob_header);
-        result.packed_offset = result.scales_offset;
-        result.layout_name = "fp16";
+        result.scales_offset = rknpu_prepack_scales_offset(&result.header);
+        result.packed_offset = rknpu_prepack_packed_offset(&result.header);
+        result.layout_name = rknpu_prepack_layout_name(result.header.layout);
 
-        result.bytes.resize(sizeof(blob_header) + result.header.packed_bytes_total);
-        std::memcpy(result.bytes.data(), &result.header, sizeof(blob_header));
+        result.bytes.resize(rknpu_prepack_total_bytes(&result.header));
+        std::memcpy(result.bytes.data(), &result.header, sizeof(result.header));
 
         auto * packed_base = reinterpret_cast<ggml_fp16_t *>(result.bytes.data() + result.packed_offset);
         std::memset(packed_base, 0, result.header.packed_bytes_total);
@@ -236,12 +194,12 @@ static blob_result build_blob(const ggml_tensor * tensor) {
     result.header.scale_type = RKNPU_PREPACK_SCALE_TYPE_F32;
     result.header.scales_bytes_total = block_count * sizeof(float);
     result.header.packed_bytes_total = block_count * weight_bytes_per_block;
-    result.scales_offset = sizeof(blob_header);
-    result.packed_offset = result.scales_offset + result.header.scales_bytes_total;
-    result.layout_name = "int8-block-scale";
+    result.scales_offset = rknpu_prepack_scales_offset(&result.header);
+    result.packed_offset = rknpu_prepack_packed_offset(&result.header);
+    result.layout_name = rknpu_prepack_layout_name(result.header.layout);
 
-    result.bytes.resize(sizeof(blob_header) + result.header.scales_bytes_total + result.header.packed_bytes_total);
-    std::memcpy(result.bytes.data(), &result.header, sizeof(blob_header));
+    result.bytes.resize(rknpu_prepack_total_bytes(&result.header));
+    std::memcpy(result.bytes.data(), &result.header, sizeof(result.header));
 
     float * scales = reinterpret_cast<float *>(result.bytes.data() + result.scales_offset);
     int8_t * packed_base = reinterpret_cast<int8_t *>(result.bytes.data() + result.packed_offset);
@@ -324,14 +282,17 @@ static int run(const params & p) {
 
     gguf_ptr ctx_out(gguf_init_empty(), gguf_free);
     gguf_set_kv(ctx_out.get(), ctx_in.get());
-    gguf_set_val_u32(ctx_out.get(), "rknpu.prepack.version", RKNPU_PREPACK_VERSION);
-    gguf_set_val_str(ctx_out.get(), "rknpu.prepack.backend", RKNPU_PREPACK_BACKEND);
-    gguf_set_val_str(ctx_out.get(), "rknpu.prepack.format", RKNPU_PREPACK_FORMAT);
+    gguf_set_val_u32(ctx_out.get(), RKNPU_PREPACK_VERSION_KEY, RKNPU_PREPACK_VERSION);
+    gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_BACKEND_KEY, RKNPU_PREPACK_BACKEND);
+    gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_FORMAT_KEY, RKNPU_PREPACK_FORMAT);
+    gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_META_FORMAT_KEY, RKNPU_PREPACK_META_FORMAT);
 
     ggml_ptr out_ctx = make_output_ctx(static_cast<size_t>(n_tensors + selected_names.size()));
     std::vector<std::vector<uint8_t>> blobs;
     blobs.reserve(selected_names.size());
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
+    std::vector<std::string> blob_tensor_names;
+    blob_tensor_names.reserve(selected_names.size());
     const std::unordered_set<std::string> selected_set(selected_names.begin(), selected_names.end());
 
     for (int64_t i = 0; i < n_tensors; ++i) {
@@ -357,11 +318,6 @@ static int run(const params & p) {
         GGML_ASSERT(tensor != nullptr);
 
         blob_result blob = build_blob(tensor);
-        const blob_header header = blob.header;
-        const uint32_t scales_offset = blob.scales_offset;
-        const uint32_t packed_offset = blob.packed_offset;
-        const char * layout_name = blob.layout_name;
-
         blobs.push_back(std::move(blob.bytes));
         auto & blob_storage = blobs.back();
 
@@ -374,17 +330,11 @@ static int run(const params & p) {
         blob_tensor->data = blob_storage.data();
         gguf_add_tensor(ctx_out.get(), blob_tensor);
         out_tensors[blob_name] = blob_tensor;
-
-        blob_result meta_blob = {
-            {},
-            header,
-            scales_offset,
-            packed_offset,
-            layout_name,
-        };
-        const std::string prefix = "rknpu.tensor." + name + ".";
-        set_tensor_meta(ctx_out.get(), prefix, tensor, meta_blob, blob_name.c_str());
+        blob_tensor_names.push_back(blob_name);
     }
+
+    set_manifest_str_array(ctx_out.get(), RKNPU_PREPACK_TENSOR_NAMES_KEY, selected_names);
+    set_manifest_str_array(ctx_out.get(), RKNPU_PREPACK_BLOB_TENSOR_NAMES_KEY, blob_tensor_names);
 
     std::ofstream out(p.output, std::ios::binary);
     out.exceptions(std::ofstream::failbit | std::ofstream::badbit);
