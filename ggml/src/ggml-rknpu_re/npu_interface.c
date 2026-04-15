@@ -35,7 +35,7 @@
 #include <pthread.h>
 
 #define NPU_DEVICE "/dev/dri/card0"
-#define PREALLOC_PFN_BASE 0xa9000ULL
+#define PREALLOC_PFN_BASE 0xa0000ULL
 #define PAGE_SIZE_BYTES   0x1000UL
 
 static int fd = -1;
