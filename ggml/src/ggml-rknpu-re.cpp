@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <atomic>
+#include <vector>
 
 // System headers for file operations
 #include <fcntl.h>
@@ -432,154 +433,80 @@ struct rknpure_weight {
     uint64_t weights_handle;
     uint64_t buffer_size;
 };
-// // host buffer type
-
-// static const char * ggml_backend_rknpu2_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
-//     return GGML_RKNPU2_NAME "_Host";
-
-//     GGML_UNUSED(buft);
-// }
-/**
- * @brief Free resources associated with a CANN host buffer.
- *
- * This function frees the resources associated with a CANN host buffer, including
- * its context.
- *
- * @param buffer The CANN host buffer to free.
- */
-// static void ggml_backend_rknpu2_host_buffer_free(ggml_backend_buffer_t buffer) {
-//     // ACL_CHECK(aclrtFreeHost(buffer->context));
-//     printf("host buffer free\n");
-// }
-/**
- * @brief Allocates a new CANN host buffer of the specified size.
- *
- * This function allocates a new CANN host buffer with the given size.
- * @param size Size in bytes of the host buffer to allocate.
- * @return Pointer to the allocated host buffer, or nullptr if allocation fails.
- */
-static void * ggml_rknpu2_host_malloc(size_t size) {
-    // if (getenv("GGML_RKNPU2_NO_PINNED") != nullptr) {
-    //     return nullptr;
-    // }
-
-/*    void * hostPtr = rknn_create_mem(kernel->matmul_ctx, kernel->matmul_io_attr.B.size);
-    aclError err = aclrtMallocHost((void **) &hostPtr, size);
-    if (err != ACL_SUCCESS) {
-
-        GGML_CANN_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
-                           size / 1024.0 / 1024.0, aclGetRecentErrMsg());
-        return nullptr;
-    }
-    return hostPtr;*/
-    // It seems that posix_memalign is mandatory
-    void * data = nullptr;
-    int result = posix_memalign((void **) &data, sysconf(_SC_PAGESIZE), size);
-    if (result != 0) {
-        printf("%s: error: posix_memalign failed\n", __func__);
-        return nullptr;
-    }
-
-    return data;
-}
-// /**
-//  * @brief Retrieves the name associated with a CANN host buffer.
-//  *
-//  * This function returns the descriptive name associated with the specified
-//  * CANN host buffer context.
-//  *
-//  * @param buft Pointer to the host buffer context.
-//  * @return Const pointer to the C-style string containing the name.
-//  */
-// static const char * ggml_backend_rknpu2_host_buffer_name(ggml_backend_buffer_t buffer) {
-//     return "RKNPU2_Host";
-
-//     GGML_UNUSED(buffer);
-// }
-// /**
-//  * @brief Allocates a new CANN host buffer of the specified type and size.
-//  *
-//  * @param buft Pointer to the host buffer type context.
-//  * @param size Size in bytes of the host buffer to allocate.
-//  * @return Pointer to the allocated host buffer, or CPU buffer pointer if allocation fails.
-//  */
-// static ggml_backend_buffer_t ggml_backend_rknpu2_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-//     void * hostPtr = ggml_rknpu2_host_malloc(size);
-
-//     if (hostPtr == nullptr) {
-//         // fallback to cpu buffer
-//         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-//     }
-
-//     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(hostPtr, size);
-//     buffer->buft = buft;
-//     buffer->iface.get_name = ggml_backend_rknpu2_host_buffer_name;
-//     buffer->iface.free_buffer = ggml_backend_rknpu2_host_buffer_free;
-
-//     return buffer;
-// }
-
 static const char * ggml_backend_rknpu2_buffer_get_name(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
-    return "RKNPURE";
+    return GGML_RKNPU2_NAME;
 }
 
+// Stores the CPU pointer and optional DMA address for tensors allocated from the custom host/DMA buffer types.
+struct ggml_backend_rknpu2_tensor_extra {
+    void * cpu_ptr = nullptr;
+    uint64_t dma = 0;
+    size_t size = 0;
+    size_t offset = 0;
+    bool is_blob = false;
+};
+
+// Owns one buffer allocation for a custom host or host-DMA buffer type and releases it when the buffer dies.
 struct ggml_backend_rknpu2_buffer_context {
-    ggml_backend_rknpu2_buffer_context(size_t device)
+    ggml_backend_rknpu2_buffer_context(size_t device, std::string name)
             : device(device)
-            , name(std::string("RKNPURE") + (std::to_string(device))) {}
+            , name(std::move(name)) {}
 
     ~ggml_backend_rknpu2_buffer_context() {
+        for (auto * extra : tensor_extras) {
+            delete extra;
+        }
         if (buffer) {
-            free(buffer);
+            mem_destroy(buffer, alloc_size, handle, obj);
         }
-
-        /*for (auto * sub_buffer : sub_buffers) {
-            free(sub_buffer);
-        }
-
-        for (auto * qnn_tensor : qnn_tensors) {
-            free_qnn_tensor(*qnn_tensor);
-            free(qnn_tensor);
-        }*/
-
-        // sub_buffers.clear();
-        // qnn_tensors.clear();
     }
+
     void * buffer = nullptr;
-
     struct ggml_backend_rknpure_context * backend_ctx = nullptr;
-
-    size_t                      buffer_size = 0;
-    // std::vector<void *>         sub_buffers;
-    // std::vector<Qnn_Tensor_t *> qnn_tensors;
-    size_t                      device;
-    std::string                 name;
+    size_t buffer_size = 0;
+    size_t alloc_size = 0;
+    uint64_t dma = 0;
+    uint64_t obj = 0;
+    uint64_t handle = 0;
+    size_t device;
+    std::string name;
+    std::vector<ggml_backend_rknpu2_tensor_extra *> tensor_extras;
 };
+// Frees the allocation backing one custom host or host-DMA buffer.
 static void ggml_backend_rknpu2_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    printf("zzh: %s called\n", __func__);
     ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
-
-    if (ctx->buffer) {
-        free(ctx->buffer);
-        ctx->buffer = NULL;
-    }
-    // clr_B();
-
-    // delete ctx;
+    delete ctx;
 }
 
+// Returns the CPU-accessible base pointer for a custom host or host-DMA buffer.
 static void * ggml_backend_rknpu2_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
 
     return ctx->buffer;
 }
 
-
-
+// Attaches CPU/DMA metadata to each tensor slice allocated from the custom host or host-DMA buffer.
 static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                         ggml_tensor * tensor) {
-    // Dont't know what should do.
+    ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
+
+    if (tensor->view_src != nullptr) {
+        if (tensor->view_src->extra != nullptr) {
+            tensor->extra = tensor->view_src->extra;
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    auto * extra = new ggml_backend_rknpu2_tensor_extra();
+    extra->cpu_ptr = tensor->data;
+    extra->size = ggml_nbytes(tensor);
+    extra->offset = (size_t) ((const char *) tensor->data - (const char *) ctx->buffer);
+    extra->is_blob = std::strstr(tensor->name, RKNPU_PREPACK_BLOB_SUFFIX) != nullptr;
+    extra->dma = ctx->dma + extra->offset;
+
+    tensor->extra = extra;
+    ctx->tensor_extras.push_back(extra);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -638,35 +565,24 @@ static bool ggml_backend_rknpu2_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_rknpu2_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
-
-    printf("zzh: %s called\n", __func__);
     memset(ctx->buffer, value, ctx->buffer_size);
 }
+
+// Describes one custom DMA-backed host buffer type.
+struct ggml_backend_rknpu2_buffer_type_context {
+    int32_t device;
+    std::string name;
+};
+
 /**
  * @brief Retrieves the name associated with a CANN buffer type.
- *
- * This function returns the descriptive name associated with the specified
- * CANN buffer type context.
- *
- * @param buft Pointer to the buffer type context.
- * @return Const pointer to the C-style string containing the name.
  */
 static const char* ggml_backend_rknpu2_buffer_type_name(
     ggml_backend_buffer_type_t buft) {
-    return "RKNPURE";
-
-    GGML_UNUSED(buft);
+    auto * ctx = (ggml_backend_rknpu2_buffer_type_context *) buft->context;
+    return ctx->name.c_str();
 }
-// cann buffer type
-/**
- * @brief Structure representing context information for a specific backend
- * buffer type.
- */
-struct ggml_backend_rknpu2_buffer_type_context {
-    int32_t
-        device; /**< Device identifier associated with the buffer context. */
-    std::string name; /**< Name associated with the buffer context. */
-};
+
 static ggml_backend_buffer_i ggml_backend_rknpu2_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rknpu2_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rknpu2_buffer_get_base,
@@ -681,53 +597,54 @@ static ggml_backend_buffer_i ggml_backend_rknpu2_buffer_interface = {
 
 static struct ggml_backend_rknpure_context g_rknpu2_mgr[GGML_RKNPU2_MAX_DEVICES];
 
-/**
- * @brief Allocates a new CANN buffer of the specified type and size.
- *
- * This function allocates a new CANN buffer on the specified device with the
- * given size.
- *
- * @param buft Pointer to the buffer type context.
- * @param size Size in bytes of the buffer to allocate.
- * @return Pointer to the allocated buffer, or nullptr if allocation fails.
- */
+// Allocates one CPU-accessible DMA-backed buffer for the custom host-DMA buffer types.
 static ggml_backend_buffer_t
 ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                            size_t size) {
     ggml_backend_rknpu2_buffer_type_context* buft_ctx =
         (ggml_backend_rknpu2_buffer_type_context*)buft->context;
 
-
-    size_t size_page = sysconf(_SC_PAGESIZE);
-
+    const size_t size_page = sysconf(_SC_PAGESIZE);
     size_t size_aligned = size;
     if ((size_aligned % size_page) != 0) {
         size_aligned += (size_page - (size_aligned % size_page));
     }
 
     ggml_backend_rknpu2_buffer_context* ctx =
-        new ggml_backend_rknpu2_buffer_context(buft_ctx->device);
-    ctx->buffer = ggml_rknpu2_host_malloc(size);
+        new ggml_backend_rknpu2_buffer_context(buft_ctx->device, buft_ctx->name);
     ctx->buffer_size = size;
+    ctx->alloc_size = size_aligned;
     ctx->backend_ctx = &g_rknpu2_mgr[buft_ctx->device];
-    if (nullptr == ctx->buffer) {
-        printf("%s: failed to allocate %.2f MiB\n", __func__, (double)size / (1 << 20));
+    ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
+            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
+    fprintf(stderr, "%s: allocated DMA buffer of size %.2f MiB for %s, dma=0x%lx, obj=0x%lx, handle=0x%lx\n",
+            __func__, (double) size / (1 << 20), buft_ctx->name.c_str(), ctx->dma, ctx->obj, ctx->handle);
+
+    if (ctx->buffer == nullptr) {
+        printf("%s: failed to allocate %.2f MiB for %s\n", __func__, (double) size / (1 << 20), buft_ctx->name.c_str());
+        delete ctx;
         return nullptr;
     }
 
     return ggml_backend_buffer_init(buft, ggml_backend_rknpu2_buffer_interface,
                                     ctx, size);
 }
+
+// Reports that the custom host and host-DMA buffer types expose CPU-accessible memory.
 static bool ggml_backend_rknpu2_buffer_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return true;
 }
+
+// Returns the tensor alignment used by the custom host and host-DMA buffer types.
 static size_t ggml_backend_rknpu2_buffer_type_get_alignment(
     ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     return 32;
 }
+
 // TODO: this value is an experimental value, works fine with whisper/llm/minicpm-v inference on Android
+// Returns the maximum allocation size accepted by the custom host and host-DMA buffer types.
 static size_t ggml_backend_rknpu2_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
 
@@ -759,8 +676,8 @@ static ggml_backend_buffer_type_i ggml_backend_rknpu2_buffer_type_interface = {
  * @return A pointer to the buffer type interface for the specified device, or
  * nullptr if the device index is out of range.
  */
-GGML_API ggml_backend_buffer_type_t
-ggml_backend_rknpure_buffer_type(int32_t device) {
+// Returns the custom CPU-accessible DMA-backed buffer type used for offline prepack blobs.
+static ggml_backend_buffer_type_t ggml_backend_rknpu2_get_host_dma_buffer_type_internal(int32_t device, const char * name_prefix) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -768,24 +685,32 @@ ggml_backend_rknpure_buffer_type(int32_t device) {
         return nullptr;
     }
 
-    static ggml_backend_buffer_type
-        ggml_backend_rknpu2_buffer_types[GGML_RKNPU2_MAX_DEVICES];
+    static ggml_backend_buffer_type host_dma_buffer_types[GGML_RKNPU2_MAX_DEVICES];
+    static bool host_dma_initialized = false;
 
-    static bool ggml_backend_rknpu2_buffer_type_initialized = false;
-
-    if (!ggml_backend_rknpu2_buffer_type_initialized) {
+    if (!host_dma_initialized) {
         for (int32_t i = 0; i < GGML_RKNPU2_MAX_DEVICES; i++) {
-            // auto & context = ggml_backend_rknpu2_buffer_type_contexts[i];
-            // context = { /*i,*/ std::string(RKNPU2_BACKEND_NAME) + std::to_string(i); }
-            ggml_backend_rknpu2_buffer_types[i].iface = ggml_backend_rknpu2_buffer_type_interface;
-            ggml_backend_rknpu2_buffer_types[i].device = nullptr;
-            ggml_backend_rknpu2_buffer_types[i].context = new ggml_backend_rknpu2_buffer_type_context{
-                i, "RKNPURE" + std::to_string(i)};
+            host_dma_buffer_types[i].iface = ggml_backend_rknpu2_buffer_type_interface;
+            host_dma_buffer_types[i].device = nullptr;
+            host_dma_buffer_types[i].context = new ggml_backend_rknpu2_buffer_type_context{
+                i, std::string(name_prefix) + std::to_string(i)};
         }
-        ggml_backend_rknpu2_buffer_type_initialized = true;
+        host_dma_initialized = true;
     }
 
-    return &ggml_backend_rknpu2_buffer_types[device];
+    return &host_dma_buffer_types[device];
+}
+
+// Returns the legacy RKNPURE buffer type used by the backend's existing tensor paths.
+GGML_API ggml_backend_buffer_type_t
+ggml_backend_rknpure_buffer_type(int32_t device) {
+    return ggml_backend_rknpu2_get_host_dma_buffer_type_internal(device, "RKNPURE");
+}
+
+// Returns a CPU-accessible buffer type whose allocations are backed by DMA for offline prepack blobs.
+GGML_API ggml_backend_buffer_type_t
+ggml_backend_rknpu2_host_dma_buffer_type(int32_t device) {
+    return ggml_backend_rknpu2_get_host_dma_buffer_type_internal(device, "HOST_DMA");
 }
 
 // g++ doesn't allow restrict? removed.
@@ -1664,6 +1589,8 @@ struct rknpu_weight_prepack_block {
     int nn;
     int kk;
     float scale;
+    const void * packed_cpu = nullptr;
+    uint64_t packed_dma = 0;
     std::shared_ptr<rknn_mem> dma_mem;
 };
 
@@ -1707,7 +1634,10 @@ struct rknpu_offline_prepack_blob {
     std::string blob_tensor_name;
     std::string layout;
     ggml_rknpu_prepack_meta meta;
-    std::vector<uint8_t> bytes;
+    const ggml_tensor * blob_tensor = nullptr;
+    const uint8_t * cpu_ptr = nullptr;
+    uint64_t dma = 0;
+    size_t size = 0;
 };
 
 static std::mutex g_weight_prepack_mtx;
@@ -1720,10 +1650,12 @@ void ggml_rknpu2_clear_offline_prepack_registry(void) {
     g_offline_prepack_registry.clear();
 }
 
-bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const void * data, size_t size) {
-    if (meta == nullptr || meta->tensor_name == nullptr || meta->blob_tensor_name == nullptr || data == nullptr || size == 0) {
+bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * blob_tensor) {
+    if (meta == nullptr || meta->tensor_name == nullptr || meta->blob_tensor_name == nullptr || blob_tensor == nullptr || blob_tensor->data == nullptr) {
         return false;
     }
+
+    auto * extra = (const ggml_backend_rknpu2_tensor_extra *) blob_tensor->extra;
 
     rknpu_offline_prepack_blob blob;
     blob.tensor_name = meta->tensor_name;
@@ -1735,8 +1667,10 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta.tensor_name = blob.tensor_name.c_str();
     blob.meta.blob_tensor_name = blob.blob_tensor_name.c_str();
     blob.meta.layout = blob.layout.c_str();
-    blob.bytes.resize(size);
-    std::memcpy(blob.bytes.data(), data, size);
+    blob.blob_tensor = blob_tensor;
+    blob.cpu_ptr = extra != nullptr ? static_cast<const uint8_t *>(extra->cpu_ptr) : static_cast<const uint8_t *>(blob_tensor->data);
+    blob.dma = extra != nullptr ? extra->dma : 0;
+    blob.size = extra != nullptr ? extra->size : ggml_nbytes(blob_tensor);
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
@@ -1805,11 +1739,11 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     GGML_LOG_DEBUG("%s: loaded offline prepack for tensor %s via blob %s\n",
             __func__, src0->name, offline->blob_tensor_name.c_str());
 
-    if (offline->bytes.size() < sizeof(rknpu_offline_blob_header)) {
+    if (offline->size < sizeof(rknpu_offline_blob_header)) {
         return nullptr;
     }
 
-    const auto * header = reinterpret_cast<const rknpu_offline_blob_header *>(offline->bytes.data());
+    const auto * header = reinterpret_cast<const rknpu_offline_blob_header *>(offline->cpu_ptr);
     if (!rknpu_prepack_header_is_valid(header) ||
         header->k != (uint32_t) k ||
         header->n != (uint32_t) n ||
@@ -1842,7 +1776,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     }
 
     const size_t total_needed = rknpu_prepack_total_bytes(header);
-    if (total_needed != offline->bytes.size()) {
+    if (total_needed != offline->size) {
         return nullptr;
     }
 
@@ -1863,8 +1797,9 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
 
     const float * scales = header->scales_bytes_total == 0
         ? nullptr
-        : reinterpret_cast<const float *>(offline->bytes.data() + offline->meta.scales_offset);
-    const uint8_t * packed_base = offline->bytes.data() + offline->meta.packed_offset;
+        : reinterpret_cast<const float *>(offline->cpu_ptr + offline->meta.scales_offset);
+    const uint8_t * packed_base = offline->cpu_ptr + offline->meta.packed_offset;
+    const uint64_t packed_dma_base = offline->dma + offline->meta.packed_offset;
 
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
@@ -1873,9 +1808,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.nn = nn;
             block.kk = kk;
             block.scale = scales ? scales[block_index] : 1.0f;
-            block.dma_mem = std::make_shared<rknn_mem>(packed_size);
-            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
-            std::memcpy(block.dma_mem->ptr, packed_base + size_t(block_index) * packed_size, packed_size);
+            block.packed_cpu = packed_base + size_t(block_index) * packed_size;
+            block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
@@ -2477,8 +2411,14 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
-                GGML_ASSERT(block->dma_mem);
-                GGML_ASSERT(block->dma_mem->dma != 0);
+                uint64_t weight_dma = 0;
+                if (block->packed_dma != 0) {
+                    weight_dma = block->packed_dma;
+                } else {
+                    GGML_ASSERT(block->dma_mem);
+                    GGML_ASSERT(block->dma_mem->dma != 0);
+                    weight_dma = block->dma_mem->dma;
+                }
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
                 }
@@ -2486,7 +2426,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 for (const auto & task_group : kernel->npu_tasks) {
                     for (const auto & task : task_group->npu_tasks) {
                         if (task->nn == nn && task->kk == kk) {
-                            task->set_weight_dma(block->dma_mem->dma);
+                            task->set_weight_dma(weight_dma);
                         }
                     }
                 }

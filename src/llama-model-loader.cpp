@@ -1080,6 +1080,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
         size_data += ggml_nbytes(it.second.tensor);
     }
+
+    for (const auto & it : auxiliary_weights_map) {
+        size_data += ggml_nbytes(it.second.tensor);
+    }
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
@@ -1091,6 +1095,9 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
+        if (weight == nullptr) {
+            weight = get_aux_weight(ggml_get_name(tensor));
+        }
         if (!weight || weight->idx != idx) {
             continue;
         }
@@ -1100,25 +1107,31 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 }
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
-    const auto & w = require_weight(ggml_get_name(cur));
+    const llama_tensor_weight * w = get_weight(ggml_get_name(cur));
+    if (w == nullptr) {
+        w = get_aux_weight(ggml_get_name(cur));
+    }
+    if (w == nullptr) {
+        throw std::runtime_error(format("%s: tensor '%s' not found", __func__, ggml_get_name(cur)));
+    }
 
-    if (w.is_rknpu_only) {
+    if (w->is_rknpu_only) {
         LLAMA_LOG_DEBUG("%s: skipping RKNPU-only tensor '%s'\n", __func__, ggml_get_name(cur));
         return;
     }
 
     if (use_mmap) {
-        const auto & mapping = mappings.at(w.idx);
+        const auto & mapping = mappings.at(w->idx);
         if (cur->data == nullptr) {
-            cur->data = (uint8_t *)mapping->addr() + w.offs;
+            cur->data = (uint8_t *)mapping->addr() + w->offs;
         } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
+            memcpy(cur->data, (uint8_t *)mapping->addr() + w->offs, ggml_nbytes(cur));
         }
     } else {
         GGML_ASSERT(cur->data != nullptr);
-        GGML_ASSERT(w.idx < files.size());
-        const auto & file = files.at(w.idx);
-        file->seek(w.offs, SEEK_SET);
+        GGML_ASSERT(w->idx < files.size());
+        const auto & file = files.at(w->idx);
+        file->seek(w->offs, SEEK_SET);
         file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
@@ -1229,6 +1242,9 @@ bool llama_model_loader::load_all_data(
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr) {
+            weight = get_aux_weight(ggml_get_name(cur));
+        }
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;

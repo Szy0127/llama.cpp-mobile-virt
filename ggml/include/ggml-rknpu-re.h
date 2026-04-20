@@ -20,6 +20,7 @@ void ggml_rknpu2_transform_tensor_back(void * data, const ggml_tensor * tensor, 
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_buffer_type(void);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpure_buffer_type(int32_t dev_num);
+GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_dma_buffer_type(int32_t dev_num);
 GGML_API  int32_t ggml_backend_rknpu2_get_device_count(void);
 
 struct ggml_rknpu_prepack_meta {
@@ -38,4 +39,4 @@ struct ggml_rknpu_prepack_meta {
 };
 
 GGML_API void ggml_rknpu2_clear_offline_prepack_registry(void);
-GGML_API bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const void * data, size_t size);
+GGML_API bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * blob_tensor);
