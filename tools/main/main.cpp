@@ -6,6 +6,8 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -16,7 +18,9 @@
 #include <vector>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #elif defined (_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -40,6 +44,94 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+struct pkvm_shinfo {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t seq;
+    uint64_t donate_gpa_start;
+    uint64_t donate_total_pages;
+    uint64_t donated_pages;
+    uint64_t last_reclaim_pages;
+    uint64_t last_reclaim_gfn;
+    uint64_t total_reclaim_pages;
+    uint64_t total_reclaim_events;
+};
+
+static constexpr uint64_t PKVM_SHINFO_PHYS_ADDR = 0xa0000000ULL - 0x1000ULL;
+static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
+
+static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
+    pkvm_shinfo dst = {};
+    dst.magic               = src->magic;
+    dst.version             = src->version;
+    dst.seq                 = src->seq;
+    dst.donate_gpa_start    = src->donate_gpa_start;
+    dst.donate_total_pages  = src->donate_total_pages;
+    dst.donated_pages       = src->donated_pages;
+    dst.last_reclaim_pages  = src->last_reclaim_pages;
+    dst.last_reclaim_gfn    = src->last_reclaim_gfn;
+    dst.total_reclaim_pages = src->total_reclaim_pages;
+    dst.total_reclaim_events= src->total_reclaim_events;
+    return dst;
+}
+
+static volatile const pkvm_shinfo * map_pkvm_shinfo() {
+    static int fd = -1;
+    static void * map = nullptr;
+
+    if (map != nullptr) {
+        return static_cast<volatile const pkvm_shinfo *>(map);
+    }
+
+    fd = open("/dev/mem", O_RDONLY | O_SYNC);
+    if (fd < 0) {
+        LOG_ERR("%s: open(/dev/mem) failed: errno=%d (%s)\n", __func__, errno, std::strerror(errno));
+        return nullptr;
+    }
+
+    map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(PKVM_SHINFO_PHYS_ADDR));
+    if (map == MAP_FAILED) {
+        LOG_ERR("%s: mmap(phys=0x%016" PRIx64 ", len=%zu) failed: errno=%d (%s)\n",
+                __func__, PKVM_SHINFO_PHYS_ADDR, PKVM_SHINFO_MAP_SIZE, errno, std::strerror(errno));
+        close(fd);
+        fd = -1;
+        map = nullptr;
+        return nullptr;
+    }
+
+    return static_cast<volatile const pkvm_shinfo *>(map);
+}
+
+static bool read_pkvm_shinfo(pkvm_shinfo & out) {
+    volatile const pkvm_shinfo * src = map_pkvm_shinfo();
+    if (src == nullptr) {
+        return false;
+    }
+
+    out = read_pkvm_shinfo_once(src);
+    return true;
+}
+
+static void dump_pkvm_shinfo(const char * reason) {
+    pkvm_shinfo info = {};
+    if (!read_pkvm_shinfo(info)) {
+        return;
+    }
+
+    LOG_INF("[pkvm_shinfo] reason=%s phys=0x%016" PRIx64 "\n",
+            reason, PKVM_SHINFO_PHYS_ADDR);
+    LOG_INF("[pkvm_shinfo] magic=0x%08" PRIx32 ", version=%" PRIu32 ", seq=%" PRIu64 "\n",
+            info.magic, info.version, info.seq);
+    LOG_INF("[pkvm_shinfo] donate_gpa_start=0x%016" PRIx64 ", donate_total_pages=%" PRIu64 "\n",
+            info.donate_gpa_start, info.donate_total_pages);
+    LOG_INF("[pkvm_shinfo] donated_pages=%" PRIu64 ", last_reclaim_pages=%" PRIu64 ", last_reclaim_gfn=%" PRIu64 "\n",
+            info.donated_pages, info.last_reclaim_pages, info.last_reclaim_gfn);
+    LOG_INF("[pkvm_shinfo] total_reclaim_pages=%" PRIu64 ", total_reclaim_events=%" PRIu64 "\n",
+            info.total_reclaim_pages, info.total_reclaim_events);
+}
+#endif
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -311,6 +403,12 @@ int main(int argc, char ** argv) {
         LOG_DBG("prompt: \"%s\"\n", prompt.c_str());
         LOG_DBG("tokens: %s\n", string_from(ctx, embd_inp).c_str());
     }
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    if (!prompt.empty()) {
+        dump_pkvm_shinfo("initial-prompt");
+    }
+#endif
 
     // Should not run without any tokens
     if (!waiting_for_first_input && embd_inp.empty()) {
@@ -896,6 +994,11 @@ int main(int argc, char ** argv) {
                     std::string user_inp = format_chat
                         ? chat_add_and_format("user", std::move(buffer))
                         : std::move(buffer);
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+                    dump_pkvm_shinfo("interactive-user-input");
+#endif
+
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);
                     const auto line_inp = common_tokenize(ctx, user_inp,            false, format_chat);

@@ -141,7 +141,7 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
     *handle = 0;
   }
 
-  printf("mem allocate addr:0x%lx, size:%d\n", map, size);
+  //printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;
 }
 
