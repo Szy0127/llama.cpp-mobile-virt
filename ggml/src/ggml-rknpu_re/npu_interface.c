@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
@@ -37,9 +38,12 @@
 #define NPU_DEVICE "/dev/dri/card0"
 #define PREALLOC_PFN_BASE 0xa0000ULL
 #define PAGE_SIZE_BYTES   0x1000UL
+#define PREALLOC_MMAP_BYTES         (4ULL << 30)
 
 static int fd = -1;
 static int dev_mem_fd = -1;
+static void *dev_mem_vaddr = NULL;
+static size_t dev_mem_map_size = 0;
 static size_t prealloc_used = 0;
 static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -50,13 +54,27 @@ static size_t page_align_up(size_t n) {
   return (n + PAGE_SIZE_BYTES - 1) & ~(size_t)(PAGE_SIZE_BYTES - 1);
 }
 
+static void cleanup_dev_mem_mapping(void) {
+  if (dev_mem_vaddr && dev_mem_map_size) {
+    munmap(dev_mem_vaddr, dev_mem_map_size);
+  }
+  dev_mem_vaddr = NULL;
+  dev_mem_map_size = 0;
+  prealloc_used = 0;
+
+  if (dev_mem_fd >= 0) {
+    close(dev_mem_fd);
+    dev_mem_fd = -1;
+  }
+}
+
 static void fd_init(void) {
   fd = npu_open();
   printf("%s %d: fd %d\n", __func__, __LINE__, fd);
 }
 
 static int ensure_dev_mem_open(void) {
-  if (dev_mem_fd >= 0) {
+  if (dev_mem_fd >= 0 && dev_mem_vaddr != NULL) {
     return 0;
   }
 
@@ -66,6 +84,23 @@ static int ensure_dev_mem_open(void) {
     return -1;
   }
 
+  const uint64_t phys_base = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES;
+  const size_t map_size = PREALLOC_MMAP_BYTES;
+  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   dev_mem_fd, (off_t)phys_base);
+  if (map == MAP_FAILED) {
+    printf("Failed to mmap /dev/mem pool at phys=0x%llx, size=%zu, errno=%d\n",
+           (unsigned long long)phys_base, map_size, errno);
+    cleanup_dev_mem_mapping();
+    return -1;
+  }
+
+  dev_mem_vaddr = map;
+  dev_mem_map_size = map_size;
+  prealloc_used = 0;
+  atexit(cleanup_dev_mem_mapping);
+  printf("Mapped /dev/mem pool: phys=0x%llx size=%zu vaddr=%p\n",
+         (unsigned long long)phys_base, map_size, map);
   return 0;
 }
 
@@ -83,16 +118,17 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
     return NULL;
   }
 
-  const size_t map_size = page_align_up(size);
-  const uint64_t phys_addr = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES + (uint64_t)prealloc_used;
-  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev_mem_fd, (off_t)phys_addr);
-  if (map == MAP_FAILED) {
-    printf("mmap failed phys=0x%llx len=%zu errno=%d\n",
-           (unsigned long long)phys_addr, map_size, errno);
+  const size_t alloc_size = size;//page_align_up(size);
+  if (alloc_size > dev_mem_map_size - prealloc_used) {
+    printf("Out of /dev/mem pool: need=%zu used=%zu total=%zu\n",
+           alloc_size, prealloc_used, dev_mem_map_size);
     pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
-  prealloc_used += map_size;
+
+  const uint64_t phys_addr = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES + (uint64_t)prealloc_used;
+  void *map = (char *)dev_mem_vaddr + prealloc_used;
+  prealloc_used += alloc_size;
   pthread_mutex_unlock(&mem_lock);
 
   if (dma_addr) {
@@ -105,16 +141,17 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
     *handle = 0;
   }
 
+  printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
+  (void)addr;
+  (void)len;
   (void)handle;
   (void)obj_addr;
-
-  if (addr && len) {
-    munmap(addr, page_align_up(len));
-  }
+  // Allocations are slices of the process-wide /dev/mem mapping, so there is
+  // no per-allocation munmap here.
 }
 
 int npu_open(void) {
