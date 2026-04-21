@@ -617,8 +617,6 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->backend_ctx = &g_rknpu2_mgr[buft_ctx->device];
     ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
             RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
-    fprintf(stderr, "%s: allocated DMA buffer of size %.2f MiB for %s, dma=0x%lx, obj=0x%lx, handle=0x%lx\n",
-            __func__, (double) size / (1 << 20), buft_ctx->name.c_str(), ctx->dma, ctx->obj, ctx->handle);
 
     if (ctx->buffer == nullptr) {
         printf("%s: failed to allocate %.2f MiB for %s\n", __func__, (double) size / (1 << 20), buft_ctx->name.c_str());
@@ -1736,7 +1734,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
         return nullptr;
     }
 
-    GGML_LOG_DEBUG("%s: loaded offline prepack for tensor %s via blob %s\n",
+    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via blob %s\n",
             __func__, src0->name, offline->blob_tensor_name.c_str());
 
     if (offline->size < sizeof(rknpu_offline_blob_header)) {
@@ -1801,6 +1799,14 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     const uint8_t * packed_base = offline->cpu_ptr + offline->meta.packed_offset;
     const uint64_t packed_dma_base = offline->dma + offline->meta.packed_offset;
 
+    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s blob=%s blob_dma=0x%llx scales_offset=%u packed_offset=%u packed_size=%u packed_dma_base=0x%llx\n",
+            __func__, src0->name, offline->blob_tensor_name.c_str(),
+            (unsigned long long) offline->dma,
+            offline->meta.scales_offset,
+            offline->meta.packed_offset,
+            packed_size,
+            (unsigned long long) packed_dma_base);
+
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
         for (int kk = 0; kk < k; kk += K) {
@@ -1810,6 +1816,11 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.scale = scales ? scales[block_index] : 1.0f;
             block.packed_cpu = packed_base + size_t(block_index) * packed_size;
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
+            if (block_index < 4) {
+                std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
+                        __func__, src0->name, block_index, nn, kk,
+                        (unsigned long long) block.packed_dma, block.packed_cpu);
+            }
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }

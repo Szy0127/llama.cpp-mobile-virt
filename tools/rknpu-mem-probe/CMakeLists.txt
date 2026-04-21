@@ -1,0 +1,6 @@
+set(TARGET llama-rknpu-mem-probe)
+add_executable(${TARGET} rknpu-mem-probe.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE ggml-rknpu-re ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ../../ggml/src/ggml-rknpu_re)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

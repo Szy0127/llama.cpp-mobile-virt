@@ -1536,23 +1536,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context *>> blob_ctxs;
+    auto create_ctx = [&]() -> ggml_context * {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+
+        pimpl->ctxs.emplace_back(ctx);
+        return ctx;
+    };
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
+            ggml_context * ctx = create_ctx();
             ctx_map[buft] = ctx;
-            pimpl->ctxs.emplace_back(ctx);
-
             return ctx;
         }
         return it->second;
@@ -4140,7 +4144,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         if (host_dma_buft == nullptr) {
             throw std::runtime_error(format("%s: failed to get host-DMA buffer type for RKNPU blobs", __func__));
         }
-        ggml_context * blob_ctx = ctx_for_buft(host_dma_buft);
         for (const auto & it : ml.get_rknpu_prepack_metas()) {
             const std::string & tensor_name = it.first;
             const auto & meta = it.second;
@@ -4148,16 +4151,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (blob_weight == nullptr || blob_weight->tensor == nullptr) {
                 throw std::runtime_error(format("%s: missing RKNPU blob tensor '%s' for tensor '%s'", __func__, meta.blob_tensor.c_str(), tensor_name.c_str()));
             }
-            if (ggml_get_tensor(blob_ctx, meta.blob_tensor.c_str()) != nullptr) {
-                continue;
-            }
+
+            ggml_context * blob_ctx = create_ctx();
+            blob_ctxs.emplace_back(host_dma_buft, blob_ctx);
 
             ggml_tensor * blob_tensor = ggml_dup_tensor(blob_ctx, blob_weight->tensor);
             if (blob_tensor == nullptr) {
                 throw std::runtime_error(format("%s: failed to create RKNPU blob tensor '%s'", __func__, meta.blob_tensor.c_str()));
             }
             ggml_set_name(blob_tensor, meta.blob_tensor.c_str());
-            LLAMA_LOG_DEBUG("%s: created host-DMA RKNPU blob tensor '%s' for tensor '%s'\n",
+            LLAMA_LOG_DEBUG("%s: created host-DMA RKNPU blob tensor '%s' for tensor '%s' in a dedicated context\n",
                     __func__, meta.blob_tensor.c_str(), tensor_name.c_str());
         }
     }
@@ -4175,13 +4178,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
-    for (auto & it : ctx_map) {
-        ggml_backend_buffer_type_t buft = it.first;
-        ggml_context * ctx              = it.second;
-
+    auto alloc_ctx_buffers = [&](ggml_backend_buffer_type_t buft, ggml_context * ctx) {
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
-            continue;
+            return;
         }
 
         llama_buf_map buf_map;
@@ -4220,8 +4220,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 pimpl->bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        }
-        else {
+        } else {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -4249,6 +4248,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         ctx_bufs.emplace_back(ctx, buf_map);
+    };
+
+    for (auto & it : ctx_map) {
+        alloc_ctx_buffers(it.first, it.second);
+    }
+    for (auto & it : blob_ctxs) {
+        alloc_ctx_buffers(it.first, it.second);
     }
 
     if (llama_supports_gpu_offload()) {
