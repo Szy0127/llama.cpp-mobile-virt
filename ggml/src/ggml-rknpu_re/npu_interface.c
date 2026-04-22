@@ -77,7 +77,7 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
   *handle = mem_create.handle;
   static uint64_t sum = 0;
   sum += size;
-  printf("%s %d alloc %ldB,sum %ldMB dma %p va %p\n", __func__, __LINE__, size, sum / 1024 / 1024, (void *)mem_create.dma_addr, map);
+  // printf("%s %d alloc %ldB,sum %ldMB dma %p va %p\n", __func__, __LINE__, size, sum / 1024 / 1024, (void *)mem_create.dma_addr, map);
   return map;
 }
 
