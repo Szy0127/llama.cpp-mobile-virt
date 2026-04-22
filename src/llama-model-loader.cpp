@@ -10,14 +10,22 @@
 
 namespace {
 
-static bool llama_is_rknpu_prepack_blob_name(const char * name) {
-    if (name == nullptr) {
+static bool llama_has_rknpu_suffix(const char * name, const char * suffix) {
+    if (name == nullptr || suffix == nullptr) {
         return false;
     }
 
     const std::string s(name);
-    const std::string suffix = RKNPU_PREPACK_BLOB_SUFFIX;
-    return s.size() > suffix.size() && s.rfind(suffix) == s.size() - suffix.size();
+    const std::string suffix_str(suffix);
+    return s.size() > suffix_str.size() && s.rfind(suffix_str) == s.size() - suffix_str.size();
+}
+
+static bool llama_is_rknpu_prepack_meta_name(const char * name) {
+    return llama_has_rknpu_suffix(name, RKNPU_PREPACK_META_SUFFIX);
+}
+
+static bool llama_is_rknpu_prepack_payload_name(const char * name) {
+    return llama_has_rknpu_suffix(name, RKNPU_PREPACK_PAYLOAD_SUFFIX);
 }
 
 static bool llama_try_get_u32(const gguf_context * meta, const std::string & key, uint32_t & out) {
@@ -53,23 +61,26 @@ static bool llama_try_read_rknpu_prepack_header(
 }
 
 static bool llama_try_load_rknpu_prepack_meta(
-        const std::string & blob_tensor_name,
-        const llama_model_loader::llama_tensor_weight & blob_weight,
+        const std::string & meta_tensor_name,
+        const llama_model_loader::llama_tensor_weight & meta_weight,
+        const std::string & payload_tensor_name,
+        const llama_model_loader::llama_tensor_weight & payload_weight,
         const llama_files & files,
         llama_model_loader::llama_rknpu_prepack_meta & out) {
-    if (blob_weight.tensor == nullptr ||
-        blob_weight.tensor->type != GGML_TYPE_I8 ||
-        ggml_n_dims(blob_weight.tensor) != 1 ||
-        !ggml_is_contiguous(blob_weight.tensor)) {
+    if (meta_weight.tensor == nullptr || payload_weight.tensor == nullptr ||
+        meta_weight.tensor->type != GGML_TYPE_I8 || payload_weight.tensor->type != GGML_TYPE_I8 ||
+        ggml_n_dims(meta_weight.tensor) != 1 || ggml_n_dims(payload_weight.tensor) != 1 ||
+        !ggml_is_contiguous(meta_weight.tensor) || !ggml_is_contiguous(payload_weight.tensor)) {
         return false;
     }
 
     rknpu_offline_blob_header header;
-    if (!llama_try_read_rknpu_prepack_header(blob_weight, files, header) || !rknpu_prepack_header_is_valid(&header)) {
+    if (!llama_try_read_rknpu_prepack_header(meta_weight, files, header) || !rknpu_prepack_header_is_valid(&header)) {
         return false;
     }
 
-    if (rknpu_prepack_total_bytes(&header) != ggml_nbytes(blob_weight.tensor)) {
+    if (rknpu_prepack_meta_bytes(&header) != ggml_nbytes(meta_weight.tensor) ||
+        rknpu_prepack_payload_bytes(&header) != ggml_nbytes(payload_weight.tensor)) {
         return false;
     }
 
@@ -84,15 +95,14 @@ static bool llama_try_load_rknpu_prepack_meta(
     out.ne[1] = header.n;
     out.ne[2] = 1;
     out.ne[3] = 1;
-    out.blob_tensor = blob_tensor_name;
+    out.meta_tensor = meta_tensor_name;
+    out.payload_tensor = payload_tensor_name;
     out.layout = layout;
     out.K = header.K;
     out.N = header.N;
     out.block_count = header.block_count;
     out.weight_bytes_per_block = header.weight_bytes_per_block;
     out.scale_type = header.scale_type;
-    out.scales_offset = rknpu_prepack_scales_offset(&header);
-    out.packed_offset = rknpu_prepack_packed_offset(&header);
     out.scales_bytes_total = header.scales_bytes_total;
     out.packed_bytes_total = header.packed_bytes_total;
     return true;
@@ -576,7 +586,7 @@ llama_model_loader::llama_model_loader(
     // so we build a unified tensors index for weights.
     for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string tensor_name = std::string(cur->name);
-        const bool is_aux = llama_is_rknpu_prepack_blob_name(cur->name);
+        const bool is_aux = llama_is_rknpu_prepack_meta_name(cur->name) || llama_is_rknpu_prepack_payload_name(cur->name);
         auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;
         if (tensor_map.find(tensor_name) != tensor_map.end()) {
             throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -644,7 +654,7 @@ llama_model_loader::llama_model_loader(
             // Save tensors data offset info of the shard.
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                 std::string tensor_name = std::string(cur->name);
-                const bool is_aux = llama_is_rknpu_prepack_blob_name(cur->name);
+                const bool is_aux = llama_is_rknpu_prepack_meta_name(cur->name) || llama_is_rknpu_prepack_payload_name(cur->name);
                 auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;
                 if (tensor_map.find(tensor_name) != tensor_map.end()) {
                     throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -692,24 +702,66 @@ llama_model_loader::llama_model_loader(
     }
 
     if (rknpu_prepack_present) {
+        struct rknpu_aux_pair {
+            const llama_tensor_weight * meta_weight = nullptr;
+            const llama_tensor_weight * payload_weight = nullptr;
+            std::string meta_tensor_name;
+            std::string payload_tensor_name;
+        };
+        std::unordered_map<std::string, rknpu_aux_pair> aux_pairs;
+
         for (const auto & it : auxiliary_weights_map) {
-            const std::string & blob_tensor_name = it.first;
-            const llama_tensor_weight & blob_weight = it.second;
-            if (blob_tensor_name.size() <= strlen(RKNPU_PREPACK_BLOB_SUFFIX)) {
-                throw std::runtime_error(format("%s: invalid RKNPU blob tensor name '%s'", __func__, blob_tensor_name.c_str()));
+            const std::string & aux_tensor_name = it.first;
+            const llama_tensor_weight & aux_weight = it.second;
+            std::string tensor_name;
+            rknpu_aux_pair * pair = nullptr;
+
+            if (llama_is_rknpu_prepack_meta_name(aux_tensor_name.c_str())) {
+                tensor_name = aux_tensor_name.substr(0, aux_tensor_name.size() - strlen(RKNPU_PREPACK_META_SUFFIX));
+                if (tensor_name.empty()) {
+                    throw std::runtime_error(format("%s: invalid RKNPU meta tensor name '%s'", __func__, aux_tensor_name.c_str()));
+                }
+                auto & slot = aux_pairs[tensor_name];
+                if (slot.meta_weight != nullptr) {
+                    throw std::runtime_error(format("%s: duplicate RKNPU meta tensor '%s'", __func__, aux_tensor_name.c_str()));
+                }
+                slot.meta_weight = &aux_weight;
+                slot.meta_tensor_name = aux_tensor_name;
+                pair = &slot;
+            } else if (llama_is_rknpu_prepack_payload_name(aux_tensor_name.c_str())) {
+                tensor_name = aux_tensor_name.substr(0, aux_tensor_name.size() - strlen(RKNPU_PREPACK_PAYLOAD_SUFFIX));
+                if (tensor_name.empty()) {
+                    throw std::runtime_error(format("%s: invalid RKNPU payload tensor name '%s'", __func__, aux_tensor_name.c_str()));
+                }
+                auto & slot = aux_pairs[tensor_name];
+                if (slot.payload_weight != nullptr) {
+                    throw std::runtime_error(format("%s: duplicate RKNPU payload tensor '%s'", __func__, aux_tensor_name.c_str()));
+                }
+                slot.payload_weight = &aux_weight;
+                slot.payload_tensor_name = aux_tensor_name;
+                pair = &slot;
             }
 
-            const std::string tensor_name = blob_tensor_name.substr(0, blob_tensor_name.size() - strlen(RKNPU_PREPACK_BLOB_SUFFIX));
-            if (tensor_name.empty()) {
-                throw std::runtime_error(format("%s: invalid RKNPU blob tensor name '%s'", __func__, blob_tensor_name.c_str()));
+            GGML_UNUSED(pair);
+        }
+
+        for (const auto & it : aux_pairs) {
+            const std::string & tensor_name = it.first;
+            const rknpu_aux_pair & pair = it.second;
+            if (pair.meta_weight == nullptr || pair.payload_weight == nullptr) {
+                throw std::runtime_error(format("%s: incomplete RKNPU prepack pair for tensor '%s' (meta=%s payload=%s)",
+                        __func__, tensor_name.c_str(),
+                        pair.meta_weight != nullptr ? pair.meta_tensor_name.c_str() : "missing",
+                        pair.payload_weight != nullptr ? pair.payload_tensor_name.c_str() : "missing"));
             }
             if (rknpu_prepack_meta_map.find(tensor_name) != rknpu_prepack_meta_map.end()) {
-                throw std::runtime_error(format("%s: duplicate RKNPU tensor '%s' derived from blob names", __func__, tensor_name.c_str()));
+                throw std::runtime_error(format("%s: duplicate RKNPU tensor '%s' derived from aux names", __func__, tensor_name.c_str()));
             }
 
             llama_rknpu_prepack_meta meta_out;
-            if (!llama_try_load_rknpu_prepack_meta(blob_tensor_name, blob_weight, files, meta_out)) {
-                throw std::runtime_error(format("%s: failed to parse RKNPU blob tensor '%s' for tensor '%s'", __func__, blob_tensor_name.c_str(), tensor_name.c_str()));
+            if (!llama_try_load_rknpu_prepack_meta(pair.meta_tensor_name, *pair.meta_weight, pair.payload_tensor_name, *pair.payload_weight, files, meta_out)) {
+                throw std::runtime_error(format("%s: failed to parse RKNPU prepack tensors '%s' and '%s' for tensor '%s'",
+                        __func__, pair.meta_tensor_name.c_str(), pair.payload_tensor_name.c_str(), tensor_name.c_str()));
             }
             rknpu_prepack_meta_map.emplace(tensor_name, std::move(meta_out));
         }
@@ -742,11 +794,12 @@ llama_model_loader::llama_model_loader(
                 ggml_set_name(tensor, tensor_name.c_str());
                 weights_map.emplace(tensor_name, llama_tensor_weight(tensor));
                 ++rknpu_only_tensor_count;
-                LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s blob=%s\n",
-                        __func__, tensor_name.c_str(), ggml_type_name(tensor->type), llama_format_tensor_shape(tensor).c_str(), meta_prepack.blob_tensor.c_str());
+                LLAMA_LOG_DEBUG("%s: synthesized canonical tensor '%s' type=%s shape=%s meta=%s payload=%s\n",
+                        __func__, tensor_name.c_str(), ggml_type_name(tensor->type), llama_format_tensor_shape(tensor).c_str(),
+                        meta_prepack.meta_tensor.c_str(), meta_prepack.payload_tensor.c_str());
             }
 
-            fprintf(stderr, "%s: found %zu RKNPU blob tensors, synthesized %zu canonical tensors\n",
+            fprintf(stderr, "%s: found %zu RKNPU prepack pairs, synthesized %zu canonical tensors\n",
                     __func__, rknpu_prepack_meta_map.size(), rknpu_only_tensor_count);
         }
     }

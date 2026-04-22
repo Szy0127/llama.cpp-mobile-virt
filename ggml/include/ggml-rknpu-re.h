@@ -25,18 +25,17 @@ GGML_API  int32_t ggml_backend_rknpu2_get_device_count(void);
 
 struct ggml_rknpu_prepack_meta {
     const char * tensor_name;
-    const char * blob_tensor_name;
+    const char * meta_tensor_name;
+    const char * payload_tensor_name;
     const char * layout;
     uint32_t K;
     uint32_t N;
     uint32_t block_count;
     uint32_t weight_bytes_per_block;
     uint32_t scale_type;
-    uint32_t scales_offset;
-    uint32_t packed_offset;
     uint32_t scales_bytes_total;
     uint32_t packed_bytes_total;
 };
 
 GGML_API void ggml_rknpu2_clear_offline_prepack_registry(void);
-GGML_API bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * blob_tensor);
+GGML_API bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * meta_tensor, const struct ggml_tensor * payload_tensor);

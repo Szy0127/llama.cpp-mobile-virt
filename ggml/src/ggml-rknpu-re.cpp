@@ -502,7 +502,8 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
     extra->cpu_ptr = tensor->data;
     extra->size = ggml_nbytes(tensor);
     extra->offset = (size_t) ((const char *) tensor->data - (const char *) ctx->buffer);
-    extra->is_blob = std::strstr(tensor->name, RKNPU_PREPACK_BLOB_SUFFIX) != nullptr;
+    extra->is_blob = std::strstr(tensor->name, RKNPU_PREPACK_META_SUFFIX) != nullptr ||
+                     std::strstr(tensor->name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != nullptr;
     extra->dma = ctx->dma + extra->offset;
 
     tensor->extra = extra;
@@ -1629,13 +1630,17 @@ struct rknpu_weight_prepack_cache {
 
 struct rknpu_offline_prepack_blob {
     std::string tensor_name;
-    std::string blob_tensor_name;
+    std::string meta_tensor_name;
+    std::string payload_tensor_name;
     std::string layout;
     ggml_rknpu_prepack_meta meta;
-    const ggml_tensor * blob_tensor = nullptr;
-    const uint8_t * cpu_ptr = nullptr;
-    uint64_t dma = 0;
-    size_t size = 0;
+    const ggml_tensor * meta_tensor = nullptr;
+    const ggml_tensor * payload_tensor = nullptr;
+    const uint8_t * meta_cpu_ptr = nullptr;
+    const uint8_t * payload_cpu_ptr = nullptr;
+    uint64_t payload_dma = 0;
+    size_t meta_size = 0;
+    size_t payload_size = 0;
 };
 
 static std::mutex g_weight_prepack_mtx;
@@ -1648,27 +1653,33 @@ void ggml_rknpu2_clear_offline_prepack_registry(void) {
     g_offline_prepack_registry.clear();
 }
 
-bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * blob_tensor) {
-    if (meta == nullptr || meta->tensor_name == nullptr || meta->blob_tensor_name == nullptr || blob_tensor == nullptr || blob_tensor->data == nullptr) {
+bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * meta_tensor, const struct ggml_tensor * payload_tensor) {
+    if (meta == nullptr || meta->tensor_name == nullptr || meta->meta_tensor_name == nullptr || meta->payload_tensor_name == nullptr ||
+        meta_tensor == nullptr || payload_tensor == nullptr || meta_tensor->data == nullptr || payload_tensor->data == nullptr) {
         return false;
     }
 
-    auto * extra = (const ggml_backend_rknpu2_tensor_extra *) blob_tensor->extra;
+    auto * payload_extra = (const ggml_backend_rknpu2_tensor_extra *) payload_tensor->extra;
 
     rknpu_offline_prepack_blob blob;
     blob.tensor_name = meta->tensor_name;
-    blob.blob_tensor_name = meta->blob_tensor_name;
+    blob.meta_tensor_name = meta->meta_tensor_name;
+    blob.payload_tensor_name = meta->payload_tensor_name;
     if (meta->layout != nullptr) {
         blob.layout = meta->layout;
     }
     blob.meta = *meta;
     blob.meta.tensor_name = blob.tensor_name.c_str();
-    blob.meta.blob_tensor_name = blob.blob_tensor_name.c_str();
+    blob.meta.meta_tensor_name = blob.meta_tensor_name.c_str();
+    blob.meta.payload_tensor_name = blob.payload_tensor_name.c_str();
     blob.meta.layout = blob.layout.c_str();
-    blob.blob_tensor = blob_tensor;
-    blob.cpu_ptr = extra != nullptr ? static_cast<const uint8_t *>(extra->cpu_ptr) : static_cast<const uint8_t *>(blob_tensor->data);
-    blob.dma = extra != nullptr ? extra->dma : 0;
-    blob.size = extra != nullptr ? extra->size : ggml_nbytes(blob_tensor);
+    blob.meta_tensor = meta_tensor;
+    blob.payload_tensor = payload_tensor;
+    blob.meta_cpu_ptr = static_cast<const uint8_t *>(meta_tensor->data);
+    blob.payload_cpu_ptr = payload_extra != nullptr ? static_cast<const uint8_t *>(payload_extra->cpu_ptr) : static_cast<const uint8_t *>(payload_tensor->data);
+    blob.payload_dma = payload_extra != nullptr ? payload_extra->dma : 0;
+    blob.meta_size = ggml_nbytes(meta_tensor);
+    blob.payload_size = payload_extra != nullptr ? payload_extra->size : ggml_nbytes(payload_tensor);
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
@@ -1734,14 +1745,14 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
         return nullptr;
     }
 
-    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via blob %s\n",
-            __func__, src0->name, offline->blob_tensor_name.c_str());
+    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
+            __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
 
-    if (offline->size < sizeof(rknpu_offline_blob_header)) {
+    if (offline->meta_size < sizeof(rknpu_offline_blob_header)) {
         return nullptr;
     }
 
-    const auto * header = reinterpret_cast<const rknpu_offline_blob_header *>(offline->cpu_ptr);
+    const auto * header = reinterpret_cast<const rknpu_offline_blob_header *>(offline->meta_cpu_ptr);
     if (!rknpu_prepack_header_is_valid(header) ||
         header->k != (uint32_t) k ||
         header->n != (uint32_t) n ||
@@ -1767,14 +1778,12 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     }
 
     if (offline->meta.K != header->K ||
-        offline->meta.N != header->N ||
-        offline->meta.scales_offset != rknpu_prepack_scales_offset(header) ||
-        offline->meta.packed_offset != rknpu_prepack_packed_offset(header)) {
+        offline->meta.N != header->N) {
         return nullptr;
     }
 
-    const size_t total_needed = rknpu_prepack_total_bytes(header);
-    if (total_needed != offline->size) {
+    if (rknpu_prepack_meta_bytes(header) != offline->meta_size ||
+        rknpu_prepack_payload_bytes(header) != offline->payload_size) {
         return nullptr;
     }
 
@@ -1795,17 +1804,16 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
 
     const float * scales = header->scales_bytes_total == 0
         ? nullptr
-        : reinterpret_cast<const float *>(offline->cpu_ptr + offline->meta.scales_offset);
-    const uint8_t * packed_base = offline->cpu_ptr + offline->meta.packed_offset;
-    const uint64_t packed_dma_base = offline->dma + offline->meta.packed_offset;
+        : reinterpret_cast<const float *>(offline->meta_cpu_ptr + rknpu_prepack_scales_offset(header));
+    const uint8_t * packed_base = offline->payload_cpu_ptr;
+    const uint64_t packed_dma_base = offline->payload_dma;
 
-    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s blob=%s blob_dma=0x%llx scales_offset=%u packed_offset=%u packed_size=%u packed_dma_base=0x%llx\n",
-            __func__, src0->name, offline->blob_tensor_name.c_str(),
-            (unsigned long long) offline->dma,
-            offline->meta.scales_offset,
-            offline->meta.packed_offset,
-            packed_size,
-            (unsigned long long) packed_dma_base);
+    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s meta=%s payload=%s payload_dma=0x%llx meta_size=%zu payload_size=%zu packed_size=%u\n",
+            __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str(),
+            (unsigned long long) offline->payload_dma,
+            offline->meta_size,
+            offline->payload_size,
+            packed_size);
 
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {

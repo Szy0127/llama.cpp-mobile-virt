@@ -29,15 +29,14 @@ struct llama_model_loader {
         bool enabled = false;
         uint32_t orig_type = 0;
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
-        std::string blob_tensor;
+        std::string meta_tensor;
+        std::string payload_tensor;
         std::string layout;
         uint32_t K = 0;
         uint32_t N = 0;
         uint32_t block_count = 0;
         uint32_t weight_bytes_per_block = 0;
         uint32_t scale_type = 0;
-        uint32_t scales_offset = 0;
-        uint32_t packed_offset = 0;
         uint32_t scales_bytes_total = 0;
         uint32_t packed_bytes_total = 0;
     };

@@ -21,10 +21,11 @@ static const uint32_t RKNPU_PREPACK_LAYOUT_INT8_BLOCK_SCALE = 2;
 static const uint32_t RKNPU_PREPACK_SCALE_TYPE_NONE = 0;
 static const uint32_t RKNPU_PREPACK_SCALE_TYPE_F32 = 1;
 static const uint32_t RKNPU_PREPACK_MAGIC = 0x31504b52u; // RKP1
-static const char * const RKNPU_PREPACK_FORMAT = "blob-v1";
-static const char * const RKNPU_PREPACK_META_FORMAT = "suffix-v1";
+static const char * const RKNPU_PREPACK_FORMAT = "split-v2";
+static const char * const RKNPU_PREPACK_META_FORMAT = "split-suffix-v1";
 static const char * const RKNPU_PREPACK_BACKEND = "rknpu2";
-static const char * const RKNPU_PREPACK_BLOB_SUFFIX = ".__rknpu_blob";
+static const char * const RKNPU_PREPACK_META_SUFFIX = ".__rknpu_meta";
+static const char * const RKNPU_PREPACK_PAYLOAD_SUFFIX = ".__rknpu_payload";
 static const char * const RKNPU_PREPACK_VERSION_KEY = "rknpu.prepack.version";
 static const char * const RKNPU_PREPACK_BACKEND_KEY = "rknpu.prepack.backend";
 static const char * const RKNPU_PREPACK_FORMAT_KEY = "rknpu.prepack.format";
@@ -123,12 +124,12 @@ static inline uint32_t rknpu_prepack_scales_offset(const struct rknpu_offline_bl
     return (uint32_t) sizeof(struct rknpu_offline_blob_header);
 }
 
-static inline uint32_t rknpu_prepack_packed_offset(const struct rknpu_offline_blob_header * header) {
-    return rknpu_prepack_scales_offset(header) + header->scales_bytes_total;
+static inline size_t rknpu_prepack_meta_bytes(const struct rknpu_offline_blob_header * header) {
+    return (size_t) rknpu_prepack_scales_offset(header) + (size_t) header->scales_bytes_total;
 }
 
-static inline size_t rknpu_prepack_total_bytes(const struct rknpu_offline_blob_header * header) {
-    return (size_t) rknpu_prepack_packed_offset(header) + (size_t) header->packed_bytes_total;
+static inline size_t rknpu_prepack_payload_bytes(const struct rknpu_offline_blob_header * header) {
+    return (size_t) header->packed_bytes_total;
 }
 
 static inline bool rknpu_prepack_header_is_valid(const struct rknpu_offline_blob_header * header) {
@@ -200,7 +201,8 @@ static inline bool rknpu_prepack_is_candidate_name(const char * name) {
     if (name_len < suffix_len || strcmp(name + name_len - suffix_len, suffix) != 0) {
         return false;
     }
-    if (strstr(name, RKNPU_PREPACK_BLOB_SUFFIX) != NULL) {
+    if (strstr(name, RKNPU_PREPACK_META_SUFFIX) != NULL ||
+        strstr(name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != NULL) {
         return false;
     }
     if (strcmp(name, "token_embd.weight") == 0) {

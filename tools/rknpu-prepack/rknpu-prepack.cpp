@@ -19,10 +19,9 @@
 namespace {
 
 struct blob_result {
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> meta_bytes;
+    std::vector<uint8_t> payload_bytes;
     rknpu_offline_blob_header header;
-    uint32_t scales_offset;
-    uint32_t packed_offset;
     const char * layout_name;
 };
 
@@ -150,14 +149,13 @@ static blob_result build_blob(const ggml_tensor * tensor) {
         result.header.scale_type = RKNPU_PREPACK_SCALE_TYPE_NONE;
         result.header.scales_bytes_total = 0;
         result.header.packed_bytes_total = block_count * weight_bytes_per_block;
-        result.scales_offset = rknpu_prepack_scales_offset(&result.header);
-        result.packed_offset = rknpu_prepack_packed_offset(&result.header);
         result.layout_name = rknpu_prepack_layout_name(result.header.layout);
 
-        result.bytes.resize(rknpu_prepack_total_bytes(&result.header));
-        std::memcpy(result.bytes.data(), &result.header, sizeof(result.header));
+        result.meta_bytes.resize(rknpu_prepack_meta_bytes(&result.header));
+        result.payload_bytes.resize(rknpu_prepack_payload_bytes(&result.header));
+        std::memcpy(result.meta_bytes.data(), &result.header, sizeof(result.header));
 
-        auto * packed_base = reinterpret_cast<ggml_fp16_t *>(result.bytes.data() + result.packed_offset);
+        auto * packed_base = reinterpret_cast<ggml_fp16_t *>(result.payload_bytes.data());
         std::memset(packed_base, 0, result.header.packed_bytes_total);
 
         const auto * src_fp16 = reinterpret_cast<const ggml_fp16_t *>(src_bytes);
@@ -186,15 +184,14 @@ static blob_result build_blob(const ggml_tensor * tensor) {
     result.header.scale_type = RKNPU_PREPACK_SCALE_TYPE_F32;
     result.header.scales_bytes_total = block_count * sizeof(float);
     result.header.packed_bytes_total = block_count * weight_bytes_per_block;
-    result.scales_offset = rknpu_prepack_scales_offset(&result.header);
-    result.packed_offset = rknpu_prepack_packed_offset(&result.header);
     result.layout_name = rknpu_prepack_layout_name(result.header.layout);
 
-    result.bytes.resize(rknpu_prepack_total_bytes(&result.header));
-    std::memcpy(result.bytes.data(), &result.header, sizeof(result.header));
+    result.meta_bytes.resize(rknpu_prepack_meta_bytes(&result.header));
+    result.payload_bytes.resize(rknpu_prepack_payload_bytes(&result.header));
+    std::memcpy(result.meta_bytes.data(), &result.header, sizeof(result.header));
 
-    float * scales = reinterpret_cast<float *>(result.bytes.data() + result.scales_offset);
-    int8_t * packed_base = reinterpret_cast<int8_t *>(result.bytes.data() + result.packed_offset);
+    float * scales = reinterpret_cast<float *>(result.meta_bytes.data() + rknpu_prepack_scales_offset(&result.header));
+    int8_t * packed_base = reinterpret_cast<int8_t *>(result.payload_bytes.data());
     std::memset(scales, 0, result.header.scales_bytes_total);
     std::memset(packed_base, 0, result.header.packed_bytes_total);
 
@@ -279,9 +276,9 @@ static int run(const params & p) {
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_FORMAT_KEY, RKNPU_PREPACK_FORMAT);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_META_FORMAT_KEY, RKNPU_PREPACK_META_FORMAT);
 
-    ggml_ptr out_ctx = make_output_ctx(static_cast<size_t>(n_tensors + selected_names.size()));
-    std::vector<std::vector<uint8_t>> blobs;
-    blobs.reserve(selected_names.size());
+    ggml_ptr out_ctx = make_output_ctx(static_cast<size_t>(n_tensors + selected_names.size() * 2));
+    std::vector<std::vector<uint8_t>> blob_parts;
+    blob_parts.reserve(selected_names.size() * 2);
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
     const std::unordered_set<std::string> selected_set(selected_names.begin(), selected_names.end());
 
@@ -308,18 +305,28 @@ static int run(const params & p) {
         GGML_ASSERT(tensor != nullptr);
 
         blob_result blob = build_blob(tensor);
-        blobs.push_back(std::move(blob.bytes));
-        auto & blob_storage = blobs.back();
 
-        int64_t ne[GGML_MAX_DIMS] = { static_cast<int64_t>(blob_storage.size()), 1, 1, 1 };
-        ggml_tensor * blob_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, ne);
-        GGML_ASSERT(blob_tensor != nullptr);
+        blob_parts.push_back(std::move(blob.meta_bytes));
+        auto & meta_storage = blob_parts.back();
+        int64_t meta_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(meta_storage.size()), 1, 1, 1 };
+        ggml_tensor * meta_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, meta_ne);
+        GGML_ASSERT(meta_tensor != nullptr);
+        const std::string meta_name = name + RKNPU_PREPACK_META_SUFFIX;
+        ggml_set_name(meta_tensor, meta_name.c_str());
+        meta_tensor->data = meta_storage.data();
+        gguf_add_tensor(ctx_out.get(), meta_tensor);
+        out_tensors[meta_name] = meta_tensor;
 
-        const std::string blob_name = name + RKNPU_PREPACK_BLOB_SUFFIX;
-        ggml_set_name(blob_tensor, blob_name.c_str());
-        blob_tensor->data = blob_storage.data();
-        gguf_add_tensor(ctx_out.get(), blob_tensor);
-        out_tensors[blob_name] = blob_tensor;
+        blob_parts.push_back(std::move(blob.payload_bytes));
+        auto & payload_storage = blob_parts.back();
+        int64_t payload_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(payload_storage.size()), 1, 1, 1 };
+        ggml_tensor * payload_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, payload_ne);
+        GGML_ASSERT(payload_tensor != nullptr);
+        const std::string payload_name = name + RKNPU_PREPACK_PAYLOAD_SUFFIX;
+        ggml_set_name(payload_tensor, payload_name.c_str());
+        payload_tensor->data = payload_storage.data();
+        gguf_add_tensor(ctx_out.get(), payload_tensor);
+        out_tensors[payload_name] = payload_tensor;
     }
 
     std::ofstream out(p.output, std::ios::binary);
@@ -343,7 +350,8 @@ static int run(const params & p) {
     out.write(reinterpret_cast<const char *>(meta.data()), meta.size());
     out.close();
 
-    std::printf("wrote %s with %zu RKNPU blob tensors\n", p.output.c_str(), selected_names.size());
+    std::printf("wrote %s with %zu RKNPU prepacked tensors (%zu meta + %zu payload)\n",
+            p.output.c_str(), selected_names.size() * 2, selected_names.size(), selected_names.size());
     return 0;
 }
 
