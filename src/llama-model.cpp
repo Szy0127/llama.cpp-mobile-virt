@@ -4157,8 +4157,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("%s: missing RKNPU payload tensor '%s' for tensor '%s'", __func__, meta.payload_tensor.c_str(), tensor_name.c_str()));
             }
 
-            ggml_context * meta_ctx = create_ctx();
-            blob_ctxs.emplace_back(cpu_buft, meta_ctx);
+            ggml_context * meta_ctx = ctx_for_buft(cpu_buft);
             ggml_tensor * meta_tensor = ggml_dup_tensor(meta_ctx, meta_weight->tensor);
             if (meta_tensor == nullptr) {
                 throw std::runtime_error(format("%s: failed to create RKNPU meta tensor '%s'", __func__, meta.meta_tensor.c_str()));
