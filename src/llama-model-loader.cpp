@@ -780,6 +780,7 @@ llama_model_loader::llama_model_loader(
             ggml_context * rknpu_only_meta_ctx = meta_ctx_ptr.get();
             contexts.emplace_back(std::move(meta_ctx_ptr));
 
+            // create canonical tensors for RKNPU prepack pairs, so that they can be accessed like normal tensors by the rest of the codebase; these tensors do not have data in the file but are synthesized from the metadata and payload tensors
             for (const auto & it : rknpu_prepack_meta_map) {
                 const std::string & tensor_name = it.first;
                 const auto & meta_prepack = it.second;
