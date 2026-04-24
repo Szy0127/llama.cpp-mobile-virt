@@ -32,116 +32,200 @@
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
 #include "npu_interface.h"
+#include "llm_ioctl.h"
 
 #include <pthread.h>
 
 #define NPU_DEVICE "/dev/dri/card0"
-#define PREALLOC_PFN_BASE 0xa0000ULL
-#define PAGE_SIZE_BYTES   0x1000UL
-#define PREALLOC_MMAP_BYTES         (4ULL << 30)
+#define LLM_DEVICE "/dev/llm"
+#define POOL_ALIGN_BYTES (128ULL << 20)
 
-static int fd = -1;
-static int dev_mem_fd = -1;
-static void *dev_mem_vaddr = NULL;
-static size_t dev_mem_map_size = 0;
-static size_t prealloc_used = 0;
-static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
+static int npu_fd = -1;
+static int llm_fd = -1;
+static int llm_window_began = 0;
+static void *pool_vaddr = NULL;
+static size_t pool_map_size = 0;
+static size_t pool_used = 0;
+static uint64_t pool_dma_base = 0;
+static uint64_t pool_obj_base = 0;
+static uint64_t pool_handle = 0;
+static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
 
-static size_t page_align_up(size_t n) {
-  return (n + PAGE_SIZE_BYTES - 1) & ~(size_t)(PAGE_SIZE_BYTES - 1);
+static size_t pool_align_up(size_t n) {
+  return (n + POOL_ALIGN_BYTES - 1) & ~(size_t)(POOL_ALIGN_BYTES - 1);
 }
 
-static void cleanup_dev_mem_mapping(void) {
-  if (dev_mem_vaddr && dev_mem_map_size) {
-    munmap(dev_mem_vaddr, dev_mem_map_size);
+static void cleanup_pool_mapping(void) {
+  if (pool_vaddr && pool_map_size) {
+    munmap(pool_vaddr, pool_map_size);
   }
-  dev_mem_vaddr = NULL;
-  dev_mem_map_size = 0;
-  prealloc_used = 0;
+  pool_vaddr = NULL;
+  pool_map_size = 0;
+  pool_used = 0;
 
-  if (dev_mem_fd >= 0) {
-    close(dev_mem_fd);
-    dev_mem_fd = -1;
+  if (llm_fd >= 0 && llm_window_began) {
+    const int ret = ioctl(llm_fd, LLM_IOC_FINISH);
+    if (ret < 0) {
+      printf("LLM_IOC_FINISH failed ret=%d errno=%d\n", ret, errno);
+    }
+    llm_window_began = 0;
   }
+
+  if (llm_fd >= 0) {
+    close(llm_fd);
+    llm_fd = -1;
+  }
+
+  pool_dma_base = 0;
+  pool_obj_base = 0;
+  pool_handle = 0;
 }
 
-static void fd_init(void) {
-  fd = npu_open();
-  printf("%s %d: fd %d\n", __func__, __LINE__, fd);
+static void npu_fd_init(void) {
+  npu_fd = npu_open();
+  printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
 }
 
-static int ensure_dev_mem_open(void) {
-  if (dev_mem_fd >= 0 && dev_mem_vaddr != NULL) {
+static int mem_pool_prepare_locked(size_t pool_size) {
+  pool_size = pool_align_up(pool_size);
+  if (pool_size == 0) {
+    printf("Invalid pool size 0\n");
+    return -1;
+  }
+
+  if (pool_vaddr != NULL) {
+    if (pool_size > pool_map_size) {
+      printf("Requested pool size %zu exceeds existing mapped pool size %zu\n",
+             pool_size, pool_map_size);
+      return -1;
+    }
     return 0;
   }
 
-  dev_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-  if (dev_mem_fd < 0) {
-    printf("Failed to open /dev/mem, errno=%d\n", errno);
+  llm_fd = open(LLM_DEVICE, O_RDWR);
+  if (llm_fd < 0) {
+    printf("Failed to open %s errno=%d\n", LLM_DEVICE, errno);
     return -1;
   }
 
-  const uint64_t phys_base = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES;
-  const size_t map_size = PREALLOC_MMAP_BYTES;
-  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                   dev_mem_fd, (off_t)phys_base);
+  int ret = ioctl(llm_fd, LLM_IOC_BEGIN);
+  if (ret < 0) {
+    printf("LLM_IOC_BEGIN failed for pool size=%zu ret=%d errno=%d\n",
+           pool_size, ret, errno);
+    close(llm_fd);
+    llm_fd = -1;
+    return -1;
+  }
+  llm_window_began = 1;
+
+  void *map = mmap(NULL, pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, llm_fd, 0);
   if (map == MAP_FAILED) {
-    printf("Failed to mmap /dev/mem pool at phys=0x%llx, size=%zu, errno=%d\n",
-           (unsigned long long)phys_base, map_size, errno);
-    cleanup_dev_mem_mapping();
+    printf("Failed to mmap %s size=%zu errno=%d\n",
+           LLM_DEVICE, pool_size, errno);
+    (void) ioctl(llm_fd, LLM_IOC_FINISH);
+    llm_window_began = 0;
+    close(llm_fd);
+    llm_fd = -1;
     return -1;
   }
 
-  dev_mem_vaddr = map;
-  dev_mem_map_size = map_size;
-  prealloc_used = 0;
-  atexit(cleanup_dev_mem_mapping);
-  printf("Mapped /dev/mem pool: phys=0x%llx size=%zu vaddr=%p\n",
-         (unsigned long long)phys_base, map_size, map);
+  struct llm_map_info info;
+  memset(&info, 0, sizeof(info));
+  ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
+  if (ret < 0) {
+    printf("LLM_IOC_GET_INFO failed ret=%d errno=%d\n", ret, errno);
+    munmap(map, pool_size);
+    (void) ioctl(llm_fd, LLM_IOC_FINISH);
+    llm_window_began = 0;
+    close(llm_fd);
+    llm_fd = -1;
+    return -1;
+  }
+
+  if (!info.mapped || info.user_vaddr != (uint64_t)(uintptr_t) map || info.length < pool_size) {
+    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu expected_vaddr=0x%llx expected_len=%zu\n",
+           info.mapped,
+           (unsigned long long) info.user_vaddr,
+           (unsigned long long) info.length,
+           (unsigned long long) (uint64_t)(uintptr_t) map,
+           pool_size);
+    munmap(map, pool_size);
+    (void) ioctl(llm_fd, LLM_IOC_FINISH);
+    llm_window_began = 0;
+    close(llm_fd);
+    llm_fd = -1;
+    return -1;
+  }
+
+  pool_vaddr = map;
+  pool_map_size = pool_size;
+  pool_used = 0;
+  pool_dma_base = (uint64_t)(uintptr_t) map;
+  pool_obj_base = (uint64_t)(uintptr_t) map;
+  pool_handle = 0;
+
+  atexit(cleanup_pool_mapping);
+  printf("Mapped LLM pool: dma=0x%llx obj=0x%llx handle=%llu size=%zu vaddr=%p\n",
+         (unsigned long long) pool_dma_base,
+         (unsigned long long) pool_obj_base,
+         (unsigned long long) pool_handle,
+         pool_map_size,
+         map);
   return 0;
+}
+
+int mem_pool_prepare(size_t pool_size) {
+  int ret;
+
+  pthread_mutex_lock(&mem_lock);
+  ret = mem_pool_prepare_locked(pool_size);
+  pthread_mutex_unlock(&mem_lock);
+
+  return ret;
 }
 
 void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle) {
   (void)flags;
 
-  pthread_once(&fd_once, fd_init);
   if (size == 0) {
     return NULL;
   }
 
   pthread_mutex_lock(&mem_lock);
-  if (ensure_dev_mem_open() != 0) {
+  if (pool_vaddr == NULL) {
+    printf("mem_allocate called before mem_pool_prepare\n");
     pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
 
-  const size_t alloc_size = size;//page_align_up(size);
-  if (alloc_size > dev_mem_map_size - prealloc_used) {
-    printf("Out of /dev/mem pool: need=%zu used=%zu total=%zu\n",
-           alloc_size, prealloc_used, dev_mem_map_size);
+  const size_t alloc_size = size;
+  if (alloc_size > pool_map_size - pool_used) {
+    printf("Out of LLM pool: need=%zu used=%zu total=%zu\n",
+           alloc_size, pool_used, pool_map_size);
     pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
 
-  const uint64_t phys_addr = PREALLOC_PFN_BASE * PAGE_SIZE_BYTES + (uint64_t)prealloc_used;
-  void *map = (char *)dev_mem_vaddr + prealloc_used;
-  prealloc_used += alloc_size;
+  const uint64_t dma = pool_dma_base + (uint64_t) pool_used;
+  const uint64_t obj_addr = pool_obj_base + (uint64_t) pool_used;
+  void *map = (char *) pool_vaddr + pool_used;
+  printf("addr:%lx, size:%ld, used:%ld\n", map, size, pool_used);
+  pool_used += alloc_size;
   pthread_mutex_unlock(&mem_lock);
 
   if (dma_addr) {
-    *dma_addr = phys_addr;
+    *dma_addr = dma;
   }
   if (obj) {
-    *obj = phys_addr;
+    *obj = obj_addr;
   }
   if (handle) {
-    *handle = 0;
+    *handle = pool_handle;
   }
 
-  //printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;
 }
 
@@ -150,8 +234,8 @@ void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
   (void)len;
   (void)handle;
   (void)obj_addr;
-  // Allocations are slices of the process-wide /dev/mem mapping, so there is
-  // no per-allocation munmap here.
+  // Allocations are slices of the process-wide /dev/llm mapping, so there is
+  // no per-allocation unmap here.
 }
 
 int npu_open(void) {
@@ -188,19 +272,19 @@ int npu_open(void) {
 }
 
 int npu_reset(void) {
-  pthread_once(&fd_once, fd_init);
+  pthread_once(&npu_fd_once, npu_fd_init);
 
   // Reset the NPU
   struct rknpu_action act = {
     .flags = RKNPU_ACT_RESET,
     0,
   };
-  return ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &act);	
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_ACTION, &act);	
 }
 
 int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask)
 {
-  pthread_once(&fd_once, fd_init);
+  pthread_once(&npu_fd_once, npu_fd_init);
   struct rknpu_subcore_task subcore_tasks[5] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   struct rknpu_submit_extend submit_ext;
   for (int i = 0; i < 5; ++i) {
@@ -232,7 +316,7 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask)
       subcore_tasks[4]
     },
   };
-  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
 }
 
 int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num, void *polling)
@@ -241,7 +325,7 @@ int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num, void *polling)
 
   (void)polling;
 
-  pthread_once(&fd_once, fd_init);
+  pthread_once(&npu_fd_once, npu_fd_init);
   if (task_num <= 0 || task_num > RKNPU_MAX_MULTI_CORE_TASKS) {
     errno = EINVAL;
     return -1;
@@ -272,5 +356,5 @@ int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num, void *polling)
     submit_ext.submit.subcore_task[core_index].task_number = 1;
   }
 
-  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
 }
