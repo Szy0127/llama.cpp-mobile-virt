@@ -1701,7 +1701,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
                 LLAMA_LOG_DEBUG("%s: using placeholder-only context for RKNPU-only tensor %s; meta/payload tensors are loaded separately\n",
                         __func__, tn.str().c_str());
-                return ml.create_tensor(ctx, tn, ne, flags);
+                ggml_tensor * t = ml.create_tensor(ctx, tn, ne, flags);
+                if (t != nullptr) {
+                    t->flags |= GGML_TENSOR_FLAG_RKNPU_PLACEHOLDER;
+                }
+                return t;
             }
 
             if (!buft) {
