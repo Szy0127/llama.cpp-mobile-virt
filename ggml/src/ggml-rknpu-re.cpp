@@ -1600,7 +1600,6 @@ struct rknpu_weight_prepack_block {
     float scale;
     const void * packed_cpu = nullptr;
     uint64_t packed_dma = 0;
-    std::shared_ptr<rknn_mem> dma_mem;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1755,8 +1754,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
         return nullptr;
     }
 
-    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
-            __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
+    // std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
+    //         __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
 
     if (offline->meta_size < sizeof(rknpu_offline_blob_header)) {
         return nullptr;
@@ -1818,12 +1817,12 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     const uint8_t * packed_base = offline->payload_cpu_ptr;
     const uint64_t packed_dma_base = offline->payload_dma;
 
-    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s meta=%s payload=%s payload_dma=0x%llx meta_size=%zu payload_size=%zu packed_size=%u\n",
-            __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str(),
-            (unsigned long long) offline->payload_dma,
-            offline->meta_size,
-            offline->payload_size,
-            packed_size);
+    // std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s meta=%s payload=%s payload_dma=0x%llx meta_size=%zu payload_size=%zu packed_size=%u\n",
+    //         __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str(),
+    //         (unsigned long long) offline->payload_dma,
+    //         offline->meta_size,
+    //         offline->payload_size,
+    //         packed_size);
 
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
@@ -1834,11 +1833,6 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.scale = scales ? scales[block_index] : 1.0f;
             block.packed_cpu = packed_base + size_t(block_index) * packed_size;
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
-            if (block_index < 4) {
-                std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
-                        __func__, src0->name, block_index, nn, kk,
-                        (unsigned long long) block.packed_dma, block.packed_cpu);
-            }
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
@@ -1868,92 +1862,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
 
     auto cache = ggml_rknpu2_try_load_weight_prepack_from_offline(src0, k, n, K, N, tensor_type);
     if (!cache) {
-        if (src0->data == nullptr) {
-            GGML_LOG_ERROR("%s: tensor %s has no source weights and no offline prepack\n", __func__, src0->name);
-            GGML_ABORT("%s: tensor %s has no source weights and no offline prepack", __func__, src0->name);
-        }
-        GGML_LOG_DEBUG("%s: offline prepack unavailable for tensor %s, building runtime prepack from source weights\n", __func__, src0->name);
-        cache = std::make_shared<rknpu_weight_prepack_cache>();
-        cache->key = cache_key;
-    } else {
-        std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
-        auto it = g_weight_prepack_cache.find(cache_key);
-        if (it != g_weight_prepack_cache.end()) {
-            g_weight_prepack_hit_cnt.fetch_add(1);
-            return it->second;
-        }
-        g_weight_prepack_cache.emplace(cache_key, cache);
-        g_weight_prepack_build_cnt.fetch_add(1);
-        return cache;
-    }
-
-    const void * B = src0->data;
-    const float * fB = nullptr;
-    std::unique_ptr<float[]> fB_storage;
-
-    if (tensor_type == RKNN_TENSOR_INT8) {
-        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-        GGML_ASSERT(traits->to_float != NULL);
-        const int nele = k * n;
-        fB_storage.reset(new float[nele]);
-        traits->to_float(B, fB_storage.get(), nele);
-        fB = fB_storage.get();
-    }
-
-    const size_t packed_size = rknn_type_size_B(tensor_type) * K * N;
-    for (int nn = 0; nn < n; nn += N) {
-        for (int kk = 0; kk < k; kk += K) {
-            rknpu_weight_prepack_block block;
-            block.nn = nn;
-            block.kk = kk;
-            block.scale = 1.0f;
-            block.dma_mem = std::make_shared<rknn_mem>(packed_size);
-            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
-            memset(block.dma_mem->ptr, 0, packed_size);
-
-            if (tensor_type == RKNN_TENSOR_FLOAT32) {
-                __fp16 * packed = (__fp16 *)block.dma_mem->ptr;
-                const __fp16 * src_fp16 = (const __fp16 *)B;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_fp16(K, i + 1, j + 1)] = src_fp16[ii * k + jj];
-                    }
-                }
-            } else {
-                GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
-                float scale = RKNPU_PREPACK_SCALE_MIN;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        scale = std::max(scale, std::abs(fB[ii * k + jj]));
-                    }
-                }
-
-                block.scale = scale / 127.f;
-                int8_t * packed = (int8_t *)block.dma_mem->ptr;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], block.scale);
-                    }
-                }
-            }
-
-            cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
-        }
+        GGML_LOG_ERROR("%s: tensor %s is missing offline prepack payload\n", __func__, src0->name);
+        GGML_ABORT("%s: tensor %s is missing offline prepack payload", __func__, src0->name);
     }
 
     std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
@@ -2366,25 +2276,8 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     const int64_t n = dst->ne[0];
 
     float *A = (float*)src1->data;
-    void *B = src0->data;
-    const float *fB = nullptr;
-    std::unique_ptr<float[]> fB_storage;
 
     rknn_tensor_type tensor_type = ggml_type_to_rknn_type(src0->type);
-
-    auto ensure_fB = [&]() -> const float * {
-        if (fB != nullptr) {
-            return fB;
-        }
-        GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
-        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-        GGML_ASSERT(traits->to_float != NULL);
-        const int nele = k * n;
-        fB_storage.reset(new float[nele]);
-        traits->to_float(B, fB_storage.get(), nele);
-        fB = fB_storage.get();
-        return fB;
-    };
 
     auto kernel = ggml_rknpu2_matmul_kernel_find(m, k, n, tensor_type);
     GGML_ASSERT(kernel);
@@ -2440,14 +2333,8 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
-                uint64_t weight_dma = 0;
-                if (block->packed_dma != 0) {
-                    weight_dma = block->packed_dma;
-                } else {
-                    GGML_ASSERT(block->dma_mem);
-                    GGML_ASSERT(block->dma_mem->dma != 0);
-                    weight_dma = block->dma_mem->dma;
-                }
+                GGML_ASSERT(block->packed_dma != 0);
+                const uint64_t weight_dma = block->packed_dma;
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
                 }
@@ -2460,32 +2347,6 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                     }
                 }
             }
-
-            // if (ith == 0) {
-            //     g_weight_block_miss_pre1_cnt.fetch_add(1);
-            // }
-
-            // auto weight = weight_mem->ptr;
-            // if (tensor_type == RKNN_TENSOR_FLOAT32) {
-            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-            //         for (int j = 0; j < K; j++) {
-            //             int ii = nn + i;
-            //             int jj = kk + j;
-            //             if (ii >= n || jj >= k) continue;
-            //             ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
-            //         }
-            // } else if (tensor_type == RKNN_TENSOR_INT8) {
-            //     const float *fB_local = ensure_fB();
-            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-            //         for (int j = 0; j < K; j++) {
-            //             int ii = nn + i;
-            //             int jj = kk + j;
-            //             if (ii >= n || jj >= k) continue;
-            //             ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB_local[ii * k + jj], weight_mem->scale);
-            //         }
-            // }else{
-            //     fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
-            // }
         }
     );
     END_MEASURE_0;

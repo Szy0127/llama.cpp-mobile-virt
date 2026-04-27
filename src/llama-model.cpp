@@ -1587,6 +1587,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
         return it->second;
     };
+    ggml_context * rknpu_placeholder_ctx = nullptr;
+    auto ctx_for_rknpu_placeholder = [&]() -> ggml_context * {
+        if (rknpu_placeholder_ctx == nullptr) {
+            rknpu_placeholder_ctx = create_ctx();
+        }
+        return rknpu_placeholder_ctx;
+    };
 
     const auto TENSOR_DUPLICATED   = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
@@ -1711,14 +1718,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             if (is_rknpu_only) {
-                ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
-                if (buft != nullptr && buft != cpu_buft) {
-                    LLAMA_LOG_DEBUG("%s: overriding buffer type %s with %s for RKNPU-only tensor %s\n",
-                            __func__, ggml_backend_buft_name(buft), ggml_backend_buft_name(cpu_buft), tn.str().c_str());
+                ggml_context * ctx = ctx_for_rknpu_placeholder();
+                if (flags & TENSOR_DUPLICATED) {
+                    ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+                    if (t) {
+                        return t;
+                    }
                 }
-                buft = cpu_buft;
-                LLAMA_LOG_DEBUG("%s: using %s buffer for RKNPU-only tensor %s; the DMA-backed blob tensor is loaded separately\n",
-                        __func__, ggml_backend_buft_name(buft), tn.str().c_str());
+                LLAMA_LOG_DEBUG("%s: using placeholder-only context for RKNPU-only tensor %s; meta/payload tensors are loaded separately\n",
+                        __func__, tn.str().c_str());
+                ggml_tensor * t = ml.create_tensor(ctx, tn, ne, flags);
+                if (t != nullptr) {
+                    t->flags |= GGML_TENSOR_FLAG_RKNPU_PLACEHOLDER;
+                }
+                return t;
             }
 
             if (!buft) {

@@ -557,10 +557,11 @@ extern "C" {
 
     // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT  =  1, // ...is an input for the GGML compute graph
-        GGML_TENSOR_FLAG_OUTPUT =  2, // ...is an output for the GGML compute graph
-        GGML_TENSOR_FLAG_PARAM  =  4, // ...contains trainable parameters
-        GGML_TENSOR_FLAG_LOSS   =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_INPUT             =  1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT            =  2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM             =  4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS              =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_RKNPU_PLACEHOLDER = 16, // ...is an RKNPU-only weight placeholder with separately managed payload storage
     };
 
     struct ggml_init_params {
