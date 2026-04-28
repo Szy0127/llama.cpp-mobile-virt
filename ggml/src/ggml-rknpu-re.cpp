@@ -442,6 +442,7 @@ static const char * ggml_backend_rknpu2_buffer_get_name(ggml_backend_buffer_t bu
 struct ggml_backend_rknpu2_tensor_extra {
     void * cpu_ptr = nullptr;
     uint64_t dma = 0;
+    uint32_t domain_id = 0;
     size_t size = 0;
     size_t offset = 0;
     bool is_blob = false;
@@ -469,6 +470,7 @@ struct ggml_backend_rknpu2_buffer_context {
     uint64_t dma = 0;
     uint64_t obj = 0;
     uint64_t handle = 0;
+    uint32_t domain_id = 0;
     size_t device;
     std::string name;
     std::vector<ggml_backend_rknpu2_tensor_extra *> tensor_extras;
@@ -505,6 +507,7 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
     extra->is_blob = std::strstr(tensor->name, RKNPU_PREPACK_META_SUFFIX) != nullptr ||
                      std::strstr(tensor->name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != nullptr;
     extra->dma = ctx->dma + extra->offset;
+    extra->domain_id = ctx->domain_id;
 
     tensor->extra = extra;
     ctx->tensor_extras.push_back(extra);
@@ -616,8 +619,9 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->buffer_size = size;
     ctx->alloc_size = size_aligned;
     ctx->backend_ctx = &g_rknpu2_mgr[buft_ctx->device];
-    ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
+    ctx->buffer = mem_allocate_payload(size_aligned, &ctx->dma, &ctx->obj,
+            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle,
+            &ctx->domain_id);
 
     if (ctx->buffer == nullptr) {
         printf("%s: failed to allocate %.2f MiB for %s\n", __func__, (double) size / (1 << 20), buft_ctx->name.c_str());
@@ -973,6 +977,11 @@ inline size_t rknn_type_size_C(rknn_tensor_type type) {
 
 static uint64_t total_allocated = 0;
 
+enum class rknpu_mem_kind {
+    payload,
+    compute,
+};
+
 struct rknn_mem {
     size_t size;
     void *ptr;
@@ -980,6 +989,7 @@ struct rknn_mem {
     void *dma_ptr;
     uint64_t dma, obj;
     uint64_t handle;
+    uint32_t domain_id;
     float scale;
     pthread_mutex_t scale_lock;
 
@@ -987,10 +997,15 @@ struct rknn_mem {
     std::atomic<int> pre1_cnt;
     std::atomic<int> post_cnt;
 
-    rknn_mem(size_t size): size(size) {
+    rknn_mem(size_t size, rknpu_mem_kind kind): size(size), domain_id(UINT32_MAX) {
         // Use NON_CACHEABLE memory like rknpu-tests, so no cache sync needed after NPU computation
-        dma_ptr = mem_allocate(size, &dma, &obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle);
+        if (kind == rknpu_mem_kind::compute) {
+            dma_ptr = mem_allocate_compute(size, &dma, &obj,
+                RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle);
+        } else {
+            dma_ptr = mem_allocate_payload(size, &dma, &obj,
+                RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle, &domain_id);
+        }
 #ifdef FAKE_CACHE
         GGML_ASSERT(dma_alloc(size, &fd, &ptr) == 0);
 #else
@@ -1037,7 +1052,9 @@ struct A_bufs {
         : M(M), K(K), m(m), k(k), type(type) {
         for (int mm = 0; mm < m; mm += M)
             for (int kk = 0; kk < k; kk += K)
-                As.emplace(std::make_tuple(mm, kk), std::make_shared<rknn_mem>(A_buf_size));
+                As.emplace(std::make_tuple(mm, kk),
+                           std::make_shared<rknn_mem>(A_buf_size,
+                                                      rknpu_mem_kind::compute));
     }
 };
 struct B_bufs {
@@ -1049,7 +1066,9 @@ struct B_bufs {
         : K(K), N(N), k(k), n(n), type(type) {
         for (int nn = 0; nn < n; nn += N)
             for (int kk = 0; kk < k; kk += K)
-                Bs.emplace(std::make_tuple(nn, kk), std::make_shared<rknn_mem>(B_buf_size));
+                Bs.emplace(std::make_tuple(nn, kk),
+                           std::make_shared<rknn_mem>(B_buf_size,
+                                                      rknpu_mem_kind::payload));
     }
 };
 struct C_bufs {
@@ -1062,7 +1081,9 @@ struct C_bufs {
         for (int mm = 0; mm < m; mm += M)
             for (int nn = 0; nn < n; nn += N)
                 for (int kk = 0; kk < k; kk += K)
-                    Cs.emplace(std::make_tuple(mm, nn, kk), std::make_shared<rknn_mem>(C_buf_size));
+                    Cs.emplace(std::make_tuple(mm, nn, kk),
+                               std::make_shared<rknn_mem>(C_buf_size,
+                                                          rknpu_mem_kind::compute));
     }
 };
 
@@ -1119,6 +1140,7 @@ struct npu_task {
     uint64_t *regcmd;
     uint64_t regcmd_dma, regcmd_obj;
     uint64_t regcmd_handle;
+    uint32_t domain_id;
 #ifdef GGML_USE_CHCORE
     struct rknpu_task *tasks;
     uint64_t tasks_dma, tasks_obj;
@@ -1133,12 +1155,13 @@ struct npu_task {
 
     npu_task(int M, int N, int K, int nn, int kk, rknn_tensor_type type,
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
-        : M(M), N(N), K(K), nn(nn), kk(kk), input(input), weight(weight), output(output), type(type) {
-        regcmd = (uint64_t*)mem_allocate(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle);
+        : M(M), N(N), K(K), nn(nn), kk(kk), domain_id(weight->domain_id),
+          input(input), weight(weight), output(output), type(type) {
+        regcmd = (uint64_t*)mem_allocate_compute(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle);
         GGML_ASSERT(regcmd);
 
 #ifdef GGML_USE_CHCORE
-        tasks = (rknpu_task *)mem_allocate(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle);
+        tasks = (rknpu_task *)mem_allocate_compute(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle);
         GGML_ASSERT(tasks);
 #endif
         
@@ -1220,7 +1243,7 @@ struct npu_task {
         //     fprintf(stderr, "weight->ptr[%d] = %d\n", i, ((int32_t*)weight->ptr)[i]);
         // }
         // *((int32_t*)weight->ptr) = 1;
-        int ret = npu_submit(regcmd_dma, (__u32)core_mask);
+        int ret = npu_submit(regcmd_dma, (__u32)core_mask, domain_id);
         if (ret) {
             printf("RKNPU_SUBMIT returned %d, submitted m=%hu, k=%hu, n=%hu, errno %d\n",
                 ret, M, K, N, errno);
@@ -1246,12 +1269,13 @@ struct npu_task {
         output->scale = input->scale * weight->scale;
     }
 
-    void set_weight_dma(uint64_t weights_dma) {
-        if (params.weights_dma == weights_dma) {
+    void set_weight_location(uint64_t weights_dma, uint32_t weights_domain_id) {
+        if (params.weights_dma == weights_dma && domain_id == weights_domain_id) {
             return;
         }
 
         params.weights_dma = weights_dma;
+        domain_id = weights_domain_id;
         if (type == RKNN_TENSOR_FLOAT32) {
             params.fp32tofp16 = 0;
             int ret = gen_matmul_fp16(&params);
@@ -1268,7 +1292,8 @@ struct npu_task {
 };
 
 extern "C" {
-    int npu_submit_multi(uint64_t task_obj_addr[], int task_num, void *poll);
+    int npu_submit_multi(uint64_t task_obj_addr[], int task_num,
+                         uint32_t domain_id, void *poll);
 }
 
 struct npu_task_multi_core {
@@ -1281,8 +1306,11 @@ struct npu_task_multi_core {
 
     void submit(void) {
         GGML_ASSERT(npu_tasks.size() <= NPU_CORE_NUM);
+        uint32_t domain_id = npu_tasks.front()->domain_id;
+        bool same_domain = true;
         std::vector<uint64_t> tasks_objs;
         for (auto npu_task: npu_tasks) {
+            same_domain = same_domain && (npu_task->domain_id == domain_id);
     #ifdef GGML_USE_CHCORE
             npu_task->flush_cache();
             tasks_objs.push_back((uint64_t) npu_task->tasks_obj);
@@ -1291,11 +1319,20 @@ struct npu_task_multi_core {
             tasks_objs.push_back((uint64_t) npu_task->regcmd_dma);
     #endif
         }
-        int ret = npu_submit_multi(tasks_objs.data(), tasks_objs.size(), (void *)ggml_thread_cpu_relax_out);
-        GGML_ASSERT(ret == 0);
+        if (same_domain) {
+            int ret = npu_submit_multi(tasks_objs.data(), tasks_objs.size(), domain_id,
+                                       (void *)ggml_thread_cpu_relax_out);
+            GGML_ASSERT(ret == 0);
+        } else {
+            for (size_t idx = 0; idx < npu_tasks.size(); ++idx) {
+                npu_tasks[idx]->submit(1u << idx);
+            }
+        }
     #ifndef GGML_USE_CHCORE
-        for (auto npu_task: npu_tasks) {
-            npu_task->flush_cache_after_submit();
+        if (same_domain) {
+            for (auto npu_task: npu_tasks) {
+                npu_task->flush_cache_after_submit();
+            }
         }
     #endif
         
@@ -1535,7 +1572,9 @@ struct matmul_kernel {
 #ifdef MAT_COPY
                     auto weight = weights->Bs.find(std::make_tuple(nn, kk))->second;
 #else
-                    static std::shared_ptr<rknn_mem> global_weight = std::make_shared<rknn_mem>(4096 * 4096 * rknn_type_size_B(type));
+                    static std::shared_ptr<rknn_mem> global_weight =
+                        std::make_shared<rknn_mem>(4096 * 4096 * rknn_type_size_B(type),
+                                                   rknpu_mem_kind::payload);
                     std::shared_ptr<rknn_mem> weight(global_weight);
 #endif
                     auto output = outputs->Cs.find(std::make_tuple(mm, nn, kk))->second;
@@ -1600,6 +1639,9 @@ struct rknpu_weight_prepack_block {
     float scale;
     const void * packed_cpu = nullptr;
     uint64_t packed_dma = 0;
+    bool has_packed_dma = false;
+    uint32_t domain_id = 0;
+    std::shared_ptr<rknn_mem> dma_mem;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1648,6 +1690,7 @@ struct rknpu_offline_prepack_blob {
     const uint8_t * meta_cpu_ptr = nullptr;
     const uint8_t * payload_cpu_ptr = nullptr;
     uint64_t payload_dma = 0;
+    uint32_t payload_domain_id = 0;
     size_t meta_size = 0;
     size_t payload_size = 0;
 };
@@ -1669,6 +1712,11 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     }
 
     auto * payload_extra = (const ggml_backend_rknpu2_tensor_extra *) payload_tensor->extra;
+    if (payload_extra == nullptr) {
+        GGML_LOG_ERROR("%s: payload tensor %s is missing RKNPURE DMA metadata\n",
+                __func__, ggml_get_name(payload_tensor));
+        return false;
+    }
 
     rknpu_offline_prepack_blob blob;
     blob.tensor_name = meta->tensor_name;
@@ -1685,10 +1733,11 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta_tensor = meta_tensor;
     blob.payload_tensor = payload_tensor;
     blob.meta_cpu_ptr = static_cast<const uint8_t *>(meta_tensor->data);
-    blob.payload_cpu_ptr = payload_extra != nullptr ? static_cast<const uint8_t *>(payload_extra->cpu_ptr) : static_cast<const uint8_t *>(payload_tensor->data);
-    blob.payload_dma = payload_extra != nullptr ? payload_extra->dma : 0;
+    blob.payload_cpu_ptr = static_cast<const uint8_t *>(payload_extra->cpu_ptr);
+    blob.payload_dma = payload_extra->dma;
+    blob.payload_domain_id = payload_extra->domain_id;
     blob.meta_size = ggml_nbytes(meta_tensor);
-    blob.payload_size = payload_extra != nullptr ? payload_extra->size : ggml_nbytes(payload_tensor);
+    blob.payload_size = payload_extra->size;
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
@@ -1833,6 +1882,13 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.scale = scales ? scales[block_index] : 1.0f;
             block.packed_cpu = packed_base + size_t(block_index) * packed_size;
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
+            block.has_packed_dma = true;
+            block.domain_id = offline->payload_domain_id;
+            if (block_index < 4) {
+                std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
+                        __func__, src0->name, block_index, nn, kk,
+                        (unsigned long long) block.packed_dma, block.packed_cpu);
+            }
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
@@ -1862,8 +1918,94 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
 
     auto cache = ggml_rknpu2_try_load_weight_prepack_from_offline(src0, k, n, K, N, tensor_type);
     if (!cache) {
-        GGML_LOG_ERROR("%s: tensor %s is missing offline prepack payload\n", __func__, src0->name);
-        GGML_ABORT("%s: tensor %s is missing offline prepack payload", __func__, src0->name);
+        if (src0->data == nullptr) {
+            GGML_LOG_ERROR("%s: tensor %s has no source weights and no offline prepack\n", __func__, src0->name);
+            GGML_ABORT("%s: tensor %s has no source weights and no offline prepack", __func__, src0->name);
+        }
+        GGML_LOG_DEBUG("%s: offline prepack unavailable for tensor %s, building runtime prepack from source weights\n", __func__, src0->name);
+        cache = std::make_shared<rknpu_weight_prepack_cache>();
+        cache->key = cache_key;
+    } else {
+        std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
+        auto it = g_weight_prepack_cache.find(cache_key);
+        if (it != g_weight_prepack_cache.end()) {
+            g_weight_prepack_hit_cnt.fetch_add(1);
+            return it->second;
+        }
+        g_weight_prepack_cache.emplace(cache_key, cache);
+        g_weight_prepack_build_cnt.fetch_add(1);
+        return cache;
+    }
+
+    const void * B = src0->data;
+    const float * fB = nullptr;
+    std::unique_ptr<float[]> fB_storage;
+
+    if (tensor_type == RKNN_TENSOR_INT8) {
+        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+        GGML_ASSERT(traits->to_float != NULL);
+        const int nele = k * n;
+        fB_storage.reset(new float[nele]);
+        traits->to_float(B, fB_storage.get(), nele);
+        fB = fB_storage.get();
+    }
+
+    const size_t packed_size = rknn_type_size_B(tensor_type) * K * N;
+    for (int nn = 0; nn < n; nn += N) {
+        for (int kk = 0; kk < k; kk += K) {
+            rknpu_weight_prepack_block block;
+            block.nn = nn;
+            block.kk = kk;
+            block.scale = 1.0f;
+            block.dma_mem = std::make_shared<rknn_mem>(packed_size,
+                                                       rknpu_mem_kind::payload);
+            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
+            block.domain_id = block.dma_mem->domain_id;
+            memset(block.dma_mem->ptr, 0, packed_size);
+
+            if (tensor_type == RKNN_TENSOR_FLOAT32) {
+                __fp16 * packed = (__fp16 *)block.dma_mem->ptr;
+                const __fp16 * src_fp16 = (const __fp16 *)B;
+                for (int i = 0; i < N; i++) {
+                    for (int j = 0; j < K; j++) {
+                        int ii = nn + i;
+                        int jj = kk + j;
+                        if (ii >= n || jj >= k) {
+                            continue;
+                        }
+                        packed[weight_fp16(K, i + 1, j + 1)] = src_fp16[ii * k + jj];
+                    }
+                }
+            } else {
+                GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
+                float scale = RKNPU_PREPACK_SCALE_MIN;
+                for (int i = 0; i < N; i++) {
+                    for (int j = 0; j < K; j++) {
+                        int ii = nn + i;
+                        int jj = kk + j;
+                        if (ii >= n || jj >= k) {
+                            continue;
+                        }
+                        scale = std::max(scale, std::abs(fB[ii * k + jj]));
+                    }
+                }
+
+                block.scale = scale / 127.f;
+                int8_t * packed = (int8_t *)block.dma_mem->ptr;
+                for (int i = 0; i < N; i++) {
+                    for (int j = 0; j < K; j++) {
+                        int ii = nn + i;
+                        int jj = kk + j;
+                        if (ii >= n || jj >= k) {
+                            continue;
+                        }
+                        packed[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], block.scale);
+                    }
+                }
+        }
+
+            cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
+        }
     }
 
     std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
@@ -2333,8 +2475,15 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
-                GGML_ASSERT(block->packed_dma != 0);
-                const uint64_t weight_dma = block->packed_dma;
+                uint64_t weight_dma = 0;
+                uint32_t weight_domain_id = block->domain_id;
+                if (block->has_packed_dma) {
+                    weight_dma = block->packed_dma;
+                } else {
+                    GGML_ASSERT(block->dma_mem);
+                    weight_dma = block->dma_mem->dma;
+                    weight_domain_id = block->dma_mem->domain_id;
+                }
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
                 }
@@ -2342,7 +2491,7 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 for (const auto & task_group : kernel->npu_tasks) {
                     for (const auto & task : task_group->npu_tasks) {
                         if (task->nn == nn && task->kk == kk) {
-                            task->set_weight_dma(weight_dma);
+                            task->set_weight_location(weight_dma, weight_domain_id);
                         }
                     }
                 }

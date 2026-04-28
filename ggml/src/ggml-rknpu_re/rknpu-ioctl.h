@@ -281,6 +281,8 @@ struct rknpu_submit {
         __s32 priority;
         __u64 task_obj_addr;
         __u64 regcfg_obj_addr;
+        __u32 iommu_domain_id;
+        __u32 reserved0;
         __u64 task_base_addr;
         __u64 user_data;
         __u32 core_mask;
