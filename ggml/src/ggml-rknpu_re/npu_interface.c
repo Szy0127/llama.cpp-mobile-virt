@@ -37,20 +37,22 @@
 #include <pthread.h>
 
 #define NPU_DEVICE "/dev/dri/card0"
-#define PREALLOC_PFN_BASE_DEFAULT      0xa0000ULL
-#define PAGE_SIZE_BYTES   0x1000UL
-#define DOMAIN_WINDOW_BYTES            (4ULL << 30)
-#define PREALLOC_MMAP_BYTES_DEFAULT    (8ULL << 30)
+#define PREALLOC_GPA_BASE_DEFAULT      0xa0000000ULL
+#define PAGE_SIZE_BYTES                0x1000UL
+#define DONATE_BYTES_DEFAULT           (4ULL << 30)
+#define IOVA_WINDOW_BYTES_DEFAULT      (4ULL << 30)
 #define COMPUTE_BUFFER_BYTES_DEFAULT   (256ULL << 20)
-//#define COMPUTE_BUFFER_BYTES_DEFAULT   (2048ULL << 20)
 
 struct npu_prealloc_layout {
   uint64_t gpa_base;
-  uint64_t total_window_bytes;
+  uint64_t donate_size;
+  uint64_t iova_window_bytes;
   uint64_t compute_buffer_bytes;
+  uint64_t reserve_size;
   uint64_t payload_window_bytes;
   uint64_t payload_total_bytes;
   uint64_t compute_gpa_offset;
+  uint32_t domain_count;
 };
 
 static int fd = -1;
@@ -65,10 +67,6 @@ static pthread_once_t layout_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
-
-static size_t page_align_up(size_t n) {
-  return (n + PAGE_SIZE_BYTES - 1) & ~(size_t)(PAGE_SIZE_BYTES - 1);
-}
 
 static void cleanup_dev_mem_mapping(void) {
   if (dev_mem_vaddr && dev_mem_map_size) {
@@ -105,46 +103,167 @@ static uint64_t parse_env_u64(const char *name, uint64_t fallback) {
   return (uint64_t) parsed;
 }
 
-static void init_prealloc_layout(void) {
-  uint64_t total_window_bytes;
-  uint64_t compute_buffer_bytes;
-  uint64_t gpa_base;
-
-  gpa_base = parse_env_u64("RKNPU_GPA_BASE",
-                           PREALLOC_PFN_BASE_DEFAULT * PAGE_SIZE_BYTES);
-  total_window_bytes = parse_env_u64("RKNPU_TOTAL_WINDOW_BYTES",
-                                     PREALLOC_MMAP_BYTES_DEFAULT);
-  total_window_bytes = parse_env_u64("RKNPU_TOTAL_WINDOW_MB",
-                                     total_window_bytes >> 20) << 20;
-  compute_buffer_bytes = parse_env_u64("RKNPU_COMPUTE_BUFFER_BYTES",
-                                       COMPUTE_BUFFER_BYTES_DEFAULT);
-  compute_buffer_bytes = parse_env_u64("RKNPU_COMPUTE_BUFFER_MB",
-                                       compute_buffer_bytes >> 20) << 20;
-
-  total_window_bytes = page_align_up(total_window_bytes);
-  compute_buffer_bytes = page_align_up(compute_buffer_bytes);
-
-  if (compute_buffer_bytes == 0 || compute_buffer_bytes >= DOMAIN_WINDOW_BYTES ||
-      total_window_bytes <= compute_buffer_bytes) {
-    printf("Invalid RKNPU layout, fallback to defaults total=0x%llx compute=0x%llx\n",
-           (unsigned long long) total_window_bytes,
-           (unsigned long long) compute_buffer_bytes);
-    gpa_base = PREALLOC_PFN_BASE_DEFAULT * PAGE_SIZE_BYTES;
-    total_window_bytes = PREALLOC_MMAP_BYTES_DEFAULT;
-    compute_buffer_bytes = COMPUTE_BUFFER_BYTES_DEFAULT;
-  }
-
-  g_prealloc_layout.gpa_base = gpa_base;
-  g_prealloc_layout.total_window_bytes = total_window_bytes;
-  g_prealloc_layout.compute_buffer_bytes = compute_buffer_bytes;
-  g_prealloc_layout.payload_window_bytes = DOMAIN_WINDOW_BYTES - compute_buffer_bytes;
-  g_prealloc_layout.payload_total_bytes = total_window_bytes - compute_buffer_bytes;
-  g_prealloc_layout.compute_gpa_offset = total_window_bytes - compute_buffer_bytes;
-}
-
 static void fd_init(void) {
   fd = npu_open();
   printf("%s %d: fd %d\n", __func__, __LINE__, fd);
+}
+
+static int validate_prealloc_layout(struct npu_prealloc_layout *layout,
+                                    const char *source) {
+  uint64_t domain_count;
+
+  if (layout->gpa_base == 0 || layout->donate_size == 0 ||
+      layout->iova_window_bytes == 0 || layout->compute_buffer_bytes == 0) {
+    printf("Invalid %s layout: zero field gpa=0x%llx donate=0x%llx iova=0x%llx compute=0x%llx\n",
+           source,
+           (unsigned long long) layout->gpa_base,
+           (unsigned long long) layout->donate_size,
+           (unsigned long long) layout->iova_window_bytes,
+           (unsigned long long) layout->compute_buffer_bytes);
+    return -1;
+  }
+
+  if ((layout->gpa_base & (PAGE_SIZE_BYTES - 1)) != 0 ||
+      (layout->donate_size & (PAGE_SIZE_BYTES - 1)) != 0 ||
+      (layout->iova_window_bytes & (PAGE_SIZE_BYTES - 1)) != 0 ||
+      (layout->compute_buffer_bytes & (PAGE_SIZE_BYTES - 1)) != 0) {
+    printf("Invalid %s layout: values must be page aligned\n", source);
+    return -1;
+  }
+
+  if (layout->donate_size <= layout->compute_buffer_bytes) {
+    printf("Invalid %s layout: donate size 0x%llx must be larger than compute buffer 0x%llx\n",
+           source,
+           (unsigned long long) layout->donate_size,
+           (unsigned long long) layout->compute_buffer_bytes);
+    return -1;
+  }
+
+  if (layout->compute_buffer_bytes >= layout->iova_window_bytes) {
+    printf("Invalid %s layout: compute buffer 0x%llx must be smaller than iova window 0x%llx\n",
+           source,
+           (unsigned long long) layout->compute_buffer_bytes,
+           (unsigned long long) layout->iova_window_bytes);
+    return -1;
+  }
+
+  if (UINT64_MAX - layout->gpa_base < layout->donate_size) {
+    printf("Invalid %s layout: compute gpa overflow\n", source);
+    return -1;
+  }
+
+  layout->payload_window_bytes =
+      layout->iova_window_bytes - layout->compute_buffer_bytes;
+  layout->reserve_size = layout->donate_size;
+  layout->payload_total_bytes =
+      layout->donate_size - layout->compute_buffer_bytes;
+  layout->compute_gpa_offset =
+      layout->reserve_size - layout->compute_buffer_bytes;
+
+  domain_count =
+      (layout->payload_total_bytes + layout->payload_window_bytes - 1) /
+      layout->payload_window_bytes;
+  if (domain_count == 0 || domain_count > UINT32_MAX) {
+    printf("Invalid %s layout: domain count overflow (%llu)\n",
+           source, (unsigned long long) domain_count);
+    return -1;
+  }
+
+  layout->domain_count = (uint32_t) domain_count;
+  return 0;
+}
+
+static void log_prealloc_layout(const char *source,
+                                const struct npu_prealloc_layout *layout) {
+  printf("RKNPU layout (%s): gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx domains=%u\n",
+         source,
+         (unsigned long long) layout->gpa_base,
+         (unsigned long long) layout->donate_size,
+         (unsigned long long) layout->compute_buffer_bytes,
+         (unsigned long long) layout->iova_window_bytes,
+         (unsigned long long) layout->reserve_size,
+         (unsigned long long) layout->payload_window_bytes,
+         layout->domain_count);
+}
+
+static int load_prealloc_layout_from_driver(struct npu_prealloc_layout *layout) {
+  struct rknpu_layout_info info;
+
+  memset(&info, 0, sizeof(info));
+  pthread_once(&fd_once, fd_init);
+  if (fd < 0) {
+    return -1;
+  }
+
+  if (ioctl(fd, DRM_IOCTL_RKNPU_GET_LAYOUT, &info) < 0) {
+    printf("DRM_IOCTL_RKNPU_GET_LAYOUT failed errno=%d\n", errno);
+    return -1;
+  }
+
+  memset(layout, 0, sizeof(*layout));
+  layout->gpa_base = info.gpa_base;
+  layout->donate_size = info.donate_size;
+  layout->iova_window_bytes = info.iova_window_size;
+  layout->compute_buffer_bytes = info.compute_buffer_size;
+
+  if (validate_prealloc_layout(layout, "driver") != 0) {
+    return -1;
+  }
+
+  if (info.payload_window_size != 0 &&
+      info.payload_window_size != layout->payload_window_bytes) {
+    printf("Driver payload window mismatch: ioctl=0x%llx local=0x%llx\n",
+           (unsigned long long) info.payload_window_size,
+           (unsigned long long) layout->payload_window_bytes);
+  }
+  if (info.reserve_size != 0 && info.reserve_size != layout->reserve_size) {
+    printf("Driver reserve size mismatch: ioctl=0x%llx local=0x%llx\n",
+           (unsigned long long) info.reserve_size,
+           (unsigned long long) layout->reserve_size);
+  }
+
+  log_prealloc_layout("driver", layout);
+  return 0;
+}
+
+static void init_prealloc_layout_from_env(struct npu_prealloc_layout *layout) {
+  memset(layout, 0, sizeof(*layout));
+  layout->gpa_base = parse_env_u64("RKNPU_GPA_BASE", PREALLOC_GPA_BASE_DEFAULT);
+  layout->donate_size = parse_env_u64("RKNPU_DONATE_SIZE", DONATE_BYTES_DEFAULT);
+  layout->donate_size =
+      parse_env_u64("RKNPU_DONATE_MB", layout->donate_size >> 20) << 20;
+  layout->iova_window_bytes =
+      parse_env_u64("RKNPU_IOVA_WINDOW_SIZE", IOVA_WINDOW_BYTES_DEFAULT);
+  layout->iova_window_bytes =
+      parse_env_u64("RKNPU_IOVA_WINDOW_MB", layout->iova_window_bytes >> 20) << 20;
+  layout->compute_buffer_bytes =
+      parse_env_u64("RKNPU_COMPUTE_BUFFER_SIZE", COMPUTE_BUFFER_BYTES_DEFAULT);
+  layout->compute_buffer_bytes =
+      parse_env_u64("RKNPU_COMPUTE_BUFFER_MB",
+                    layout->compute_buffer_bytes >> 20) << 20;
+
+  if (validate_prealloc_layout(layout, "env") != 0) {
+    memset(layout, 0, sizeof(*layout));
+    layout->gpa_base = PREALLOC_GPA_BASE_DEFAULT;
+    layout->donate_size = DONATE_BYTES_DEFAULT;
+    layout->iova_window_bytes = IOVA_WINDOW_BYTES_DEFAULT;
+    layout->compute_buffer_bytes = COMPUTE_BUFFER_BYTES_DEFAULT;
+    if (validate_prealloc_layout(layout, "defaults") != 0) {
+      abort();
+    }
+    log_prealloc_layout("defaults", layout);
+    return;
+  }
+
+  log_prealloc_layout("env", layout);
+}
+
+static void init_prealloc_layout(void) {
+  if (load_prealloc_layout_from_driver(&g_prealloc_layout) == 0) {
+    return;
+  }
+
+  init_prealloc_layout_from_env(&g_prealloc_layout);
 }
 
 static int ensure_dev_mem_open(void) {
@@ -161,7 +280,7 @@ static int ensure_dev_mem_open(void) {
   }
 
   const uint64_t phys_base = g_prealloc_layout.gpa_base;
-  const size_t map_size = g_prealloc_layout.total_window_bytes;
+  const size_t map_size = g_prealloc_layout.reserve_size;
   void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
                    dev_mem_fd, (off_t)phys_base);
   if (map == MAP_FAILED) {
@@ -323,6 +442,7 @@ int npu_open(void) {
   int ret = ioctl(local_fd, DRM_IOCTL_VERSION, &dv);
   if (ret <0) {
     printf("DRM_IOCTL_VERISON failed %d\n",ret);
+    close(local_fd);
     return ret;
   }
   printf("drm name is %s - %s - %s\n", dv.name, dv.date, dv.desc);

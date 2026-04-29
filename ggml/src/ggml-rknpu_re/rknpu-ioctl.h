@@ -318,6 +318,18 @@ struct rknpu_action {
         __u32 value;
 };
 
+struct rknpu_layout_info {
+        __u64 gpa_base;
+        __u64 donate_size;
+        __u64 compute_buffer_size;
+        __u64 iova_window_size;
+        __u64 reserve_size;
+        __u64 payload_window_size;
+        __u64 compute_buffer_gpa;
+        __u32 domain_count;
+        __u32 layout_version;
+};
+
 #define RKNPU_ACTION 0x00
 #define RKNPU_SUBMIT 0x01
 #define RKNPU_MEM_CREATE 0x02
@@ -325,6 +337,9 @@ struct rknpu_action {
 #define RKNPU_MEM_DESTROY 0x04
 #define RKNPU_MEM_SYNC 0x05
 #define RKNPU_SUBMIT_EXT 0x06
+#define RKNPU_GET_LAYOUT 0x07
+
+#define RKNPU_LAYOUT_INFO_VERSION 1
 
 #define RKNPU_IOC_MAGIC 'r'
 #define RKNPU_IOW(nr, type) _IOW(RKNPU_IOC_MAGIC, nr, type)
@@ -370,6 +385,8 @@ struct drm_version {
         DRM_IOWR(DRM_COMMAND_BASE + RKNPU_MEM_SYNC, struct rknpu_mem_sync)
 #define DRM_IOCTL_RKNPU_SUBMIT_EXT                                             \
         DRM_IOWR(DRM_COMMAND_BASE + RKNPU_SUBMIT_EXT, struct rknpu_submit_extend)
+#define DRM_IOCTL_RKNPU_GET_LAYOUT                                             \
+        DRM_IOWR(DRM_COMMAND_BASE + RKNPU_GET_LAYOUT, struct rknpu_layout_info)
 
 #define IOCTL_RKNPU_ACTION RKNPU_IOWR(RKNPU_ACTION, struct rknpu_action)
 #define IOCTL_RKNPU_SUBMIT RKNPU_IOWR(RKNPU_SUBMIT, struct rknpu_submit)
@@ -381,5 +398,7 @@ struct drm_version {
 #define IOCTL_RKNPU_MEM_SYNC RKNPU_IOWR(RKNPU_MEM_SYNC, struct rknpu_mem_sync)
 #define IOCTL_RKNPU_SUBMIT_EXT                                                 \
         RKNPU_IOWR(RKNPU_SUBMIT_EXT, struct rknpu_submit_extend)
+#define IOCTL_RKNPU_GET_LAYOUT                                                 \
+        RKNPU_IOWR(RKNPU_GET_LAYOUT, struct rknpu_layout_info)
 
 #endif // RKNPU_IOCTL_H
