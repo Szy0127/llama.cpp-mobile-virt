@@ -1734,6 +1734,15 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta_size = ggml_nbytes(meta_tensor);
     blob.payload_size = payload_extra->size;
 
+    std::fprintf(stderr,
+            "[RKNPU_ALLOC][WEIGHT_PREPACK] tensor=%s payload_tensor=%s size=%zu cpu=%p dma=0x%llx domain=%u\n",
+            blob.tensor_name.c_str(),
+            blob.payload_tensor_name.c_str(),
+            blob.payload_size,
+            blob.payload_cpu_ptr,
+            (unsigned long long) blob.payload_dma,
+            blob.payload_domain_id);
+
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
     return true;
@@ -1879,11 +1888,6 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
             block.has_packed_dma = true;
             block.domain_id = offline->payload_domain_id;
-            if (block_index < 4) {
-                std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
-                        __func__, src0->name, block_index, nn, kk,
-                        (unsigned long long) block.packed_dma, block.packed_cpu);
-            }
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
