@@ -470,6 +470,26 @@ struct ggml_backend_rknpu2_buffer_context {
     std::string name;
     std::vector<ggml_backend_rknpu2_tensor_extra *> tensor_extras;
 };
+
+static const char * ggml_backend_rknpu2_tensor_name(const ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->name[0] != '\0' ? tensor->name : "<unnamed>";
+}
+
+static void ggml_backend_rknpu2_log_tensor_layout(const char * tag,
+                                                  const ggml_tensor * tensor,
+                                                  const void * cpu_ptr,
+                                                  uint64_t dma,
+                                                  size_t size,
+                                                  uint32_t domain_id) {
+    GGML_LOG_INFO("[RKNPU_TENSOR] %s tensor=%s cpu=%p dma=0x%llx size=%zu domain=%u\n",
+                  tag,
+                  ggml_backend_rknpu2_tensor_name(tensor),
+                  cpu_ptr,
+                  (unsigned long long) dma,
+                  size,
+                  domain_id);
+}
+
 // Frees the allocation backing one custom host or host-DMA buffer.
 static void ggml_backend_rknpu2_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
@@ -491,6 +511,14 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
     if (tensor->view_src != nullptr) {
         if (tensor->view_src->extra != nullptr) {
             tensor->extra = tensor->view_src->extra;
+            auto * extra = (ggml_backend_rknpu2_tensor_extra *) tensor->view_src->extra;
+            const size_t offset = (size_t) ((const char *) tensor->data - (const char *) extra->cpu_ptr);
+            ggml_backend_rknpu2_log_tensor_layout("view",
+                                                  tensor,
+                                                  tensor->data,
+                                                  extra->dma + offset,
+                                                  ggml_nbytes(tensor),
+                                                  extra->domain_id);
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -506,6 +534,12 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
 
     tensor->extra = extra;
     ctx->tensor_extras.push_back(extra);
+    ggml_backend_rknpu2_log_tensor_layout("alloc",
+                                          tensor,
+                                          extra->cpu_ptr,
+                                          extra->dma,
+                                          extra->size,
+                                          extra->domain_id);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1879,11 +1913,6 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
             block.has_packed_dma = true;
             block.domain_id = offline->payload_domain_id;
-            if (block_index < 4) {
-                std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
-                        __func__, src0->name, block_index, nn, kk,
-                        (unsigned long long) block.packed_dma, block.packed_cpu);
-            }
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }

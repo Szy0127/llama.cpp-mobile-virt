@@ -68,6 +68,24 @@ static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
 
+static void log_prealloc_usage(const char *kind, size_t alloc_size,
+                               uint64_t phys_addr, uint64_t iova,
+                               uint32_t domain_id,
+                               uint64_t prealloc_used_now,
+                               uint64_t left_now,
+                               uint64_t compute_used_now,
+                               uint64_t compute_left_now) {
+  printf("[RKNPU_PREALLOC] kind=%s size=%zu phys=0x%llx iova=0x%llx domain=%u prealloc_used=%llu left=%llu compute_used=%llu compute_left=%llu\n",
+         kind, alloc_size,
+         (unsigned long long) phys_addr,
+         (unsigned long long) iova,
+         domain_id,
+         (unsigned long long) prealloc_used_now,
+         (unsigned long long) left_now,
+         (unsigned long long) compute_used_now,
+         (unsigned long long) compute_left_now);
+}
+
 static void cleanup_dev_mem_mapping(void) {
   if (dev_mem_vaddr && dev_mem_map_size) {
     munmap(dev_mem_vaddr, dev_mem_map_size);
@@ -319,6 +337,12 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   const size_t alloc_size = size;
   uint64_t phys_addr;
   uint64_t iova;
+  uint32_t alloc_domain_id = UINT32_MAX;
+  uint64_t prealloc_used_now;
+  uint64_t left_now;
+  uint64_t compute_used_now;
+  uint64_t compute_left_now;
+  const char *alloc_kind;
   void *map;
 
   if (use_compute_pool) {
@@ -335,6 +359,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     iova = g_prealloc_layout.payload_window_bytes + (uint64_t) compute_used;
     map = (char *) dev_mem_vaddr + g_prealloc_layout.compute_gpa_offset + compute_used;
     compute_used += alloc_size;
+    alloc_kind = "compute";
     if (domain_id) {
       *domain_id = UINT32_MAX;
     }
@@ -368,12 +393,18 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     phys_addr = g_prealloc_layout.gpa_base + local_payload_used;
     iova = local_payload_used % g_prealloc_layout.payload_window_bytes;
     map = (char *) dev_mem_vaddr + local_payload_used;
+    alloc_domain_id = (uint32_t)
+        (local_payload_used / g_prealloc_layout.payload_window_bytes);
     if (domain_id) {
-      *domain_id = (uint32_t)
-          (local_payload_used / g_prealloc_layout.payload_window_bytes);
+      *domain_id = alloc_domain_id;
     }
     payload_used = local_payload_used + alloc_size;
+    alloc_kind = "payload";
   }
+  prealloc_used_now = payload_used;
+  left_now = g_prealloc_layout.payload_total_bytes - prealloc_used_now;
+  compute_used_now = compute_used;
+  compute_left_now = g_prealloc_layout.compute_buffer_bytes - compute_used_now;
   pthread_mutex_unlock(&mem_lock);
 
   if (dma_addr) {
@@ -385,6 +416,10 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   if (handle) {
     *handle = 0;
   }
+
+  log_prealloc_usage(alloc_kind, alloc_size, phys_addr, iova, alloc_domain_id,
+                     prealloc_used_now, left_now,
+                     compute_used_now, compute_left_now);
 
   //printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;
