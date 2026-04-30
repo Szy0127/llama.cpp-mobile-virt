@@ -1666,11 +1666,8 @@ struct rknpu_weight_prepack_block {
     int nn;
     int kk;
     float scale;
-    const void * packed_cpu = nullptr;
-    uint64_t packed_dma = 0;
-    bool has_packed_dma = false;
+    uint64_t packed_dma = 0; // weight_dma may legitimately be 0 when the packed payload starts at the beginning of an IOVA window
     uint32_t domain_id = 0;
-    std::shared_ptr<rknn_mem> dma_mem;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1717,7 +1714,6 @@ struct rknpu_offline_prepack_blob {
     const ggml_tensor * meta_tensor = nullptr;
     const ggml_tensor * payload_tensor = nullptr;
     const uint8_t * meta_cpu_ptr = nullptr;
-    const uint8_t * payload_cpu_ptr = nullptr;
     uint64_t payload_dma = 0;
     uint32_t payload_domain_id = 0;
     size_t meta_size = 0;
@@ -1762,18 +1758,16 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta_tensor = meta_tensor;
     blob.payload_tensor = payload_tensor;
     blob.meta_cpu_ptr = static_cast<const uint8_t *>(meta_tensor->data);
-    blob.payload_cpu_ptr = static_cast<const uint8_t *>(payload_extra->cpu_ptr);
     blob.payload_dma = payload_extra->dma;
     blob.payload_domain_id = payload_extra->domain_id;
     blob.meta_size = ggml_nbytes(meta_tensor);
     blob.payload_size = payload_extra->size;
 
     std::fprintf(stderr,
-            "[RKNPU_ALLOC][WEIGHT_PREPACK] tensor=%s payload_tensor=%s size=%zu cpu=%p dma=0x%llx domain=%u\n",
+            "[RKNPU_ALLOC][WEIGHT_PREPACK] tensor=%s payload_tensor=%s size=%zu dma=0x%llx domain=%u\n",
             blob.tensor_name.c_str(),
             blob.payload_tensor_name.c_str(),
             blob.payload_size,
-            blob.payload_cpu_ptr,
             (unsigned long long) blob.payload_dma,
             blob.payload_domain_id);
 
@@ -1837,9 +1831,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     rknn_tensor_type tensor_type) {
 
     const rknpu_offline_prepack_blob * offline = ggml_rknpu2_find_offline_prepack(src0->name);
-    if (offline == nullptr) {
-        return nullptr;
-    }
+    GGML_ASSERT(offline); // 我们假定所有prepacked权重都必须被预打包并注册到离线预打包注册表中, 不存在fallback到现场pack的情况
 
     // std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
     //         __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
@@ -1901,7 +1893,6 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     const float * scales = header->scales_bytes_total == 0
         ? nullptr
         : reinterpret_cast<const float *>(offline->meta_cpu_ptr + rknpu_prepack_scales_offset(header));
-    const uint8_t * packed_base = offline->payload_cpu_ptr;
     const uint64_t packed_dma_base = offline->payload_dma;
 
     // std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s meta=%s payload=%s payload_dma=0x%llx meta_size=%zu payload_size=%zu packed_size=%u\n",
@@ -1918,11 +1909,9 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.nn = nn;
             block.kk = kk;
             block.scale = scales ? scales[block_index] : 1.0f;
-            block.packed_cpu = packed_base + size_t(block_index) * packed_size;
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
-            block.has_packed_dma = true;
             block.domain_id = offline->payload_domain_id;
-            cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
+            cache->blocks.emplace(rknpu_block_key(nn, kk), block);
             ++block_index;
         }
     }
@@ -1930,6 +1919,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     return cache;
 }
 
+// 构建cache函数，按理来说不需要cache直接现场算偏移就行，但是暂时保留方便debug
 static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepack(
     const ggml_tensor * src0,
     int64_t k,
@@ -1949,96 +1939,11 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
         }
     }
 
+    // 在此处构建好所有的预打包块信息，目前保证所有权重都被cache到，不存在fallback的情况（可以理解为下面这个函数返回nullptr都是校验不通过的情况）
     auto cache = ggml_rknpu2_try_load_weight_prepack_from_offline(src0, k, n, K, N, tensor_type);
     if (!cache) {
-        if (src0->data == nullptr) {
-            GGML_LOG_ERROR("%s: tensor %s has no source weights and no offline prepack\n", __func__, src0->name);
-            GGML_ABORT("%s: tensor %s has no source weights and no offline prepack", __func__, src0->name);
-        }
-        GGML_LOG_DEBUG("%s: offline prepack unavailable for tensor %s, building runtime prepack from source weights\n", __func__, src0->name);
-        cache = std::make_shared<rknpu_weight_prepack_cache>();
-        cache->key = cache_key;
-    } else {
-        std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
-        auto it = g_weight_prepack_cache.find(cache_key);
-        if (it != g_weight_prepack_cache.end()) {
-            g_weight_prepack_hit_cnt.fetch_add(1);
-            return it->second;
-        }
-        g_weight_prepack_cache.emplace(cache_key, cache);
-        g_weight_prepack_build_cnt.fetch_add(1);
-        return cache;
-    }
-
-    const void * B = src0->data;
-    const float * fB = nullptr;
-    std::unique_ptr<float[]> fB_storage;
-
-    if (tensor_type == RKNN_TENSOR_INT8) {
-        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-        GGML_ASSERT(traits->to_float != NULL);
-        const int nele = k * n;
-        fB_storage.reset(new float[nele]);
-        traits->to_float(B, fB_storage.get(), nele);
-        fB = fB_storage.get();
-    }
-
-    const size_t packed_size = rknn_type_size_B(tensor_type) * K * N;
-    for (int nn = 0; nn < n; nn += N) {
-        for (int kk = 0; kk < k; kk += K) {
-            rknpu_weight_prepack_block block;
-            block.nn = nn;
-            block.kk = kk;
-            block.scale = 1.0f;
-            block.dma_mem = std::make_shared<rknn_mem>(packed_size,
-                                                       rknpu_mem_kind::payload);
-            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
-            block.domain_id = block.dma_mem->domain_id;
-            memset(block.dma_mem->ptr, 0, packed_size);
-
-            if (tensor_type == RKNN_TENSOR_FLOAT32) {
-                __fp16 * packed = (__fp16 *)block.dma_mem->ptr;
-                const __fp16 * src_fp16 = (const __fp16 *)B;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_fp16(K, i + 1, j + 1)] = src_fp16[ii * k + jj];
-                    }
-                }
-            } else {
-                GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
-                float scale = RKNPU_PREPACK_SCALE_MIN;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        scale = std::max(scale, std::abs(fB[ii * k + jj]));
-                    }
-                }
-
-                block.scale = scale / 127.f;
-                int8_t * packed = (int8_t *)block.dma_mem->ptr;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], block.scale);
-                    }
-                }
-        }
-
-            cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
-        }
+        GGML_LOG_ERROR("%s: offline prepack is required for tensor %s\n", __func__, src0->name);
+        GGML_ABORT("%s: offline prepack is required for tensor %s", __func__, src0->name);
     }
 
     std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
@@ -2508,15 +2413,8 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
-                uint64_t weight_dma = 0;
-                uint32_t weight_domain_id = block->domain_id;
-                if (block->has_packed_dma) {
-                    weight_dma = block->packed_dma;
-                } else {
-                    GGML_ASSERT(block->dma_mem);
-                    weight_dma = block->dma_mem->dma;
-                    weight_domain_id = block->dma_mem->domain_id;
-                }
+                const uint64_t weight_dma = block->packed_dma;
+                const uint32_t weight_domain_id = block->domain_id;
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
                 }
