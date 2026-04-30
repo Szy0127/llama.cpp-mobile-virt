@@ -1768,6 +1768,15 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta_size = ggml_nbytes(meta_tensor);
     blob.payload_size = payload_extra->size;
 
+    std::fprintf(stderr,
+            "[RKNPU_ALLOC][WEIGHT_PREPACK] tensor=%s payload_tensor=%s size=%zu cpu=%p dma=0x%llx domain=%u\n",
+            blob.tensor_name.c_str(),
+            blob.payload_tensor_name.c_str(),
+            blob.payload_size,
+            blob.payload_cpu_ptr,
+            (unsigned long long) blob.payload_dma,
+            blob.payload_domain_id);
+
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
     return true;
