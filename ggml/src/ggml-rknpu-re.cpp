@@ -1009,6 +1009,7 @@ static uint64_t total_allocated = 0;
 enum class rknpu_mem_kind {
     payload,
     compute,
+    placeholder,
 };
 
 struct rknn_mem {
@@ -1021,12 +1022,31 @@ struct rknn_mem {
     uint32_t domain_id;
     float scale;
     pthread_mutex_t scale_lock;
+    rknpu_mem_kind kind;
 
     std::atomic<int> pre_scale_cnt;
     std::atomic<int> pre1_cnt;
     std::atomic<int> post_cnt;
 
-    rknn_mem(size_t size, rknpu_mem_kind kind): size(size), domain_id(UINT32_MAX) {
+
+    rknn_mem(size_t size, rknpu_mem_kind kind): size(size), domain_id(UINT32_MAX), kind(kind) {
+        scale = 1.0f;
+        pthread_mutex_init(&scale_lock, 0);
+
+        // In offline-prepack-only mode, B still needs an object for task/scale bookkeeping,
+        // but pre1 will overwrite the real DMA/domain from the GGUF payload before submit.
+        if (kind == rknpu_mem_kind::placeholder) {
+            // init below fields to dummy values to avoid accidental use before overwrite
+            domain_id = 0;
+            ptr = nullptr;
+            fd = -1;
+            dma_ptr = nullptr;
+            dma = 0;
+            obj = 0;
+            handle = 0;
+            return;
+        }
+
         // Use NON_CACHEABLE memory like rknpu-tests, so no cache sync needed after NPU computation
         if (kind == rknpu_mem_kind::compute) {
             dma_ptr = mem_allocate_compute(size, &dma, &obj,
@@ -1043,14 +1063,14 @@ struct rknn_mem {
         // GGML_ASSERT(dma_ptr);
         total_allocated += size;
         //fprintf(stderr, "rknn_mem allocated: %lu bytes, total allocated: %lu bytes\n", size, total_allocated);
-        scale = 1.0;
-        pthread_mutex_init(&scale_lock, 0);
     }
     ~rknn_mem(void) {
 #ifdef FAKE_CACHE
         dma_buf_free(size, &fd, ptr);
 #endif
-        mem_destroy(dma_ptr, size, handle, obj);
+        if (kind != rknpu_mem_kind::placeholder) {
+            mem_destroy(dma_ptr, size, handle, obj);
+        }
     }
     void init_scale(void) { scale = RKNPU_PREPACK_SCALE_MIN; }
     void commit_scale(float _scale) {
@@ -1091,13 +1111,14 @@ struct B_bufs {
     rknn_tensor_type type;
     std::map<std::tuple<int, int>, std::shared_ptr<rknn_mem>> Bs;
 
+    // 由于使用prepack blob的方式来传递B，所以这里初始化的B_bufs只起到占位作用，并不分配真正的内存。
     B_bufs(int K, int N, int k, int n, rknn_tensor_type type)
         : K(K), N(N), k(k), n(n), type(type) {
         for (int nn = 0; nn < n; nn += N)
             for (int kk = 0; kk < k; kk += K)
                 Bs.emplace(std::make_tuple(nn, kk),
                            std::make_shared<rknn_mem>(B_buf_size,
-                                                      rknpu_mem_kind::payload));
+                                                      rknpu_mem_kind::placeholder));
     }
 };
 struct C_bufs {
