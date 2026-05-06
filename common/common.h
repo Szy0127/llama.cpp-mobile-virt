@@ -327,6 +327,7 @@ struct common_params {
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock         = false; // use mlock to keep model in memory
+    size_t rknpu_tail_load_bytes = 0; // load only the tail portion of RKNPU prepack payload tensors
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool dump_kv_cache     = false; // dump the KV cache contents for debugging purposes

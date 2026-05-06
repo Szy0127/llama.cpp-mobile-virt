@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
 
+#include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstring>
@@ -548,6 +549,7 @@ llama_model_loader::llama_model_loader(
         std::vector<std::string> & splits,
         bool use_mmap,
         bool check_tensors,
+        size_t rknpu_tail_load_bytes,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
@@ -562,6 +564,7 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+    this->rknpu_tail_load_bytes = rknpu_tail_load_bytes;
 
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
@@ -921,6 +924,51 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap = use_mmap;
     this->check_tensors = check_tensors;
+
+    if (rknpu_tail_load_bytes > 0 && !rknpu_prepack_meta_map.empty()) {
+        rknpu_partial_load_entries.reserve(rknpu_prepack_meta_map.size());
+
+        for (const auto & it : weights_map) {
+            if (!it.second.is_rknpu_only) {
+                continue;
+            }
+
+            const auto meta_it = rknpu_prepack_meta_map.find(it.first);
+            if (meta_it == rknpu_prepack_meta_map.end()) {
+                continue;
+            }
+
+            const auto & prepack_meta = meta_it->second;
+            rknpu_partial_load_entries.push_back({
+                prepack_meta.payload_tensor,
+                prepack_meta.packed_bytes_total,
+                false,
+            });
+            rknpu_partial_total_bytes += prepack_meta.packed_bytes_total;
+        }
+
+        size_t suffix_bytes = 0;
+        for (auto it = rknpu_partial_load_entries.rbegin(); it != rknpu_partial_load_entries.rend(); ++it) {
+            if (suffix_bytes >= rknpu_tail_load_bytes) {
+                break;
+            }
+            it->selected = true;
+            suffix_bytes += it->payload_bytes;
+            rknpu_partial_selected_bytes += it->payload_bytes;
+        }
+
+        LLAMA_LOG_INFO("%s: RKNPU partial load enabled, tail budget = %zu bytes, selected %zu/%zu payload bytes across %zu/%zu tensors\n",
+                __func__,
+                rknpu_tail_load_bytes,
+                rknpu_partial_selected_bytes,
+                rknpu_partial_total_bytes,
+                std::count_if(rknpu_partial_load_entries.begin(), rknpu_partial_load_entries.end(), [](const auto & entry) { return entry.selected; }),
+                rknpu_partial_load_entries.size());
+        for (const auto & entry : rknpu_partial_load_entries) {
+            LLAMA_LOG_DEBUG("%s: RKNPU partial payload %s (%zu bytes) => %s\n",
+                    __func__, entry.payload_tensor_name.c_str(), entry.payload_bytes, entry.selected ? "load" : "skip");
+        }
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -970,6 +1018,32 @@ const llama_model_loader::llama_rknpu_prepack_meta * llama_model_loader::get_rkn
 
 const std::unordered_map<std::string, llama_model_loader::llama_rknpu_prepack_meta> & llama_model_loader::get_rknpu_prepack_metas() const {
     return rknpu_prepack_meta_map;
+}
+
+bool llama_model_loader::has_rknpu_partial_load() const {
+    return rknpu_tail_load_bytes > 0;
+}
+
+bool llama_model_loader::should_load_rknpu_payload(const char * name) const {
+    if (!has_rknpu_partial_load() || !llama_is_rknpu_prepack_payload_name(name)) {
+        return true;
+    }
+
+    for (const auto & entry : rknpu_partial_load_entries) {
+        if (entry.payload_tensor_name == name) {
+            return entry.selected;
+        }
+    }
+
+    return true;
+}
+
+size_t llama_model_loader::get_rknpu_partial_selected_bytes() const {
+    return rknpu_partial_selected_bytes;
+}
+
+size_t llama_model_loader::get_rknpu_partial_total_bytes() const {
+    return rknpu_partial_total_bytes;
 }
 
 bool llama_model_loader::get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const {
@@ -1127,15 +1201,28 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
+    auto should_count_weight = [&](const std::string & name, const llama_tensor_weight & weight) {
+        if (weight.is_rknpu_only) {
+            return false;
+        }
+        if (llama_is_rknpu_prepack_payload_name(name.c_str())) {
+            return should_load_rknpu_payload(name.c_str());
+        }
+        return true;
+    };
+
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        if (it.second.is_rknpu_only) {
+        if (!should_count_weight(it.first, it.second)) {
             continue;
         }
         size_data += ggml_nbytes(it.second.tensor);
     }
 
     for (const auto & it : auxiliary_weights_map) {
+        if (!should_count_weight(it.first, it.second)) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }
@@ -1171,6 +1258,10 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 
     if (w->is_rknpu_only) {
         LLAMA_LOG_DEBUG("%s: skipping RKNPU-only tensor '%s'\n", __func__, ggml_get_name(cur));
+        return;
+    }
+    if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur)) && !should_load_rknpu_payload(ggml_get_name(cur))) {
+        LLAMA_LOG_DEBUG("%s: skipping unselected RKNPU payload tensor '%s'\n", __func__, ggml_get_name(cur));
         return;
     }
 
@@ -1314,6 +1405,10 @@ bool llama_model_loader::load_all_data(
 
         if (weight->is_rknpu_only) {
             LLAMA_LOG_DEBUG("%s: skipping RKNPU-only tensor '%s' during bulk load\n", __func__, ggml_get_name(cur));
+            continue;
+        }
+        if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur)) && !should_load_rknpu_payload(ggml_get_name(cur))) {
+            LLAMA_LOG_DEBUG("%s: skipping unselected RKNPU payload tensor '%s' during bulk load\n", __func__, ggml_get_name(cur));
             continue;
         }
 

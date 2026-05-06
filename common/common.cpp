@@ -1081,12 +1081,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.n_gpu_layers = params.n_gpu_layers;
     }
 
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
-    mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_mlock       = params.use_mlock;
-    mparams.check_tensors   = params.check_tensors;
+    mparams.main_gpu              = params.main_gpu;
+    mparams.split_mode            = params.split_mode;
+    mparams.tensor_split          = params.tensor_split;
+    mparams.use_mmap              = params.use_mmap;
+    mparams.use_mlock             = params.use_mlock;
+    mparams.rknpu_tail_load_bytes = params.rknpu_tail_load_bytes;
+    mparams.check_tensors         = params.check_tensors;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

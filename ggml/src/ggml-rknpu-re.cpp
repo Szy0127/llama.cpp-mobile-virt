@@ -459,7 +459,11 @@ struct ggml_backend_rknpu2_buffer_context {
             delete extra;
         }
         if (buffer) {
-            mem_destroy(buffer, alloc_size, handle, obj);
+            if (use_malloc) {
+                free(buffer);
+            } else {
+                mem_destroy(buffer, alloc_size, handle, obj);
+            }
         }
     }
 
@@ -470,6 +474,7 @@ struct ggml_backend_rknpu2_buffer_context {
     uint64_t dma = 0;
     uint64_t obj = 0;
     uint64_t handle = 0;
+    bool use_malloc = false;
     size_t device;
     std::string name;
     std::vector<ggml_backend_rknpu2_tensor_extra *> tensor_extras;
@@ -574,6 +579,7 @@ static void ggml_backend_rknpu2_buffer_clear(ggml_backend_buffer_t buffer, uint8
 struct ggml_backend_rknpu2_buffer_type_context {
     int32_t device;
     std::string name;
+    bool use_malloc;
 };
 
 /**
@@ -617,8 +623,17 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->buffer_size = size;
     ctx->alloc_size = size_aligned;
     ctx->backend_ctx = &g_rknpu2_mgr[buft_ctx->device];
-    ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
+    ctx->use_malloc = buft_ctx->use_malloc;
+
+    if (ctx->use_malloc) {
+        ctx->buffer = malloc(size_aligned);
+        ctx->dma = 0;
+        ctx->obj = 0;
+        ctx->handle = 0;
+    } else {
+        ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
+                RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
+    }
 
     if (ctx->buffer == nullptr) {
         printf("%s: failed to allocate %.2f MiB for %s\n", __func__, (double) size / (1 << 20), buft_ctx->name.c_str());
@@ -676,8 +691,7 @@ static ggml_backend_buffer_type_i ggml_backend_rknpu2_buffer_type_interface = {
  * @return A pointer to the buffer type interface for the specified device, or
  * nullptr if the device index is out of range.
  */
-// Returns the custom CPU-accessible DMA-backed buffer type used for offline prepack blobs.
-static ggml_backend_buffer_type_t ggml_backend_rknpu2_get_host_dma_buffer_type_internal(int32_t device, const char * name_prefix) {
+static ggml_backend_buffer_type_t ggml_backend_rknpu2_get_host_buffer_type_internal(int32_t device, const char * name_prefix, bool use_malloc) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -686,31 +700,41 @@ static ggml_backend_buffer_type_t ggml_backend_rknpu2_get_host_dma_buffer_type_i
     }
 
     static ggml_backend_buffer_type host_dma_buffer_types[GGML_RKNPU2_MAX_DEVICES];
+    static ggml_backend_buffer_type host_malloc_buffer_types[GGML_RKNPU2_MAX_DEVICES];
     static bool host_dma_initialized = false;
+    static bool host_malloc_initialized = false;
 
-    if (!host_dma_initialized) {
+    ggml_backend_buffer_type * buffer_types = use_malloc ? host_malloc_buffer_types : host_dma_buffer_types;
+    bool * initialized = use_malloc ? &host_malloc_initialized : &host_dma_initialized;
+
+    if (!*initialized) {
         for (int32_t i = 0; i < GGML_RKNPU2_MAX_DEVICES; i++) {
-            host_dma_buffer_types[i].iface = ggml_backend_rknpu2_buffer_type_interface;
-            host_dma_buffer_types[i].device = nullptr;
-            host_dma_buffer_types[i].context = new ggml_backend_rknpu2_buffer_type_context{
-                i, std::string(name_prefix) + std::to_string(i)};
+            buffer_types[i].iface = ggml_backend_rknpu2_buffer_type_interface;
+            buffer_types[i].device = nullptr;
+            buffer_types[i].context = new ggml_backend_rknpu2_buffer_type_context{
+                i, std::string(name_prefix) + std::to_string(i), use_malloc};
         }
-        host_dma_initialized = true;
+        *initialized = true;
     }
 
-    return &host_dma_buffer_types[device];
+    return &buffer_types[device];
 }
 
 // Returns the legacy RKNPURE buffer type used by the backend's existing tensor paths.
 GGML_API ggml_backend_buffer_type_t
 ggml_backend_rknpure_buffer_type(int32_t device) {
-    return ggml_backend_rknpu2_get_host_dma_buffer_type_internal(device, "RKNPURE");
+    return ggml_backend_rknpu2_get_host_buffer_type_internal(device, "RKNPURE", false);
 }
 
 // Returns a CPU-accessible buffer type whose allocations are backed by DMA for offline prepack blobs.
 GGML_API ggml_backend_buffer_type_t
 ggml_backend_rknpu2_host_dma_buffer_type(int32_t device) {
-    return ggml_backend_rknpu2_get_host_dma_buffer_type_internal(device, "HOST_DMA");
+    return ggml_backend_rknpu2_get_host_buffer_type_internal(device, "HOST_DMA", false);
+}
+
+GGML_API ggml_backend_buffer_type_t
+ggml_backend_rknpu2_host_malloc_buffer_type(int32_t device) {
+    return ggml_backend_rknpu2_get_host_buffer_type_internal(device, "HOST_MALLOC", true);
 }
 
 // g++ doesn't allow restrict? removed.

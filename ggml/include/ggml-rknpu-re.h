@@ -21,6 +21,7 @@ void ggml_rknpu2_transform_tensor_back(void * data, const ggml_tensor * tensor, 
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_buffer_type(void);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpure_buffer_type(int32_t dev_num);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_dma_buffer_type(int32_t dev_num);
+GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_malloc_buffer_type(int32_t dev_num);
 GGML_API  int32_t ggml_backend_rknpu2_get_device_count(void);
 
 struct ggml_rknpu_prepack_meta {

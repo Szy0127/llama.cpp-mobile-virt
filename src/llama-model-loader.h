@@ -9,6 +9,7 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
@@ -41,6 +42,12 @@ struct llama_model_loader {
         uint32_t packed_bytes_total = 0;
     };
 
+    struct llama_rknpu_partial_load_entry {
+        std::string payload_tensor_name;
+        size_t payload_bytes = 0;
+        bool selected = false;
+    };
+
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx = 0; // source file index
@@ -69,7 +76,33 @@ struct llama_model_loader {
 
     // custom comparator to sort weights more nicely by layer
     struct weight_name_comparer {
+        static int component_rank(const std::string & name) {
+            static const std::pair<const char *, int> component_ranks[] = {
+                {".attn_q.weight",      0},
+                {".attn_k.weight",      1},
+                {".attn_v.weight",      2},
+                {".attn_output.weight", 3},
+                {".ffn_gate.weight",    4},
+                {".ffn_up.weight",      5},
+                {".ffn_down.weight",    6},
+            };
+
+            for (const auto & component : component_ranks) {
+                const size_t suffix_len = strlen(component.first);
+                if (name.size() >= suffix_len &&
+                    name.compare(name.size() - suffix_len, suffix_len, component.first) == 0) {
+                    return component.second;
+                }
+            }
+
+            return 100;
+        }
+
         bool operator()(const std::string & a, const std::string & b) const {
+            if (a == "output.weight" || b == "output.weight") {
+                return a != "output.weight";
+            }
+
             int a_layer = -1;
             int b_layer = -1;
             sscanf(a.c_str(), "blk.%d.", &a_layer);
@@ -77,6 +110,13 @@ struct llama_model_loader {
             if (a_layer != b_layer) {
                 return a_layer < b_layer;
             }
+
+            const int a_rank = component_rank(a);
+            const int b_rank = component_rank(b);
+            if (a_rank != b_rank) {
+                return a_rank < b_rank;
+            }
+
             return a < b;
         }
     };
@@ -93,6 +133,10 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool check_tensors;
+    size_t rknpu_tail_load_bytes = 0;
+    std::vector<llama_rknpu_partial_load_entry> rknpu_partial_load_entries;
+    size_t rknpu_partial_selected_bytes = 0;
+    size_t rknpu_partial_total_bytes = 0;
 
     llama_files files;
     llama_ftype ftype;
@@ -123,6 +167,7 @@ struct llama_model_loader {
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         bool use_mmap,
         bool check_tensors,
+        size_t rknpu_tail_load_bytes,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
@@ -168,6 +213,11 @@ struct llama_model_loader {
     const llama_rknpu_prepack_meta * get_rknpu_prepack_meta(const char * name) const;
 
     const std::unordered_map<std::string, llama_rknpu_prepack_meta> & get_rknpu_prepack_metas() const;
+
+    bool has_rknpu_partial_load() const;
+    bool should_load_rknpu_payload(const char * name) const;
+    size_t get_rknpu_partial_selected_bytes() const;
+    size_t get_rknpu_partial_total_bytes() const;
 
     bool get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const;
 
