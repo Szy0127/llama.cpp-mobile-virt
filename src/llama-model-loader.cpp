@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <future>
 
@@ -947,6 +948,12 @@ llama_model_loader::llama_model_loader(
             rknpu_partial_total_bytes += prepack_meta.packed_bytes_total;
         }
 
+        fprintf(stderr,
+                "[partial-load] mode enabled: tail_budget=%zu total_payload_bytes=%zu payload_count=%zu\n",
+                rknpu_tail_load_bytes,
+                rknpu_partial_total_bytes,
+                rknpu_partial_load_entries.size());
+
         size_t suffix_bytes = 0;
         for (auto it = rknpu_partial_load_entries.rbegin(); it != rknpu_partial_load_entries.rend(); ++it) {
             if (suffix_bytes >= rknpu_tail_load_bytes) {
@@ -955,6 +962,17 @@ llama_model_loader::llama_model_loader(
             it->selected = true;
             suffix_bytes += it->payload_bytes;
             rknpu_partial_selected_bytes += it->payload_bytes;
+        }
+
+        size_t payload_suffix_offset = rknpu_partial_total_bytes;
+        for (const auto & entry : rknpu_partial_load_entries) {
+            payload_suffix_offset -= entry.payload_bytes;
+            fprintf(stderr,
+                    "[partial-load] plan payload=%s suffix_offset=%zu size=%zu selected=%d\n",
+                    entry.payload_tensor_name.c_str(),
+                    payload_suffix_offset,
+                    entry.payload_bytes,
+                    entry.selected ? 1 : 0);
         }
 
         LLAMA_LOG_INFO("%s: RKNPU partial load enabled, tail budget = %zu bytes, selected %zu/%zu payload bytes across %zu/%zu tensors\n",
@@ -1282,6 +1300,13 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+    }
+
+    if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur))) {
+        fprintf(stderr,
+                "[partial-load] loaded payload=%s size=%zu\n",
+                ggml_get_name(cur),
+                ggml_nbytes(cur));
     }
 }
 

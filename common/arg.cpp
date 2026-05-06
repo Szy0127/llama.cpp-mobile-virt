@@ -2263,10 +2263,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_MMAP"));
     add_opt(common_arg(
-        {"--rknpu-tail-load-bytes"}, "N",
-        "load only the tail portion of RKNPU prepack payload tensors in bytes (0 = disabled)",
-        [](common_params & params, const std::string & value) {
-            params.rknpu_tail_load_bytes = std::stoull(value);
+        {"--rknpu-tail-load-bytes"}, "SIZE",
+        "load only the tail portion of RKNPU prepack payload tensors (format: <N>M or <N>G, case-insensitive)",
+        +[](common_params & params, const std::string & value) {
+            if (value.size() < 2) {
+                throw std::invalid_argument("invalid value");
+            }
+
+            const char suffix = value.back();
+            size_t multiplier = 0;
+            if (suffix == 'M' || suffix == 'm') {
+                multiplier = 1024ULL * 1024ULL;
+            } else if (suffix == 'G' || suffix == 'g') {
+                multiplier = 1024ULL * 1024ULL * 1024ULL;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+
+            const std::string number = value.substr(0, value.size() - 1);
+            if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("invalid value");
+            }
+
+            params.rknpu_tail_load_bytes = std::stoull(number) * multiplier;
         }
     ));
     add_opt(common_arg(

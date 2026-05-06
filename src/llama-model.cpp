@@ -4209,7 +4209,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // create the RKNPU prepack meta/payload tensors
     if (!ordered_rknpu_prepack_metas.empty()) {
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-        ggml_backend_buffer_type_t host_payload_buft = ml.has_rknpu_partial_load()
+
+        // TODO: partial_load调用的ggml_backend_rknpu2_host_malloc_buffer_type似乎分不出那么大的内存，所以暂时全用dma_buffer(话说本来就该用它，只不过现在不知道该返回什么样的地址而已)
+        ggml_backend_buffer_type_t host_payload_buft = false
                 ? ggml_backend_rknpu2_host_malloc_buffer_type(0)
                 : ggml_backend_rknpu2_host_dma_buffer_type(0);
         if (cpu_buft == nullptr || host_payload_buft == nullptr) {
