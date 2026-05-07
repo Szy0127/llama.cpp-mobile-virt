@@ -33,15 +33,13 @@
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
 #include "npu_interface.h"
+#include "llm_ioctl.h"
 
 #include <pthread.h>
 
 #define NPU_DEVICE "/dev/dri/card0"
-#define PREALLOC_GPA_BASE_DEFAULT      0xa0000000ULL
-#define PAGE_SIZE_BYTES                0x1000UL
-#define DONATE_BYTES_DEFAULT           (4ULL << 30)
-#define IOVA_WINDOW_BYTES_DEFAULT      (4ULL << 30)
-#define COMPUTE_BUFFER_BYTES_DEFAULT   (256ULL << 20)
+#define LLM_DEVICE "/dev/llm"
+#define PAGE_SIZE_BYTES 0x1000UL
 
 struct npu_prealloc_layout {
   uint64_t gpa_base;
@@ -55,15 +53,15 @@ struct npu_prealloc_layout {
   uint32_t domain_count;
 };
 
-static int fd = -1;
-static int dev_mem_fd = -1;
-static void *dev_mem_vaddr = NULL;
-static size_t dev_mem_map_size = 0;
+static int npu_fd = -1;
+static int llm_fd = -1;
+static int llm_window_began = 0;
+static void *pool_vaddr = NULL;
+static size_t pool_map_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
-static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
-static pthread_once_t layout_once = PTHREAD_ONCE_INIT;
+static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
@@ -71,59 +69,45 @@ int npu_open(void);
 static void log_prealloc_usage(const char *kind, size_t alloc_size,
                                uint64_t phys_addr, uint64_t iova,
                                uint32_t domain_id,
-                               uint64_t prealloc_used_now,
-                               uint64_t left_now,
+                               uint64_t payload_used_now,
+                               uint64_t payload_left_now,
                                uint64_t compute_used_now,
                                uint64_t compute_left_now) {
-  printf("[RKNPU_PREALLOC] kind=%s size=%zu phys=0x%llx iova=0x%llx domain=%u prealloc_used=%llu left=%llu compute_used=%llu compute_left=%llu\n",
+  printf("[RKNPU_PREALLOC] kind=%s size=%zu phys=0x%llx iova=0x%llx domain=%u payload_used=%llu payload_left=%llu compute_used=%llu compute_left=%llu\n",
          kind, alloc_size,
          (unsigned long long) phys_addr,
          (unsigned long long) iova,
          domain_id,
-         (unsigned long long) prealloc_used_now,
-         (unsigned long long) left_now,
+         (unsigned long long) payload_used_now,
+         (unsigned long long) payload_left_now,
          (unsigned long long) compute_used_now,
          (unsigned long long) compute_left_now);
 }
 
-static void cleanup_dev_mem_mapping(void) {
-  if (dev_mem_vaddr && dev_mem_map_size) {
-    munmap(dev_mem_vaddr, dev_mem_map_size);
+static void cleanup_pool_mapping(void) {
+  if (pool_vaddr && pool_map_size) {
+    munmap(pool_vaddr, pool_map_size);
   }
-  dev_mem_vaddr = NULL;
-  dev_mem_map_size = 0;
+
+  pool_vaddr = NULL;
+  pool_map_size = 0;
   payload_used = 0;
   compute_used = 0;
 
-  if (dev_mem_fd >= 0) {
-    close(dev_mem_fd);
-    dev_mem_fd = -1;
+  if (llm_fd >= 0 && llm_window_began) {
+    const int ret = ioctl(llm_fd, LLM_IOC_FINISH);
+    if (ret < 0) {
+      printf("LLM_IOC_FINISH failed ret=%d errno=%d\n", ret, errno);
+    }
   }
-}
+  llm_window_began = 0;
 
-static uint64_t parse_env_u64(const char *name, uint64_t fallback) {
-  const char *value = getenv(name);
-  char *end = NULL;
-  unsigned long long parsed;
-
-  if (value == NULL || value[0] == '\0') {
-    return fallback;
+  if (llm_fd >= 0) {
+    close(llm_fd);
+    llm_fd = -1;
   }
 
-  errno = 0;
-  parsed = strtoull(value, &end, 0);
-  if (errno != 0 || end == value || (end && *end != '\0')) {
-    printf("Invalid value for %s: %s, fallback=0x%llx\n",
-           name, value, (unsigned long long) fallback);
-    return fallback;
-  }
-
-  return (uint64_t) parsed;
-}
-
-static void fd_init(void) {
-  fd = npu_open();
-  printf("%s %d: fd %d\n", __func__, __LINE__, fd);
+  memset(&g_prealloc_layout, 0, sizeof(g_prealloc_layout));
 }
 
 static int validate_prealloc_layout(struct npu_prealloc_layout *layout,
@@ -204,17 +188,12 @@ static void log_prealloc_layout(const char *source,
          layout->domain_count);
 }
 
-static int load_prealloc_layout_from_driver(struct npu_prealloc_layout *layout) {
-  struct rknpu_layout_info info;
+static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
+  struct llm_layout_info info;
 
   memset(&info, 0, sizeof(info));
-  pthread_once(&fd_once, fd_init);
-  if (fd < 0) {
-    return -1;
-  }
-
-  if (ioctl(fd, DRM_IOCTL_RKNPU_GET_LAYOUT, &info) < 0) {
-    printf("DRM_IOCTL_RKNPU_GET_LAYOUT failed errno=%d\n", errno);
+  if (ioctl(llm_fd, LLM_IOC_GET_LAYOUT, &info) < 0) {
+    printf("LLM_IOC_GET_LAYOUT failed errno=%d\n", errno);
     return -1;
   }
 
@@ -224,112 +203,154 @@ static int load_prealloc_layout_from_driver(struct npu_prealloc_layout *layout) 
   layout->iova_window_bytes = info.iova_window_size;
   layout->compute_buffer_bytes = info.compute_buffer_size;
 
-  if (validate_prealloc_layout(layout, "driver") != 0) {
+  if (validate_prealloc_layout(layout, "llm") != 0) {
     return -1;
   }
 
   if (info.payload_window_size != 0 &&
       info.payload_window_size != layout->payload_window_bytes) {
-    printf("Driver payload window mismatch: ioctl=0x%llx local=0x%llx\n",
+    printf("LLM payload window mismatch: ioctl=0x%llx local=0x%llx\n",
            (unsigned long long) info.payload_window_size,
            (unsigned long long) layout->payload_window_bytes);
   }
   if (info.reserve_size != 0 && info.reserve_size != layout->reserve_size) {
-    printf("Driver reserve size mismatch: ioctl=0x%llx local=0x%llx\n",
+    printf("LLM reserve size mismatch: ioctl=0x%llx local=0x%llx\n",
            (unsigned long long) info.reserve_size,
            (unsigned long long) layout->reserve_size);
   }
+  if (info.compute_buffer_gpa != 0 &&
+      info.compute_buffer_gpa != layout->gpa_base + layout->compute_gpa_offset) {
+    printf("LLM compute gpa mismatch: ioctl=0x%llx local=0x%llx\n",
+           (unsigned long long) info.compute_buffer_gpa,
+           (unsigned long long) (layout->gpa_base + layout->compute_gpa_offset));
+  }
+  if (info.layout_version != 0 &&
+      info.layout_version != LLM_LAYOUT_INFO_VERSION) {
+    printf("LLM layout version mismatch: ioctl=%u expected=%u\n",
+           info.layout_version, LLM_LAYOUT_INFO_VERSION);
+  }
 
-  log_prealloc_layout("driver", layout);
+  log_prealloc_layout("llm", layout);
   return 0;
 }
 
-static void init_prealloc_layout_from_env(struct npu_prealloc_layout *layout) {
-  memset(layout, 0, sizeof(*layout));
-  layout->gpa_base = parse_env_u64("RKNPU_GPA_BASE", PREALLOC_GPA_BASE_DEFAULT);
-  layout->donate_size = parse_env_u64("RKNPU_DONATE_SIZE", DONATE_BYTES_DEFAULT);
-  layout->donate_size =
-      parse_env_u64("RKNPU_DONATE_MB", layout->donate_size >> 20) << 20;
-  layout->iova_window_bytes =
-      parse_env_u64("RKNPU_IOVA_WINDOW_SIZE", IOVA_WINDOW_BYTES_DEFAULT);
-  layout->iova_window_bytes =
-      parse_env_u64("RKNPU_IOVA_WINDOW_MB", layout->iova_window_bytes >> 20) << 20;
-  layout->compute_buffer_bytes =
-      parse_env_u64("RKNPU_COMPUTE_BUFFER_SIZE", COMPUTE_BUFFER_BYTES_DEFAULT);
-  layout->compute_buffer_bytes =
-      parse_env_u64("RKNPU_COMPUTE_BUFFER_MB",
-                    layout->compute_buffer_bytes >> 20) << 20;
+static void npu_fd_init(void) {
+  npu_fd = npu_open();
+  printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
+}
 
-  if (validate_prealloc_layout(layout, "env") != 0) {
-    memset(layout, 0, sizeof(*layout));
-    layout->gpa_base = PREALLOC_GPA_BASE_DEFAULT;
-    layout->donate_size = DONATE_BYTES_DEFAULT;
-    layout->iova_window_bytes = IOVA_WINDOW_BYTES_DEFAULT;
-    layout->compute_buffer_bytes = COMPUTE_BUFFER_BYTES_DEFAULT;
-    if (validate_prealloc_layout(layout, "defaults") != 0) {
-      abort();
+static int mem_pool_prepare_locked(size_t pool_size) {
+  if (pool_size == 0) {
+    printf("Invalid pool size 0\n");
+    return -1;
+  }
+
+  if (pool_vaddr != NULL) {
+    if (pool_size > g_prealloc_layout.payload_total_bytes) {
+      printf("Requested pool size %zu exceeds payload capacity %llu\n",
+             pool_size,
+             (unsigned long long) g_prealloc_layout.payload_total_bytes);
+      return -1;
     }
-    log_prealloc_layout("defaults", layout);
-    return;
-  }
-
-  log_prealloc_layout("env", layout);
-}
-
-static void init_prealloc_layout(void) {
-  if (load_prealloc_layout_from_driver(&g_prealloc_layout) == 0) {
-    return;
-  }
-
-  init_prealloc_layout_from_env(&g_prealloc_layout);
-}
-
-static int ensure_dev_mem_open(void) {
-  pthread_once(&layout_once, init_prealloc_layout);
-
-  if (dev_mem_fd >= 0 && dev_mem_vaddr != NULL) {
     return 0;
   }
 
-  dev_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-  if (dev_mem_fd < 0) {
-    printf("Failed to open /dev/mem, errno=%d\n", errno);
+  llm_fd = open(LLM_DEVICE, O_RDWR);
+  if (llm_fd < 0) {
+    printf("Failed to open %s errno=%d\n", LLM_DEVICE, errno);
     return -1;
   }
 
-  const uint64_t phys_base = g_prealloc_layout.gpa_base;
-  const size_t map_size = g_prealloc_layout.reserve_size;
-  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                   dev_mem_fd, (off_t)phys_base);
+  int ret = ioctl(llm_fd, LLM_IOC_BEGIN);
+  if (ret < 0) {
+    printf("LLM_IOC_BEGIN failed for pool size=%zu ret=%d errno=%d\n",
+           pool_size, ret, errno);
+    close(llm_fd);
+    llm_fd = -1;
+    return -1;
+  }
+  llm_window_began = 1;
+
+  if (load_prealloc_layout_from_llm(&g_prealloc_layout) != 0) {
+    cleanup_pool_mapping();
+    return -1;
+  }
+
+  if (pool_size > g_prealloc_layout.payload_total_bytes) {
+    printf("Requested pool size %zu exceeds payload capacity %llu\n",
+           pool_size,
+           (unsigned long long) g_prealloc_layout.payload_total_bytes);
+    cleanup_pool_mapping();
+    return -1;
+  }
+
+  const size_t map_size = g_prealloc_layout.payload_total_bytes;
+  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, llm_fd, 0);
   if (map == MAP_FAILED) {
-    printf("Failed to mmap /dev/mem pool at phys=0x%llx, size=%zu, errno=%d\n",
-           (unsigned long long)phys_base, map_size, errno);
-    cleanup_dev_mem_mapping();
+    printf("Failed to mmap %s size=%zu errno=%d\n",
+           LLM_DEVICE, map_size, errno);
+    cleanup_pool_mapping();
     return -1;
   }
 
-  dev_mem_vaddr = map;
-  dev_mem_map_size = map_size;
+  struct llm_map_info info;
+  memset(&info, 0, sizeof(info));
+  ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
+  if (ret < 0) {
+    printf("LLM_IOC_GET_INFO failed ret=%d errno=%d\n", ret, errno);
+    munmap(map, map_size);
+    cleanup_pool_mapping();
+    return -1;
+  }
+
+  if (!info.mapped || info.user_vaddr != (uint64_t) (uintptr_t) map || info.length < map_size) {
+    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu expected_vaddr=0x%llx expected_len=%zu\n",
+           info.mapped,
+           (unsigned long long) info.user_vaddr,
+           (unsigned long long) info.length,
+           (unsigned long long) (uint64_t) (uintptr_t) map,
+           map_size);
+    munmap(map, map_size);
+    cleanup_pool_mapping();
+    return -1;
+  }
+
+  pool_vaddr = map;
+  pool_map_size = map_size;
   payload_used = 0;
   compute_used = 0;
-  atexit(cleanup_dev_mem_mapping);
-  printf("Mapped /dev/mem pool: phys=0x%llx size=%zu vaddr=%p\n",
-         (unsigned long long)phys_base, map_size, map);
+  atexit(cleanup_pool_mapping);
+  printf("Mapped LLM pool: gpa_base=0x%llx reserve=0x%llx payload_window=0x%llx compute=0x%llx vaddr=%p\n",
+         (unsigned long long) g_prealloc_layout.gpa_base,
+         (unsigned long long) g_prealloc_layout.reserve_size,
+         (unsigned long long) g_prealloc_layout.payload_window_bytes,
+         (unsigned long long) g_prealloc_layout.compute_buffer_bytes,
+         map);
   return 0;
+}
+
+int mem_pool_prepare(size_t pool_size) {
+  int ret;
+
+  pthread_mutex_lock(&mem_lock);
+  ret = mem_pool_prepare_locked(pool_size);
+  pthread_mutex_unlock(&mem_lock);
+
+  return ret;
 }
 
 static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *obj,
                                    uint32_t flags, uint64_t *handle,
                                    uint32_t *domain_id, int use_compute_pool) {
-  (void)flags;
+  (void) flags;
 
-  pthread_once(&fd_once, fd_init);
   if (size == 0) {
     return NULL;
   }
 
   pthread_mutex_lock(&mem_lock);
-  if (ensure_dev_mem_open() != 0) {
+  if (pool_vaddr == NULL || pool_map_size == 0) {
+    printf("mem_allocate called before mem_pool_prepare\n");
     pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
@@ -338,8 +359,8 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   uint64_t phys_addr;
   uint64_t iova;
   uint32_t alloc_domain_id = UINT32_MAX;
-  uint64_t prealloc_used_now;
-  uint64_t left_now;
+  uint64_t payload_used_now;
+  uint64_t payload_left_now;
   uint64_t compute_used_now;
   uint64_t compute_left_now;
   const char *alloc_kind;
@@ -357,7 +378,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     phys_addr = g_prealloc_layout.gpa_base +
                 g_prealloc_layout.compute_gpa_offset + (uint64_t) compute_used;
     iova = g_prealloc_layout.payload_window_bytes + (uint64_t) compute_used;
-    map = (char *) dev_mem_vaddr + g_prealloc_layout.compute_gpa_offset + compute_used;
+    map = (char *) pool_vaddr + g_prealloc_layout.compute_gpa_offset + compute_used;
     compute_used += alloc_size;
     alloc_kind = "compute";
     if (domain_id) {
@@ -392,7 +413,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
 
     phys_addr = g_prealloc_layout.gpa_base + local_payload_used;
     iova = local_payload_used % g_prealloc_layout.payload_window_bytes;
-    map = (char *) dev_mem_vaddr + local_payload_used;
+    map = (char *) pool_vaddr + local_payload_used;
     alloc_domain_id = (uint32_t)
         (local_payload_used / g_prealloc_layout.payload_window_bytes);
     if (domain_id) {
@@ -401,8 +422,9 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     payload_used = local_payload_used + alloc_size;
     alloc_kind = "payload";
   }
-  prealloc_used_now = payload_used;
-  left_now = g_prealloc_layout.payload_total_bytes - prealloc_used_now;
+
+  payload_used_now = payload_used;
+  payload_left_now = g_prealloc_layout.payload_total_bytes - payload_used_now;
   compute_used_now = compute_used;
   compute_left_now = g_prealloc_layout.compute_buffer_bytes - compute_used_now;
   pthread_mutex_unlock(&mem_lock);
@@ -418,10 +440,8 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   }
 
   log_prealloc_usage(alloc_kind, alloc_size, phys_addr, iova, alloc_domain_id,
-                     prealloc_used_now, left_now,
+                     payload_used_now, payload_left_now,
                      compute_used_now, compute_left_now);
-
-  //printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;
 }
 
@@ -442,25 +462,23 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj,
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
-  (void)addr;
-  (void)len;
-  (void)handle;
-  (void)obj_addr;
-  // Allocations are slices of the process-wide /dev/mem mapping, so there is
+  (void) addr;
+  (void) len;
+  (void) handle;
+  (void) obj_addr;
+  // Allocations are slices of the process-wide /dev/llm mapping, so there is
   // no per-allocation munmap here.
 }
 
 int npu_open(void) {
-
   char buf1[256], buf2[256], buf3[256];
 
   memset(buf1, 0 ,sizeof(buf1));
   memset(buf2, 0 ,sizeof(buf2));
   memset(buf3, 0, sizeof(buf3));
 
-  // Open DRI called "rknpu"
   int local_fd = open(NPU_DEVICE, O_RDWR);
-  if(local_fd<0) {
+  if (local_fd < 0) {
     printf("Failed to open %s %d\n", NPU_DEVICE, errno);
     return local_fd;
   }
@@ -475,8 +493,8 @@ int npu_open(void) {
   dv.desc_len = sizeof(buf3);
 
   int ret = ioctl(local_fd, DRM_IOCTL_VERSION, &dv);
-  if (ret <0) {
-    printf("DRM_IOCTL_VERISON failed %d\n",ret);
+  if (ret < 0) {
+    printf("DRM_IOCTL_VERISON failed %d\n", ret);
     close(local_fd);
     return ret;
   }
@@ -485,19 +503,18 @@ int npu_open(void) {
 }
 
 int npu_reset(void) {
-  pthread_once(&fd_once, fd_init);
+  pthread_once(&npu_fd_once, npu_fd_init);
 
-  // Reset the NPU
   struct rknpu_action act = {
     .flags = RKNPU_ACT_RESET,
     0,
   };
-  return ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &act);	
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_ACTION, &act);
 }
 
-int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id)
-{
-  pthread_once(&fd_once, fd_init);
+int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id) {
+  pthread_once(&npu_fd_once, npu_fd_init);
+
   struct rknpu_subcore_task subcore_tasks[5] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   struct rknpu_submit_extend submit_ext;
   for (int i = 0; i < 5; ++i) {
@@ -530,17 +547,16 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id)
       subcore_tasks[4]
     },
   };
-  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
 }
 
 int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num,
-                     uint32_t domain_id, void *polling)
-{
+                     uint32_t domain_id, void *polling) {
   struct rknpu_submit_extend submit_ext;
 
-  (void)polling;
+  (void) polling;
 
-  pthread_once(&fd_once, fd_init);
+  pthread_once(&npu_fd_once, npu_fd_init);
   if (task_num <= 0 || task_num > RKNPU_MAX_MULTI_CORE_TASKS) {
     errno = EINVAL;
     return -1;
@@ -572,5 +588,5 @@ int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num,
     submit_ext.submit.subcore_task[core_index].task_number = 1;
   }
 
-  return ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
+  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
 }

@@ -9,11 +9,14 @@
 
 #include "ggml-cpp.h"
 #include "ggml-rknpu-re.h"
+#include "../ggml/src/ggml-rknpu_re/npu_interface.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -21,6 +24,29 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+
+static bool llama_buft_uses_rknpu_mem_pool(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_backend_buft_name(buft);
+    return name != nullptr &&
+        (std::strncmp(name, "RKNPURE", 7) == 0 || std::strncmp(name, "HOST_DMA", 8) == 0);
+}
+
+static size_t llama_ctx_alloc_size_for_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t total = 0;
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == nullptr && t->view_src == nullptr) {
+            total += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+        }
+    }
+
+    return total;
+}
 
 namespace {
 
@@ -4296,6 +4322,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
     pimpl->bufs.reserve(n_max_backend_buffer);
 
+    size_t rknpu_pool_bytes = 0;
+    for (const auto & it : ctx_map) {
+        if (llama_buft_uses_rknpu_mem_pool(it.first)) {
+            rknpu_pool_bytes += llama_ctx_alloc_size_for_buft(it.second, it.first);
+        }
+    }
+    for (const auto & it : blob_ctxs) {
+        if (llama_buft_uses_rknpu_mem_pool(it.first)) {
+            rknpu_pool_bytes += llama_ctx_alloc_size_for_buft(it.second, it.first);
+        }
+    }
+    if (rknpu_pool_bytes > 0) {
+        LLAMA_LOG_INFO("%s: preparing unified RKNPU pool = %8.2f MiB\n",
+                __func__, rknpu_pool_bytes / 1024.0 / 1024.0);
+        if (mem_pool_prepare(rknpu_pool_bytes) != 0) {
+            throw std::runtime_error(format("%s: failed to prepare unified RKNPU pool (%zu bytes)",
+                    __func__, rknpu_pool_bytes));
+        }
+    }
+
     auto alloc_ctx_buffers = [&](ggml_backend_buffer_type_t buft, ggml_context * ctx) {
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
@@ -4458,6 +4504,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    LLAMA_LOG_INFO("%s: tensor data fully loaded, exiting before inference\n", __func__);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::exit(0);
 
     return true;
 }
