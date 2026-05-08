@@ -100,17 +100,42 @@ namespace console {
 #else
         // POSIX-specific console initialization
         if (!simple_io) {
-            struct termios new_termios;
-            tcgetattr(STDIN_FILENO, &initial_state);
-            new_termios = initial_state;
-            new_termios.c_lflag &= ~(ICANON | ECHO);
-            new_termios.c_cc[VMIN] = 1;
-            new_termios.c_cc[VTIME] = 0;
-            tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+            // TODO: 由于不同平台使用的交叉编译环境不同，导致某些平台上readline_advanced/getwchar表现不同导致segFault, 因此暂时使用simple_io.
+            // struct termios new_termios;
+            // tcgetattr(STDIN_FILENO, &initial_state);
+            // new_termios = initial_state;
+            // new_termios.c_lflag &= ~(ICANON | ECHO);
+            // new_termios.c_cc[VMIN] = 1;
+            // new_termios.c_cc[VTIME] = 0;
+            // tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
 
-            tty = fopen("/dev/tty", "w+");
-            if (tty != nullptr) {
-                out = tty;
+            // tty = fopen("/dev/tty", "w+");
+            // if (tty != nullptr) {
+            //     out = tty;
+            // }
+
+            if (!isatty(STDIN_FILENO)) {
+                simple_io = true;
+            } else {
+                struct termios new_termios;
+                if (tcgetattr(STDIN_FILENO, &initial_state) != 0) {
+                    simple_io = true;
+                } else {
+                    new_termios = initial_state;
+                    new_termios.c_lflag &= ~(ICANON | ECHO);
+                    new_termios.c_cc[VMIN] = 1;
+                    new_termios.c_cc[VTIME] = 0;
+                    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) != 0) {
+                        simple_io = true;
+                    }
+                }
+            }
+
+            if (!simple_io) {
+                tty = fopen("/dev/tty", "w+");
+                if (tty != nullptr) {
+                    out = tty;
+                }
             }
         }
 
@@ -495,7 +520,16 @@ namespace console {
     bool readline(std::string & line, bool multiline_input) {
         set_display(user_input);
 
-        if (simple_io) {
+        // TODO: 由于不同平台使用的交叉编译环境不同，导致某些平台上readline_advanced/getwchar表现不同导致segFault, 因此暂时使用simple_io.
+        // if (simple_io) {
+        //     return readline_simple(line, multiline_input);
+        // }
+        if (simple_io || !advanced_display) {
+#if !defined(_WIN32)
+            if (!simple_io) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &initial_state);
+            }
+#endif
             return readline_simple(line, multiline_input);
         }
         return readline_advanced(line, multiline_input);
