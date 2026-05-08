@@ -64,7 +64,6 @@ static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
 static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
 static pthread_once_t layout_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
 
@@ -328,9 +327,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     return NULL;
   }
 
-  pthread_mutex_lock(&mem_lock);
   if (ensure_dev_mem_open() != 0) {
-    pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
 
@@ -350,7 +347,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
       printf("Out of compute buffer: need=%zu used=%zu total=%llu\n",
              alloc_size, compute_used,
              (unsigned long long) g_prealloc_layout.compute_buffer_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -370,7 +366,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
       printf("Allocation exceeds payload window: need=%zu window=%llu\n",
              alloc_size,
              (unsigned long long) g_prealloc_layout.payload_window_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -386,7 +381,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
              alloc_size,
              (unsigned long long) local_payload_used,
              (unsigned long long) g_prealloc_layout.payload_total_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -405,7 +399,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   left_now = g_prealloc_layout.payload_total_bytes - prealloc_used_now;
   compute_used_now = compute_used;
   compute_left_now = g_prealloc_layout.compute_buffer_bytes - compute_used_now;
-  pthread_mutex_unlock(&mem_lock);
 
   if (dma_addr) {
     *dma_addr = iova;
@@ -442,9 +435,7 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj,
 }
 
 void ggml_rknpu2_reset_compute_used(void) {
-  pthread_mutex_lock(&mem_lock);
   compute_used = 0;
-  pthread_mutex_unlock(&mem_lock);
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
