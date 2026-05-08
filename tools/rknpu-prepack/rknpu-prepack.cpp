@@ -34,6 +34,37 @@ struct params {
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
 using ggml_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 
+struct selected_tensor_desc {
+    std::string output_name;
+    std::string source_name;
+    const ggml_tensor * source_tensor = nullptr;
+    bool synthesized_output = false;
+};
+
+struct tensor_stats {
+    size_t count = 0;
+    size_t bytes = 0;
+};
+
+static bool should_include_name(const std::string & name, const params & p) {
+    return p.include_tensors.empty() || p.include_tensors.count(name) > 0;
+}
+
+static void validate_synthesized_output_source(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        throw std::runtime_error("missing token_embd.weight required to synthesize output.weight");
+    }
+    if (!rknpu_prepack_is_supported_tensor_type(tensor->type)) {
+        throw std::runtime_error("token_embd.weight has unsupported type for synthesized output.weight prepack");
+    }
+    if (ggml_n_dims(tensor) != 2) {
+        throw std::runtime_error("token_embd.weight must be 2D to synthesize output.weight");
+    }
+    if (!ggml_is_contiguous(tensor)) {
+        throw std::runtime_error("token_embd.weight must be contiguous to synthesize output.weight");
+    }
+}
+
 static ggml_ptr make_output_ctx(size_t tensor_count) {
     const size_t mem_size = (tensor_count + 8) * ggml_tensor_overhead();
     ggml_init_params params = {
@@ -111,10 +142,7 @@ static bool is_selected_tensor(const ggml_tensor * tensor, const params & p) {
     if (!rknpu_prepack_is_candidate_tensor(tensor)) {
         return false;
     }
-    if (p.include_tensors.empty()) {
-        return true;
-    }
-    return p.include_tensors.count(tensor->name) > 0;
+    return should_include_name(tensor->name, p);
 }
 
 static blob_result build_blob(const ggml_tensor * tensor) {
@@ -250,22 +278,56 @@ static int run(const params & p) {
     }
 
     const int64_t n_tensors = gguf_get_n_tensors(ctx_in.get());
-    std::vector<std::string> selected_names;
-    selected_names.reserve(n_tensors);
+    std::vector<selected_tensor_desc> selected_tensors;
+    selected_tensors.reserve(n_tensors + 1);
+    std::unordered_set<std::string> selected_output_names;
+    selected_output_names.reserve(n_tensors + 1);
+    tensor_stats selected_input_stats;
+    tensor_stats synthesized_output_stats;
+    tensor_stats passthrough_stats;
+
+    ggml_tensor * token_embd_tensor = nullptr;
+    bool has_output_weight = false;
 
     for (int64_t i = 0; i < n_tensors; ++i) {
         ggml_tensor * tensor = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(ctx_in.get(), i));
         GGML_ASSERT(tensor != nullptr);
+
+        if (std::strcmp(tensor->name, "token_embd.weight") == 0) {
+            token_embd_tensor = tensor;
+        }
+        if (std::strcmp(tensor->name, "output.weight") == 0) {
+            has_output_weight = true;
+        }
+
         if (is_selected_tensor(tensor, p)) {
-            selected_names.emplace_back(tensor->name);
+            selected_tensors.push_back({tensor->name, tensor->name, tensor, false});
+            selected_output_names.insert(tensor->name);
+            selected_input_stats.count += 1;
+            selected_input_stats.bytes += ggml_nbytes(tensor);
+        } else {
+            passthrough_stats.count += 1;
+            passthrough_stats.bytes += ggml_nbytes(tensor);
         }
     }
 
+    if (!has_output_weight) {
+        validate_synthesized_output_source(token_embd_tensor);
+        selected_tensors.push_back({"output.weight", "token_embd.weight", token_embd_tensor, true});
+        selected_output_names.insert("output.weight");
+        synthesized_output_stats.count += 1;
+        synthesized_output_stats.bytes += ggml_nbytes(token_embd_tensor);
+        std::fprintf(stderr, "synthesizing output.weight from token_embd.weight for RKNPU prepack\n");
+    }
+
     if (p.list_only) {
-        for (const auto & name : selected_names) {
-            std::printf("%s\n", name.c_str());
+        for (const auto & desc : selected_tensors) {
+            std::printf("%s\n", desc.output_name.c_str());
         }
-        std::printf("found %zu candidate tensors\n", selected_names.size());
+        std::printf("found %zu candidate tensors (%zu bytes); synthesized output tensors: %zu (%zu bytes); passthrough tensors: %zu (%zu bytes)\n",
+                selected_input_stats.count, selected_input_stats.bytes,
+                synthesized_output_stats.count, synthesized_output_stats.bytes,
+                passthrough_stats.count, passthrough_stats.bytes);
         return 0;
     }
 
@@ -276,17 +338,17 @@ static int run(const params & p) {
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_FORMAT_KEY, RKNPU_PREPACK_FORMAT);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_META_FORMAT_KEY, RKNPU_PREPACK_META_FORMAT);
 
-    ggml_ptr out_ctx = make_output_ctx(static_cast<size_t>(n_tensors + selected_names.size() * 2));
+    const size_t output_tensor_count = static_cast<size_t>(passthrough_stats.count + selected_tensors.size() * 2);
+    ggml_ptr out_ctx = make_output_ctx(output_tensor_count);
     std::vector<std::vector<uint8_t>> blob_parts;
-    blob_parts.reserve(selected_names.size() * 2);
+    blob_parts.reserve(selected_tensors.size() * 2);
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
-    const std::unordered_set<std::string> selected_set(selected_names.begin(), selected_names.end());
 
     for (int64_t i = 0; i < n_tensors; ++i) {
         ggml_tensor * src_tensor = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(ctx_in.get(), i));
         GGML_ASSERT(src_tensor != nullptr);
 
-        if (selected_set.count(src_tensor->name) > 0) {
+        if (selected_output_names.count(src_tensor->name) > 0) {
             continue;
         }
 
@@ -299,19 +361,22 @@ static int run(const params & p) {
         out_tensors.emplace(out_tensor->name, out_tensor);
     }
 
-    for (const auto & name : selected_names) {
-        std::fprintf(stderr, "converting tensor '%s'...\n", name.c_str());
-        ggml_tensor * tensor = ggml_get_tensor(meta_ctx.get(), name.c_str());
-        GGML_ASSERT(tensor != nullptr);
+    for (const auto & desc : selected_tensors) {
+        if (desc.synthesized_output) {
+            std::fprintf(stderr, "converting synthesized tensor '%s' from source '%s'...\n", desc.output_name.c_str(), desc.source_name.c_str());
+        } else {
+            std::fprintf(stderr, "converting tensor '%s'...\n", desc.output_name.c_str());
+        }
+        GGML_ASSERT(desc.source_tensor != nullptr);
 
-        blob_result blob = build_blob(tensor);
+        blob_result blob = build_blob(desc.source_tensor);
 
         blob_parts.push_back(std::move(blob.meta_bytes));
         auto & meta_storage = blob_parts.back();
         int64_t meta_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(meta_storage.size()), 1, 1, 1 };
         ggml_tensor * meta_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, meta_ne);
         GGML_ASSERT(meta_tensor != nullptr);
-        const std::string meta_name = name + RKNPU_PREPACK_META_SUFFIX;
+        const std::string meta_name = desc.output_name + RKNPU_PREPACK_META_SUFFIX;
         ggml_set_name(meta_tensor, meta_name.c_str());
         meta_tensor->data = meta_storage.data();
         gguf_add_tensor(ctx_out.get(), meta_tensor);
@@ -322,7 +387,7 @@ static int run(const params & p) {
         int64_t payload_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(payload_storage.size()), 1, 1, 1 };
         ggml_tensor * payload_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, payload_ne);
         GGML_ASSERT(payload_tensor != nullptr);
-        const std::string payload_name = name + RKNPU_PREPACK_PAYLOAD_SUFFIX;
+        const std::string payload_name = desc.output_name + RKNPU_PREPACK_PAYLOAD_SUFFIX;
         ggml_set_name(payload_tensor, payload_name.c_str());
         payload_tensor->data = payload_storage.data();
         gguf_add_tensor(ctx_out.get(), payload_tensor);
@@ -350,8 +415,13 @@ static int run(const params & p) {
     out.write(reinterpret_cast<const char *>(meta.data()), meta.size());
     out.close();
 
-    std::printf("wrote %s with %zu RKNPU prepacked tensors (%zu meta + %zu payload)\n",
-            p.output.c_str(), selected_names.size() * 2, selected_names.size(), selected_names.size());
+    std::printf(
+            "wrote %s with %zu RKNPU prepacked tensors (%zu meta + %zu payload); "
+            "selected input tensors: %zu (%zu bytes); synthesized output tensors: %zu (%zu bytes); passthrough tensors: %zu (%zu bytes)\n",
+            p.output.c_str(), selected_tensors.size() * 2, selected_tensors.size(), selected_tensors.size(),
+            selected_input_stats.count, selected_input_stats.bytes,
+            synthesized_output_stats.count, synthesized_output_stats.bytes,
+            passthrough_stats.count, passthrough_stats.bytes);
     return 0;
 }
 

@@ -56,13 +56,19 @@ static uint64_t npu_total_failed_count = 0;
     // if (src1->ne[1] == 1) {
     //     return false;
     // }
-
-    {
-        const int64_t m = src1->ne[1];
-        const int64_t k = src0->ne[0];
-        const int64_t n = dst->ne[0];
-        /* can not allocate large B buffers for large vocab_size. just use cpu to perform these matmuls */
-    }
+    
+    // comment this because now we use NPU to compute lm_head MatMul
+    // {
+    //     const int64_t m = src1->ne[1];
+    //     const int64_t k = src0->ne[0];
+    //     const int64_t n = dst->ne[0];
+    //     /* can not allocate large B buffers for large vocab_size. just use cpu to perform these matmuls */
+    //     if (k >= 50000 || n >= 50000){
+    //         npu_total_failed_count++;
+    //         // fprintf(stderr, "NPU failed1! npu_total_failed_count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
+    //         return false;
+    //     }
+    // }
 
     // printf("ggml_backend_rknpure_supports_op, %d, %d, %p\n", src1->type, dst->type, src0->extra);
     // return false; // DEBUG: first, never use this backend
