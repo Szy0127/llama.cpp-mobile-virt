@@ -441,6 +441,12 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj,
   return mem_allocate_payload(size, dma_addr, obj, flags, handle, NULL);
 }
 
+void ggml_rknpu2_reset_compute_used(void) {
+  pthread_mutex_lock(&mem_lock);
+  compute_used = 0;
+  pthread_mutex_unlock(&mem_lock);
+}
+
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
   (void)addr;
   (void)len;

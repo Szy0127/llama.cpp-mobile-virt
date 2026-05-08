@@ -14,6 +14,7 @@ void* mem_allocate_compute(size_t size, uint64_t *dma_addr, uint64_t *obj,
                            uint32_t flags, uint64_t *handle);
 void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle);
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
+void ggml_rknpu2_reset_compute_used(void);
 
 int npu_reset(void);
 int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id);

@@ -2037,6 +2037,11 @@ ggml_rknpu2_matmul_kernel_create(int m, int k, int n, rknn_tensor_type type)
     return kernel;
 }
 
+void ggml_rknpu2_clear_matmul_cache(void) {
+    matmul_kernels.clear();
+    matmul_buffer_mgr.clear();
+}
+
 static void ggml_backend_rknpu2_mul_mat_mul_npu(
     struct ggml_rknpu2_data_pack** packs,
     const int64_t m,
@@ -2224,17 +2229,6 @@ void rknpu2_matmul_pre0(struct ggml_tensor * dst, int nth, int ith) {
     const int64_t m = src1->ne[1];
     const int64_t k = src0->ne[0];
     const int64_t n = dst->ne[0];
-
-    static bool cleared;
-    if (ith == 0) {
-        /* now in decoding stage, clear all prefill buffers */
-        if (m == 1 && cleared == false) {
-            matmul_kernels.clear();
-            matmul_buffer_mgr.clear();
-            cleared = true;
-            ggml_rknpu_dump_measure();
-        }
-    }
 
     BEGIN_MEASURE_0;
 

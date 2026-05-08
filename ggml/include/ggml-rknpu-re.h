@@ -22,6 +22,17 @@ GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_buffer_type(void);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpure_buffer_type(int32_t dev_num);
 GGML_API  ggml_backend_buffer_type_t ggml_backend_rknpu2_host_dma_buffer_type(int32_t dev_num);
 GGML_API  int32_t ggml_backend_rknpu2_get_device_count(void);
+GGML_API  void ggml_rknpu2_clear_matmul_cache(void);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+GGML_API void ggml_rknpu2_reset_compute_used(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 struct ggml_rknpu_prepack_meta {
     const char * tensor_name;

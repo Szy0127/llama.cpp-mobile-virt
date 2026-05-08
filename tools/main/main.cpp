@@ -6,6 +6,10 @@
 #include "llama.h"
 #include "chat.h"
 
+#if defined(GGML_USE_RKNPU_RE)
+#include "ggml-rknpu-re.h"
+#endif
+
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -44,6 +48,13 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static void rknpu_clear_after_generation(void) {
+#if defined(GGML_USE_RKNPU_RE)
+    ggml_rknpu2_clear_matmul_cache();
+    ggml_rknpu2_reset_compute_used();
+#endif
+}
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 struct pkvm_shinfo {
@@ -944,6 +955,8 @@ int main(int argc, char ** argv) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
                     LOG("%s", params.input_prefix.c_str());
                 }
+
+                rknpu_clear_after_generation();
 
                 // color user input only
                 console::set_display(console::user_input);
