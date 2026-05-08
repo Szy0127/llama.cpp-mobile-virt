@@ -972,6 +972,13 @@ int main(int argc, char ** argv) {
                     // then returning control by pressing return again.
                     buffer.pop_back();
                 }
+                
+                // TODO: temporary solution for exiting interactive mode
+                if (buffer == "exit") {
+                    console::cleanup();
+                    LOG("Exiting by user command\n");
+                    break;
+                }
 
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
