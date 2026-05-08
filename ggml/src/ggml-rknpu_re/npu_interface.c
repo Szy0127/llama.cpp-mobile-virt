@@ -62,7 +62,6 @@ static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
 static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int npu_open(void);
 
@@ -239,7 +238,7 @@ static void npu_fd_init(void) {
   printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
 }
 
-static int mem_pool_prepare_locked(size_t pool_size) {
+int mem_pool_prepare(size_t pool_size) {
   if (pool_size == 0) {
     printf("Invalid pool size 0\n");
     return -1;
@@ -329,15 +328,6 @@ static int mem_pool_prepare_locked(size_t pool_size) {
   return 0;
 }
 
-int mem_pool_prepare(size_t pool_size) {
-  int ret;
-
-  pthread_mutex_lock(&mem_lock);
-  ret = mem_pool_prepare_locked(pool_size);
-  pthread_mutex_unlock(&mem_lock);
-
-  return ret;
-}
 
 static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *obj,
                                    uint32_t flags, uint64_t *handle,
@@ -348,10 +338,8 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     return NULL;
   }
 
-  pthread_mutex_lock(&mem_lock);
   if (pool_vaddr == NULL || pool_map_size == 0) {
     printf("mem_allocate called before mem_pool_prepare\n");
-    pthread_mutex_unlock(&mem_lock);
     return NULL;
   }
 
@@ -371,7 +359,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
       printf("Out of compute buffer: need=%zu used=%zu total=%llu\n",
              alloc_size, compute_used,
              (unsigned long long) g_prealloc_layout.compute_buffer_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -391,7 +378,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
       printf("Allocation exceeds payload window: need=%zu window=%llu\n",
              alloc_size,
              (unsigned long long) g_prealloc_layout.payload_window_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -407,7 +393,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
              alloc_size,
              (unsigned long long) local_payload_used,
              (unsigned long long) g_prealloc_layout.payload_total_bytes);
-      pthread_mutex_unlock(&mem_lock);
       return NULL;
     }
 
@@ -427,7 +412,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   payload_left_now = g_prealloc_layout.payload_total_bytes - payload_used_now;
   compute_used_now = compute_used;
   compute_left_now = g_prealloc_layout.compute_buffer_bytes - compute_used_now;
-  pthread_mutex_unlock(&mem_lock);
 
   if (dma_addr) {
     *dma_addr = iova;
