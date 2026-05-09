@@ -9,6 +9,8 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
@@ -81,6 +83,16 @@ struct llama_model_loader {
         }
     };
 
+    struct llama_rknpu_partial_load_entry {
+        std::string tensor_name;
+        std::string payload_tensor_name;
+        size_t cpu_addr = 0;
+        uint64_t dma = 0;
+        uint32_t domain_id = 0;
+        size_t payload_bytes = 0;
+        bool selected = true;
+    };
+
     static const int TENSOR_NOT_REQUIRED = 1;
     static const int TENSOR_DUPLICATED   = 2;
 
@@ -93,6 +105,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool check_tensors;
+    size_t rknpu_tail_load_bytes = 0;
 
     llama_files files;
     llama_ftype ftype;
@@ -103,7 +116,9 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::map<std::string, llama_tensor_weight, weight_name_comparer> auxiliary_weights_map; // for RKNPU prepack blobs
     std::unordered_map<std::string, llama_rknpu_prepack_meta> rknpu_prepack_meta_map; // key: original tensor name (e.g. "model.layers.0.attention.wq.weight"), value: prepack meta
+    std::vector<llama_rknpu_partial_load_entry> rknpu_partial_load_plan;
     bool rknpu_prepack_present = false;
+    bool rknpu_partial_load_configured = false;
     uint32_t n_tensors_physical = 0;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
@@ -124,7 +139,8 @@ struct llama_model_loader {
         bool use_mmap,
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        size_t rknpu_tail_load_bytes);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -168,6 +184,12 @@ struct llama_model_loader {
     const llama_rknpu_prepack_meta * get_rknpu_prepack_meta(const char * name) const;
 
     const std::unordered_map<std::string, llama_rknpu_prepack_meta> & get_rknpu_prepack_metas() const;
+
+    bool has_rknpu_partial_load() const;
+
+    void configure_rknpu_partial_load(std::vector<llama_rknpu_partial_load_entry> plan);
+
+    bool should_load_rknpu_payload(const char * payload_tensor_name) const;
 
     bool get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const;
 

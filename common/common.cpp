@@ -1102,6 +1102,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    mparams.rknpu_tail_load_bytes = params.rknpu_tail_load_bytes;
+
     return mparams;
 }
 

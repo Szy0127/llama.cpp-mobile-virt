@@ -1757,6 +1757,26 @@ void ggml_rknpu2_clear_offline_prepack_registry(void) {
     g_offline_prepack_registry.clear();
 }
 
+bool ggml_rknpu2_get_tensor_location(const struct ggml_tensor * tensor, uint64_t * dma, uint32_t * domain_id) {
+    if (tensor == nullptr) {
+        return false;
+    }
+
+    auto * extra = (const ggml_backend_rknpu2_tensor_extra *) tensor->extra;
+    if (extra == nullptr) {
+        return false;
+    }
+
+    if (dma != nullptr) {
+        *dma = extra->dma;
+    }
+    if (domain_id != nullptr) {
+        *domain_id = extra->domain_id;
+    }
+
+    return true;
+}
+
 bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * meta_tensor, const struct ggml_tensor * payload_tensor) {
     if (meta == nullptr || meta->tensor_name == nullptr || meta->meta_tensor_name == nullptr || meta->payload_tensor_name == nullptr ||
         meta_tensor == nullptr || payload_tensor == nullptr || meta_tensor->data == nullptr || payload_tensor->data == nullptr) {
