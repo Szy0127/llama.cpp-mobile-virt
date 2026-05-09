@@ -58,6 +58,7 @@ static int llm_fd = -1;
 static int llm_window_began = 0;
 static void *pool_vaddr = NULL;
 static size_t pool_map_size = 0;
+static size_t pool_committed_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
@@ -90,6 +91,7 @@ static void cleanup_pool_mapping(void) {
 
   pool_vaddr = NULL;
   pool_map_size = 0;
+  pool_committed_size = 0;
   payload_used = 0;
   compute_used = 0;
 
@@ -212,6 +214,13 @@ static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
            (unsigned long long) info.payload_window_size,
            (unsigned long long) layout->payload_window_bytes);
   }
+  if (info.payload_total_size != 0 &&
+      info.payload_total_size != layout->payload_total_bytes) {
+    printf("LLM payload total mismatch: ioctl=0x%llx local=0x%llx\n",
+           (unsigned long long) info.payload_total_size,
+           (unsigned long long) layout->payload_total_bytes);
+    return -1;
+  }
   if (info.reserve_size != 0 && info.reserve_size != layout->reserve_size) {
     printf("LLM reserve size mismatch: ioctl=0x%llx local=0x%llx\n",
            (unsigned long long) info.reserve_size,
@@ -236,6 +245,29 @@ static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
 static void npu_fd_init(void) {
   npu_fd = npu_open();
   printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
+}
+
+static int ensure_payload_committed(size_t end) {
+  while (end > pool_committed_size) {
+    struct llm_extend_info ext;
+    memset(&ext, 0, sizeof(ext));
+
+    if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
+      printf("LLM_IOC_EXTEND failed end=%zu committed=%zu errno=%d\n",
+             end, pool_committed_size, errno);
+      return -1;
+    }
+    if (ext.committed_length <= pool_committed_size ||
+        ext.committed_length > pool_map_size) {
+      printf("LLM_IOC_EXTEND returned invalid committed=%llu previous=%zu map=%zu\n",
+             (unsigned long long) ext.committed_length,
+             pool_committed_size, pool_map_size);
+      return -1;
+    }
+    pool_committed_size = (size_t) ext.committed_length;
+  }
+
+  return 0;
 }
 
 int mem_pool_prepare(size_t pool_size) {
@@ -302,11 +334,14 @@ int mem_pool_prepare(size_t pool_size) {
     return -1;
   }
 
-  if (!info.mapped || info.user_vaddr != (uint64_t) (uintptr_t) map || info.length < map_size) {
-    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu expected_vaddr=0x%llx expected_len=%zu\n",
+  if (!info.mapped || info.user_vaddr != (uint64_t) (uintptr_t) map ||
+      info.length < map_size || info.committed_length == 0 ||
+      info.committed_length > info.length) {
+    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu committed=%llu expected_vaddr=0x%llx expected_len=%zu\n",
            info.mapped,
            (unsigned long long) info.user_vaddr,
            (unsigned long long) info.length,
+           (unsigned long long) info.committed_length,
            (unsigned long long) (uint64_t) (uintptr_t) map,
            map_size);
     munmap(map, map_size);
@@ -316,6 +351,22 @@ int mem_pool_prepare(size_t pool_size) {
 
   pool_vaddr = map;
   pool_map_size = map_size;
+  pool_committed_size = (size_t) info.committed_length;
+
+  size_t commit_size = pool_size;
+  if (info.entry_size != 0) {
+    size_t entry_size = (size_t) info.entry_size;
+    commit_size = ((pool_size + entry_size - 1) / entry_size) * entry_size;
+    if (commit_size < pool_size || commit_size > map_size) {
+      commit_size = map_size;
+    }
+  }
+
+  if (ensure_payload_committed(commit_size) != 0) {
+    cleanup_pool_mapping();
+    return -1;
+  }
+
   payload_used = 0;
   compute_used = 0;
   atexit(cleanup_pool_mapping);
