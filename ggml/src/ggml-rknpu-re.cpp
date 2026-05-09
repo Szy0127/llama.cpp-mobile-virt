@@ -519,12 +519,14 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
             tensor->extra = tensor->view_src->extra;
             auto * extra = (ggml_backend_rknpu2_tensor_extra *) tensor->view_src->extra;
             const size_t offset = (size_t) ((const char *) tensor->data - (const char *) extra->cpu_ptr);
+            /*
             ggml_backend_rknpu2_log_tensor_layout("view",
                                                   tensor,
                                                   tensor->data,
                                                   extra->dma + offset,
                                                   ggml_nbytes(tensor),
                                                   extra->domain_id);
+                                                  */
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -540,12 +542,14 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
 
     tensor->extra = extra;
     ctx->tensor_extras.push_back(extra);
+    /*
     ggml_backend_rknpu2_log_tensor_layout("alloc",
                                           tensor,
                                           extra->cpu_ptr,
                                           extra->dma,
                                           extra->size,
                                           extra->domain_id);
+                                          */
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1790,6 +1794,7 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
     blob.meta_size = ggml_nbytes(meta_tensor);
     blob.payload_size = payload_extra->size;
 
+    /*
     std::fprintf(stderr,
             "[RKNPU_ALLOC][WEIGHT_PREPACK] tensor=%s payload_tensor=%s size=%zu dma=0x%llx domain=%u\n",
             blob.tensor_name.c_str(),
@@ -1797,6 +1802,7 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
             blob.payload_size,
             (unsigned long long) blob.payload_dma,
             blob.payload_domain_id);
+            */
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);

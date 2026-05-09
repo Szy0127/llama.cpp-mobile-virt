@@ -111,7 +111,7 @@ static int finish_llm_window(void) {
 
   unsigned int seq = 0;
   for (unsigned int i = 0; i < pool_finish_entry_count; i++, seq++) {
-    if (finish_llm_entry(seq, i, &done) != 0) {
+    if (finish_llm_entry(seq, i) != 0) {
       return -1;
     }
   }
@@ -276,7 +276,7 @@ static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
 
   layout->payload_entry_count = info.payload_entry_count;
   layout->compute_entry_count = info.compute_entry_count;
-  log_prealloc_layout("llm", layout);
+  //log_prealloc_layout("llm", layout);
   return 0;
 }
 
@@ -403,6 +403,7 @@ int mem_pool_prepare(size_t pool_size) {
       commit_size = map_size;
     }
   }
+  printf("commit size:%lx\n", commit_size);
 
   if (ensure_payload_committed(commit_size) != 0) {
     cleanup_pool_mapping();
@@ -534,9 +535,11 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     *handle = 0;
   }
 
+  /*
   log_prealloc_usage(alloc_kind, alloc_size, phys_addr, iova, alloc_domain_id,
                      payload_used_now, payload_left_now,
                      compute_used_now, compute_left_now);
+                     */
   return map;
 }
 
