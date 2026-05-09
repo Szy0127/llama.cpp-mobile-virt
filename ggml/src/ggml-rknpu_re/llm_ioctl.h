@@ -12,6 +12,7 @@ struct llm_map_info {
     __u64 entry_size;
     __u32 nr_pages;
     __u32 committed_entries;
+    __u32 finish_entry_count;
     __u32 mapped;
 };
 
@@ -40,6 +41,9 @@ struct llm_extend_info {
     __u32 entry_index;
     __u32 flags;
 };
+
+#define LLM_EXTEND_FLAG_FINISH (1U << 0)
+#define LLM_EXTEND_FLAG_DONE   (1U << 1)
 
 #define LLM_IOC_MAGIC    'L'
 #define LLM_LAYOUT_INFO_VERSION 2

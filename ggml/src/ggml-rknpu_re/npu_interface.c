@@ -51,6 +51,8 @@ struct npu_prealloc_layout {
   uint64_t payload_total_bytes;
   uint64_t compute_gpa_offset;
   uint32_t domain_count;
+  uint32_t payload_entry_count;
+  uint32_t compute_entry_count;
 };
 
 static int npu_fd = -1;
@@ -59,6 +61,8 @@ static int llm_window_began = 0;
 static void *pool_vaddr = NULL;
 static size_t pool_map_size = 0;
 static size_t pool_committed_size = 0;
+static unsigned int pool_committed_entries = 0;
+static unsigned int pool_finish_entry_count = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
@@ -84,23 +88,55 @@ static void log_prealloc_usage(const char *kind, size_t alloc_size,
          (unsigned long long) compute_left_now);
 }
 
+static int finish_llm_entry(unsigned int seq, unsigned int entry_index) {
+  struct llm_extend_info ext;
+  memset(&ext, 0, sizeof(ext));
+  ext.flags = LLM_EXTEND_FLAG_FINISH;
+  ext.entry_index = entry_index;
+
+  if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
+    printf("LLM_IOC_EXTEND finish failed seq=%u entry=%u errno=%d\n",
+           seq, entry_index, errno);
+    return -1;
+  }
+
+  return 0;
+}
+
+static int finish_llm_window(void) {
+  if (ioctl(llm_fd, LLM_IOC_FINISH) < 0) {
+    printf("LLM_IOC_FINISH failed errno=%d\n", errno);
+    return -1;
+  }
+
+  unsigned int seq = 0;
+  for (unsigned int i = 0; i < pool_finish_entry_count; i++, seq++) {
+    if (finish_llm_entry(seq, i, &done) != 0) {
+      return -1;
+    }
+  }
+
+  printf("LLM_IOC_EXTEND complete %u/%u entries\n",
+         seq, pool_finish_entry_count);
+  return 0;
+}
+
 static void cleanup_pool_mapping(void) {
   if (pool_vaddr && pool_map_size) {
     munmap(pool_vaddr, pool_map_size);
   }
 
+  if (llm_fd >= 0 && llm_window_began) {
+    finish_llm_window();
+  }
+
   pool_vaddr = NULL;
   pool_map_size = 0;
   pool_committed_size = 0;
+  pool_committed_entries = 0;
+  pool_finish_entry_count = 0;
   payload_used = 0;
   compute_used = 0;
-
-  if (llm_fd >= 0 && llm_window_began) {
-    const int ret = ioctl(llm_fd, LLM_IOC_FINISH);
-    if (ret < 0) {
-      printf("LLM_IOC_FINISH failed ret=%d errno=%d\n", ret, errno);
-    }
-  }
   llm_window_began = 0;
 
   if (llm_fd >= 0) {
@@ -238,6 +274,8 @@ static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
            info.layout_version, LLM_LAYOUT_INFO_VERSION);
   }
 
+  layout->payload_entry_count = info.payload_entry_count;
+  layout->compute_entry_count = info.compute_entry_count;
   log_prealloc_layout("llm", layout);
   return 0;
 }
@@ -265,6 +303,8 @@ static int ensure_payload_committed(size_t end) {
       return -1;
     }
     pool_committed_size = (size_t) ext.committed_length;
+    pool_committed_entries = ext.entry_index + 1;
+    pool_finish_entry_count = pool_committed_entries;
   }
 
   return 0;
@@ -352,6 +392,8 @@ int mem_pool_prepare(size_t pool_size) {
   pool_vaddr = map;
   pool_map_size = map_size;
   pool_committed_size = (size_t) info.committed_length;
+  pool_committed_entries = info.committed_entries;
+  pool_finish_entry_count = info.finish_entry_count;
 
   size_t commit_size = pool_size;
   if (info.entry_size != 0) {
@@ -363,6 +405,24 @@ int mem_pool_prepare(size_t pool_size) {
   }
 
   if (ensure_payload_committed(commit_size) != 0) {
+    cleanup_pool_mapping();
+    return -1;
+  }
+
+  memset(&info, 0, sizeof(info));
+  ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
+  if (ret < 0) {
+    printf("LLM_IOC_GET_INFO after extend failed ret=%d errno=%d\n", ret, errno);
+    cleanup_pool_mapping();
+    return -1;
+  }
+  pool_committed_size = (size_t) info.committed_length;
+  pool_committed_entries = info.committed_entries;
+  pool_finish_entry_count = info.finish_entry_count;
+  if (pool_finish_entry_count != pool_committed_entries) {
+    printf("LLM finish entry count mismatch: info=%u payload=%u\n",
+           pool_finish_entry_count,
+           pool_committed_entries);
     cleanup_pool_mapping();
     return -1;
   }
