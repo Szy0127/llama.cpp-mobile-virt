@@ -50,9 +50,14 @@ struct npu_prealloc_layout {
   uint64_t payload_window_bytes;
   uint64_t payload_total_bytes;
   uint64_t compute_gpa_offset;
+  uint64_t entry_size;
+  uint64_t payload_reload_offset;
+  uint64_t payload_reload_bytes;
   uint32_t domain_count;
   uint32_t payload_entry_count;
   uint32_t compute_entry_count;
+  uint32_t payload_reload_start_entry;
+  uint32_t payload_reload_entry_count;
 };
 
 static int npu_fd = -1;
@@ -60,9 +65,6 @@ static int llm_fd = -1;
 static int llm_window_began = 0;
 static void *pool_vaddr = NULL;
 static size_t pool_map_size = 0;
-static size_t pool_committed_size = 0;
-static unsigned int pool_committed_entries = 0;
-static unsigned int pool_finish_entry_count = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
@@ -70,33 +72,15 @@ static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
 
 int npu_open(void);
 
-static void log_prealloc_usage(const char *kind, size_t alloc_size,
-                               uint64_t phys_addr, uint64_t iova,
-                               uint32_t domain_id,
-                               uint64_t payload_used_now,
-                               uint64_t payload_left_now,
-                               uint64_t compute_used_now,
-                               uint64_t compute_left_now) {
-  printf("[RKNPU_PREALLOC] kind=%s size=%zu phys=0x%llx iova=0x%llx domain=%u payload_used=%llu payload_left=%llu compute_used=%llu compute_left=%llu\n",
-         kind, alloc_size,
-         (unsigned long long) phys_addr,
-         (unsigned long long) iova,
-         domain_id,
-         (unsigned long long) payload_used_now,
-         (unsigned long long) payload_left_now,
-         (unsigned long long) compute_used_now,
-         (unsigned long long) compute_left_now);
-}
-
-static int finish_llm_entry(unsigned int seq, unsigned int entry_index) {
+static int finish_llm_entry(unsigned int entry_index) {
   struct llm_extend_info ext;
   memset(&ext, 0, sizeof(ext));
   ext.flags = LLM_EXTEND_FLAG_FINISH;
   ext.entry_index = entry_index;
 
   if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
-    printf("LLM_IOC_EXTEND finish failed seq=%u entry=%u errno=%d\n",
-           seq, entry_index, errno);
+    printf("LLM_IOC_EXTEND finish failed entry=%u errno=%d\n",
+           entry_index, errno);
     return -1;
   }
 
@@ -109,15 +93,18 @@ static int finish_llm_window(void) {
     return -1;
   }
 
-  unsigned int seq = 0;
-  for (unsigned int i = 0; i < pool_finish_entry_count; i++, seq++) {
-    if (finish_llm_entry(seq, i) != 0) {
+  for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
+       i++) {
+    unsigned int entry_index =
+        g_prealloc_layout.payload_reload_start_entry + i;
+
+    if (finish_llm_entry(entry_index) != 0) {
       return -1;
     }
   }
 
   printf("LLM_IOC_EXTEND complete %u/%u entries\n",
-         seq, pool_finish_entry_count);
+         g_prealloc_layout.payload_reload_entry_count);
   return 0;
 }
 
@@ -132,9 +119,6 @@ static void cleanup_pool_mapping(void) {
 
   pool_vaddr = NULL;
   pool_map_size = 0;
-  pool_committed_size = 0;
-  pool_committed_entries = 0;
-  pool_finish_entry_count = 0;
   payload_used = 0;
   compute_used = 0;
   llm_window_began = 0;
@@ -214,7 +198,7 @@ static int validate_prealloc_layout(struct npu_prealloc_layout *layout,
 
 static void log_prealloc_layout(const char *source,
                                 const struct npu_prealloc_layout *layout) {
-  printf("RKNPU layout (%s): gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx domains=%u\n",
+  printf("RKNPU layout (%s): gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx reload=0x%llx+0x%llx entries=%u+%u domains=%u\n",
          source,
          (unsigned long long) layout->gpa_base,
          (unsigned long long) layout->donate_size,
@@ -222,6 +206,10 @@ static void log_prealloc_layout(const char *source,
          (unsigned long long) layout->iova_window_bytes,
          (unsigned long long) layout->reserve_size,
          (unsigned long long) layout->payload_window_bytes,
+         (unsigned long long) layout->payload_reload_offset,
+         (unsigned long long) layout->payload_reload_bytes,
+         layout->payload_reload_start_entry,
+         layout->payload_reload_entry_count,
          layout->domain_count);
 }
 
@@ -276,8 +264,81 @@ static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
 
   layout->payload_entry_count = info.payload_entry_count;
   layout->compute_entry_count = info.compute_entry_count;
+  layout->payload_reload_offset = info.reload_offset;
+  layout->payload_reload_bytes = info.reload_length;
+  layout->entry_size = info.entry_size;
+  layout->payload_reload_start_entry = info.reload_start_entry;
+  layout->payload_reload_entry_count = info.reload_entry_count;
+
+  if (layout->payload_reload_start_entry > layout->payload_entry_count ||
+      layout->payload_reload_entry_count >
+          layout->payload_entry_count - layout->payload_reload_start_entry) {
+    printf("Invalid LLM reload entries: start=%u count=%u payload=%u\n",
+           layout->payload_reload_start_entry,
+           layout->payload_reload_entry_count,
+           layout->payload_entry_count);
+    return -1;
+  }
+  if (layout->payload_reload_offset !=
+          (uint64_t) layout->payload_reload_start_entry * info.entry_size ||
+      layout->payload_reload_bytes !=
+          (uint64_t) layout->payload_reload_entry_count * info.entry_size) {
+    printf("Invalid LLM reload range: off=0x%llx len=0x%llx entry_size=0x%llx start=%u count=%u\n",
+           (unsigned long long) layout->payload_reload_offset,
+           (unsigned long long) layout->payload_reload_bytes,
+           (unsigned long long) info.entry_size,
+           layout->payload_reload_start_entry,
+           layout->payload_reload_entry_count);
+    return -1;
+  }
   //log_prealloc_layout("llm", layout);
   return 0;
+}
+
+int mem_payload_mapped_slice(const void *addr, size_t size,
+                             size_t *slice_offset, size_t *slice_size) {
+  if (slice_offset) {
+    *slice_offset = 0;
+  }
+  if (slice_size) {
+    *slice_size = 0;
+  }
+
+  if (addr == NULL || size == 0 || pool_vaddr == NULL || pool_map_size == 0) {
+    return 0;
+  }
+
+  uintptr_t base = (uintptr_t) pool_vaddr;
+  uintptr_t start = (uintptr_t) addr;
+  if (start < base) {
+    return -1;
+  }
+
+  uint64_t req_start = (uint64_t) (start - base);
+  if (req_start > pool_map_size || size > pool_map_size - req_start) {
+    return -1;
+  }
+
+  uint64_t req_end = req_start + (uint64_t) size;
+  uint64_t reload_start = g_prealloc_layout.payload_reload_offset;
+  uint64_t reload_end = reload_start + g_prealloc_layout.payload_reload_bytes;
+  if (reload_end > pool_map_size || reload_end < reload_start) {
+    reload_end = pool_map_size;
+  }
+
+  uint64_t copy_start = req_start > reload_start ? req_start : reload_start;
+  uint64_t copy_end = req_end < reload_end ? req_end : reload_end;
+  if (copy_start >= copy_end) {
+    return 0;
+  }
+
+  if (slice_offset) {
+    *slice_offset = (size_t) (copy_start - req_start);
+  }
+  if (slice_size) {
+    *slice_size = (size_t) (copy_end - copy_start);
+  }
+  return 1;
 }
 
 static void npu_fd_init(void) {
@@ -285,26 +346,46 @@ static void npu_fd_init(void) {
   printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
 }
 
-static int ensure_payload_committed(size_t end) {
-  while (end > pool_committed_size) {
+static int extend_payload_entry(unsigned int entry_index) {
     struct llm_extend_info ext;
     memset(&ext, 0, sizeof(ext));
+    ext.entry_index = entry_index;
 
     if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
-      printf("LLM_IOC_EXTEND failed end=%zu committed=%zu errno=%d\n",
-             end, pool_committed_size, errno);
+      printf("LLM_IOC_EXTEND failed entry=%u errno=%d\n",
+             entry_index, errno);
       return -1;
     }
-    if (ext.committed_length <= pool_committed_size ||
-        ext.committed_length > pool_map_size) {
-      printf("LLM_IOC_EXTEND returned invalid committed=%llu previous=%zu map=%zu\n",
-             (unsigned long long) ext.committed_length,
-             pool_committed_size, pool_map_size);
+
+    if (!(ext.flags & LLM_EXTEND_FLAG_SKIPPED)) {
+      uint64_t expected_offset =
+          (uint64_t) entry_index * g_prealloc_layout.entry_size;
+
+      if (g_prealloc_layout.entry_size == 0 ||
+          ext.length == 0 || ext.offset != expected_offset ||
+          ext.offset + ext.length > pool_map_size) {
+        printf("LLM_IOC_EXTEND invalid mapping entry=%u off=0x%llx len=0x%llx expected=0x%llx map=%zu flags=0x%x\n",
+               entry_index,
+               (unsigned long long) ext.offset,
+               (unsigned long long) ext.length,
+               (unsigned long long) expected_offset,
+               pool_map_size, ext.flags);
+        return -1;
+      }
+    }
+
+  return 0;
+}
+
+static int ensure_payload_mapped(void) {
+  for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
+       i++) {
+    unsigned int entry_index =
+        g_prealloc_layout.payload_reload_start_entry + i;
+
+    if (extend_payload_entry( entry_index) != 0) {
       return -1;
     }
-    pool_committed_size = (size_t) ext.committed_length;
-    pool_committed_entries = ext.entry_index + 1;
-    pool_finish_entry_count = pool_committed_entries;
   }
 
   return 0;
@@ -375,15 +456,18 @@ int mem_pool_prepare(size_t pool_size) {
   }
 
   if (!info.mapped || info.user_vaddr != (uint64_t) (uintptr_t) map ||
-      info.length < map_size || info.committed_length == 0 ||
-      info.committed_length > info.length) {
-    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu committed=%llu expected_vaddr=0x%llx expected_len=%zu\n",
+      info.length < map_size || info.reload_offset != g_prealloc_layout.payload_reload_offset ||
+      info.reload_length != g_prealloc_layout.payload_reload_bytes) {
+    printf("LLM mapping metadata mismatch: mapped=%u user_vaddr=0x%llx length=%llu reload=0x%llx+0x%llx expected_vaddr=0x%llx expected_len=%zu expected_reload=0x%llx+0x%llx\n",
            info.mapped,
            (unsigned long long) info.user_vaddr,
            (unsigned long long) info.length,
-           (unsigned long long) info.committed_length,
+           (unsigned long long) info.reload_offset,
+           (unsigned long long) info.reload_length,
            (unsigned long long) (uint64_t) (uintptr_t) map,
-           map_size);
+           map_size,
+           (unsigned long long) g_prealloc_layout.payload_reload_offset,
+           (unsigned long long) g_prealloc_layout.payload_reload_bytes);
     munmap(map, map_size);
     cleanup_pool_mapping();
     return -1;
@@ -391,21 +475,8 @@ int mem_pool_prepare(size_t pool_size) {
 
   pool_vaddr = map;
   pool_map_size = map_size;
-  pool_committed_size = (size_t) info.committed_length;
-  pool_committed_entries = info.committed_entries;
-  pool_finish_entry_count = info.finish_entry_count;
 
-  size_t commit_size = pool_size;
-  if (info.entry_size != 0) {
-    size_t entry_size = (size_t) info.entry_size;
-    commit_size = ((pool_size + entry_size - 1) / entry_size) * entry_size;
-    if (commit_size < pool_size || commit_size > map_size) {
-      commit_size = map_size;
-    }
-  }
-  printf("commit size:%lx\n", commit_size);
-
-  if (ensure_payload_committed(commit_size) != 0) {
+  if (ensure_payload_mapped() != 0) {
     cleanup_pool_mapping();
     return -1;
   }
@@ -417,13 +488,13 @@ int mem_pool_prepare(size_t pool_size) {
     cleanup_pool_mapping();
     return -1;
   }
-  pool_committed_size = (size_t) info.committed_length;
-  pool_committed_entries = info.committed_entries;
-  pool_finish_entry_count = info.finish_entry_count;
-  if (pool_finish_entry_count != pool_committed_entries) {
-    printf("LLM finish entry count mismatch: info=%u payload=%u\n",
-           pool_finish_entry_count,
-           pool_committed_entries);
+  if (info.reload_start_entry != g_prealloc_layout.payload_reload_start_entry ||
+      info.reload_entry_count != g_prealloc_layout.payload_reload_entry_count) {
+    printf("LLM reload range mismatch after extend: info=%u+%u expected=%u+%u\n",
+           info.reload_start_entry,
+           info.reload_entry_count,
+           g_prealloc_layout.payload_reload_start_entry,
+           g_prealloc_layout.payload_reload_entry_count);
     cleanup_pool_mapping();
     return -1;
   }
@@ -459,11 +530,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
   uint64_t phys_addr;
   uint64_t iova;
   uint32_t alloc_domain_id = UINT32_MAX;
-  uint64_t payload_used_now;
-  uint64_t payload_left_now;
-  uint64_t compute_used_now;
-  uint64_t compute_left_now;
-  const char *alloc_kind;
   void *map;
 
   if (use_compute_pool) {
@@ -479,7 +545,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     iova = g_prealloc_layout.payload_window_bytes + (uint64_t) compute_used;
     map = (char *) pool_vaddr + g_prealloc_layout.compute_gpa_offset + compute_used;
     compute_used += alloc_size;
-    alloc_kind = "compute";
     if (domain_id) {
       *domain_id = UINT32_MAX;
     }
@@ -501,10 +566,12 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     }
 
     if (alloc_size > g_prealloc_layout.payload_total_bytes - local_payload_used) {
-      printf("Out of payload window: need=%zu used=%llu total=%llu\n",
+      printf("Out of payload window: need=%zu used=%llu total=%llu reload=0x%llx+0x%llx\n",
              alloc_size,
              (unsigned long long) local_payload_used,
-             (unsigned long long) g_prealloc_layout.payload_total_bytes);
+             (unsigned long long) g_prealloc_layout.payload_total_bytes,
+             (unsigned long long) g_prealloc_layout.payload_reload_offset,
+             (unsigned long long) g_prealloc_layout.payload_reload_bytes);
       return NULL;
     }
 
@@ -517,13 +584,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
       *domain_id = alloc_domain_id;
     }
     payload_used = local_payload_used + alloc_size;
-    alloc_kind = "payload";
   }
-
-  payload_used_now = payload_used;
-  payload_left_now = g_prealloc_layout.payload_total_bytes - payload_used_now;
-  compute_used_now = compute_used;
-  compute_left_now = g_prealloc_layout.compute_buffer_bytes - compute_used_now;
 
   if (dma_addr) {
     *dma_addr = iova;
@@ -535,11 +596,6 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     *handle = 0;
   }
 
-  /*
-  log_prealloc_usage(alloc_kind, alloc_size, phys_addr, iova, alloc_domain_id,
-                     payload_used_now, payload_left_now,
-                     compute_used_now, compute_left_now);
-                     */
   return map;
 }
 

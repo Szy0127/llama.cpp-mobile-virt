@@ -7,12 +7,11 @@
 struct llm_map_info {
     __u64 user_vaddr;
     __u64 length;
-    __u64 committed_length;
-    __u64 next_page_offset;
     __u64 entry_size;
-    __u32 nr_pages;
-    __u32 committed_entries;
-    __u32 finish_entry_count;
+    __u64 reload_offset;
+    __u64 reload_length;
+    __u32 reload_start_entry;
+    __u32 reload_entry_count;
     __u32 mapped;
 };
 
@@ -26,16 +25,19 @@ struct llm_layout_info {
     __u64 payload_total_size;
     __u64 compute_buffer_gpa;
     __u64 entry_size;
+    __u64 reload_offset;
+    __u64 reload_length;
     __u32 domain_count;
     __u32 payload_entry_count;
     __u32 compute_entry_count;
+    __u32 reload_start_entry;
+    __u32 reload_entry_count;
     __u32 layout_version;
 };
 
 struct llm_extend_info {
     __u64 offset;
     __u64 length;
-    __u64 committed_length;
     __u64 reserved_length;
     __u64 entry_size;
     __u32 entry_index;
@@ -44,9 +46,10 @@ struct llm_extend_info {
 
 #define LLM_EXTEND_FLAG_FINISH (1U << 0)
 #define LLM_EXTEND_FLAG_DONE   (1U << 1)
+#define LLM_EXTEND_FLAG_SKIPPED (1U << 2)
 
 #define LLM_IOC_MAGIC    'L'
-#define LLM_LAYOUT_INFO_VERSION 2
+#define LLM_LAYOUT_INFO_VERSION 3
 #define LLM_IOC_GET_INFO _IOR(LLM_IOC_MAGIC, 0x00, struct llm_map_info)
 #define LLM_IOC_BEGIN    _IO(LLM_IOC_MAGIC, 0x01)
 #define LLM_IOC_FINISH   _IO(LLM_IOC_MAGIC, 0x02)

@@ -553,26 +553,28 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
     return GGML_STATUS_SUCCESS;
 }
 
-// in fact, this is never called when not using mmap
+// Sparse reload only maps the blocks reported by llm.ko, so tensor writes must
+// be clipped to the mapped reload range.
 static void ggml_backend_rknpu2_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                        ggml_tensor * tensor, const void * data,
                                        size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    // TODO: how to handle offset and size?
-
-    if (/*rknpu2_backend &&*/ ggml_rknpure_can_mul_mat_b(tensor) == false) { // we don't test this!
-        printf("ggml_rknpure_can_mul_mat_b NOT OK\n");
-        memcpy((char *) tensor->data + offset, data, size); // We must have this, otherwise will give meaningful output
+    size_t mapped_offset = 0;
+    size_t mapped_size = 0;
+    const int mapped = mem_payload_mapped_slice((const char *) tensor->data + offset,
+                                                size, &mapped_offset, &mapped_size);
+    if (mapped < 0) {
+        printf("%s: tensor %s range is outside LLM payload pool\n",
+               __func__, ggml_backend_rknpu2_tensor_name(tensor));
         return;
     }
-    // printf("ggml_backend_rknpu2_buffer_set_tensor, offset=%lu\n", offset);
-    GGML_ASSERT(offset == 0);
-
-    
-    if (ggml_rknpure_transform_tensor(data, tensor, offset, size)) {
-        printf("ggml_rknpure_transform_tensor failed\n");
+    if (mapped == 0) {
+        return;
     }
-    memcpy((char *) tensor->data + offset, data, size);
+
+    memcpy((char *) tensor->data + offset + mapped_offset,
+           (const char *) data + mapped_offset,
+           mapped_size);
 }
 
 static void ggml_backend_rknpu2_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -582,14 +584,17 @@ static void ggml_backend_rknpu2_buffer_get_tensor(ggml_backend_buffer_t buffer,
 #ifndef NDEBUG
     // printf("ggml_backend_rknpu2_buffer_get_tensor\n");
 #endif
-    GGML_ASSERT(offset == 0);
-    memcpy(data, (char *) tensor->data + offset, size);
-    return;
-    abort();
-    // memcpy(data, (const char *) tensor->data + offset, size);
-    
-        // We need to transform RKNPU2 tensor back
-    ggml_rknpu2_transform_tensor_back(data, tensor, offset, size);
+    memset(data, 0, size);
+
+    size_t mapped_offset = 0;
+    size_t mapped_size = 0;
+    const int mapped = mem_payload_mapped_slice((const char *) tensor->data + offset,
+                                                size, &mapped_offset, &mapped_size);
+    if (mapped > 0) {
+        memcpy((char *) data + mapped_offset,
+               (const char *) tensor->data + offset + mapped_offset,
+               mapped_size);
+    }
 }
 
 static bool ggml_backend_rknpu2_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
@@ -608,7 +613,12 @@ static bool ggml_backend_rknpu2_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_rknpu2_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rknpu2_buffer_context * ctx = (ggml_backend_rknpu2_buffer_context *) buffer->context;
-    memset(ctx->buffer, value, ctx->buffer_size);
+    size_t mapped_offset = 0;
+    size_t mapped_size = 0;
+    if (mem_payload_mapped_slice(ctx->buffer, ctx->buffer_size,
+                                 &mapped_offset, &mapped_size) > 0) {
+        memset((char *) ctx->buffer + mapped_offset, value, mapped_size);
+    }
 }
 
 // Describes one custom DMA-backed host buffer type.
@@ -675,7 +685,7 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
 // Reports that the custom host and host-DMA buffer types expose CPU-accessible memory.
 static bool ggml_backend_rknpu2_buffer_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return true;
+    return false;
 }
 
 // Returns the tensor alignment used by the custom host and host-DMA buffer types.
