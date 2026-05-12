@@ -1,5 +1,5 @@
 /*
- * gcc create_enc_model.c src/chacha20.c
+ * gcc create_enc_model.c -lcrypto
  * ./a.out tensor_info model.gguf model_enc.gguf
  */
 #include <stdio.h>
@@ -7,24 +7,55 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
-#include "src/chacha12.h"
+#include <openssl/evp.h>
 
 #define MAX_LINE_LENGTH 256
+#define AES_BLOCK_SIZE 16
 
 static uint8_t key[] = {
     0x00, 0x01, 0x02, 0x03,
     0x04, 0x05, 0x06, 0x07,
     0x08, 0x09, 0x0a, 0x0b,
-    0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13,
-    0x14, 0x15, 0x16, 0x17,
-    0x18, 0x19, 0x1a, 0x1b,
-    0x1c, 0x1d, 0x1e, 0x1f
+    0x0c, 0x0d, 0x0e, 0x0f
 };
 
-static uint8_t nonce[] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x01, 0x02
-};
+static int aes128_ecb_encrypt_inplace(unsigned char *buf, int len, const unsigned char key[16]) {
+    EVP_CIPHER_CTX *ctx = NULL;
+    int outlen = 0;
+    int tmplen = 0;
+    int ret = -1;
+
+    if (len % AES_BLOCK_SIZE != 0) {
+        fprintf(stderr, "Error: input length must be multiple of 16 bytes\n");
+        return -1;
+    }
+
+    printf("encrypt size 0x%lx\n", len);
+    ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL) {
+        return -1;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL) != 1) {
+        goto cleanup;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    if (EVP_EncryptUpdate(ctx, buf, &outlen, buf, len) != 1) {
+        goto cleanup;
+    }
+
+    if (EVP_EncryptFinal_ex(ctx, buf + outlen, &tmplen) != 1) {
+        goto cleanup;
+    }
+
+    ret = outlen + tmplen;
+
+cleanup:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
+}
 
 static int ends_with(const char *s, const char *suffix) {
     size_t s_len = strlen(s);
@@ -119,6 +150,7 @@ int main(int argc, char *argv[]) {
     }
 
     unsigned long encrypted_count = 0;
+    unsigned long skipped_unaligned_count = 0;
     unsigned long skipped_meta_count = 0;
     for (unsigned long i = 0; i < total_tensors; i++) {
         char name_line[MAX_LINE_LENGTH];
@@ -169,7 +201,20 @@ int main(int argc, char *argv[]) {
             free(buffer);
             continue;
         }
-        ChaCha12XOR(key, 1, nonce, buffer, buffer, (int)size);
+
+        if (size % AES_BLOCK_SIZE != 0) {
+            fprintf(stderr, "Skip tensor %s: size %llu is not aligned to %d bytes\n",
+                    tensor_name, size, AES_BLOCK_SIZE);
+            free(buffer);
+            skipped_unaligned_count++;
+            continue;
+        }
+
+        if (aes128_ecb_encrypt_inplace(buffer, (int)size, key) < 0) {
+            fprintf(stderr, "AES-128-ECB encryption failed for tensor %s\n", tensor_name);
+            free(buffer);
+            continue;
+        }
 
 
         if (fseek(fp_output, (long)offset, SEEK_SET) != 0) {
@@ -192,7 +237,7 @@ int main(int argc, char *argv[]) {
     fclose(fp_offset);
     fclose(fp_input);
     fclose(fp_output);
-    printf("Processed tensors: total=%lu encrypted=%lu skipped_meta=%lu, output=%s\n",
-           total_tensors, encrypted_count, skipped_meta_count, output_file);
+    printf("Processed tensors: total=%lu encrypted=%lu skipped_meta=%lu skipped_unaligned=%lu, output=%s\n",
+           total_tensors, encrypted_count, skipped_meta_count, skipped_unaligned_count, output_file);
     return 0;
 }
