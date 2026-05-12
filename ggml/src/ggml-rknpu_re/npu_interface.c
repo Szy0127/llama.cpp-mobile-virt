@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <limits.h>
+#include <time.h>
 
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
@@ -524,16 +525,34 @@ int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {
            (unsigned long long) payload_offset,
            (unsigned long long) size);
   }
-  printf("flush success\n");
   return ret;
 }
 
 int ggml_rknpu2_flush_all_payload(void) {
+  struct timespec start_ts;
+  struct timespec end_ts;
+  long long elapsed_us = 0;
+  int ret;
+
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
   if (ensure_dev_mem_open() != 0) {
     return -1;
   }
 
-  return ggml_rknpu2_flush_payload_range(0, g_prealloc_layout.payload_total_bytes);
+  //ret = ggml_rknpu2_flush_payload_range(0, g_prealloc_layout.payload_total_bytes);
+  for(uint64_t offset = 0 ; offset < g_prealloc_layout.payload_total_bytes ; offset += 64*1024*1024){
+    ret = ggml_rknpu2_flush_payload_range(offset, 64*1024*1024);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &end_ts);
+  elapsed_us =
+      (long long) (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL +
+      (long long) (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
+  printf("[RKNPU_FLUSH] flush_all total=%#llx ret=%d elapsed=%lld us\n",
+         (unsigned long long) g_prealloc_layout.payload_total_bytes,
+         ret, elapsed_us);
+  return ret;
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
