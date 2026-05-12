@@ -262,6 +262,7 @@ MK_CPPFLAGS  = -Iggml/include -Iggml/src -Iinclude -Isrc -Icommon -DGGML_USE_CPU
 MK_CFLAGS    = -std=c11   -fPIC
 MK_CXXFLAGS  = -std=c++17 -fPIC
 MK_NVCCFLAGS = -std=c++17
+MK_LDFLAGS  += -lcrypto
 
 ifdef LLAMA_NO_CCACHE
 GGML_NO_CCACHE := 1

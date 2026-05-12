@@ -125,10 +125,10 @@ static bool read_pkvm_shinfo(pkvm_shinfo & out) {
     return true;
 }
 
-static void dump_pkvm_shinfo(const char * reason) {
+static bool dump_pkvm_shinfo(const char * reason) {
     pkvm_shinfo info = {};
     if (!read_pkvm_shinfo(info)) {
-        return;
+        return false;
     }
 
     LOG_INF("[pkvm_shinfo] reason=%s phys=0x%016" PRIx64 "\n",
@@ -141,6 +141,7 @@ static void dump_pkvm_shinfo(const char * reason) {
             info.donated_pages, info.last_reclaim_pages, info.last_reclaim_gfn);
     LOG_INF("[pkvm_shinfo] total_reclaim_pages=%" PRIu64 ", total_reclaim_events=%" PRIu64 "\n",
             info.total_reclaim_pages, info.total_reclaim_events);
+    return info.total_reclaim_pages > 0;
 }
 #endif
 
@@ -668,7 +669,10 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    //TODO: decrypt all data
+    if (decrypt_all_tensor(false) != 0) {
+        LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
+        return 1;
+    }
     if (ggml_rknpu2_flush_all_payload() != 0) {
         LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
         return 1;
@@ -1014,9 +1018,12 @@ int main(int argc, char ** argv) {
                         ? chat_add_and_format("user", std::move(buffer))
                         : std::move(buffer);
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-                    dump_pkvm_shinfo("interactive-user-input");
-#endif
+                    if (dump_pkvm_shinfo("interactive-user-input")){
+                        if (decrypt_all_tensor(true) != 0) {
+                            LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
+                            return 1;
+                        }
+                    }
 
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);

@@ -11,6 +11,9 @@ cmake -Bbuild -H. \
     -DLLAMA_CURL=OFF\
     -DCMAKE_C_FLAGS="-march=armv8-a"\
     -DCMAKE_CXX_FLAGS="-march=armv8-a -std=c++17"\
+    -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/aarch64-linux-gnu/libcrypto.so \
+    -DOPENSSL_SSL_LIBRARY=/usr/lib/aarch64-linux-gnu/libssl.so \
+    -DOPENSSL_INCLUDE_DIR=/usr/include \
     -DLLAMA_CURL=OFF\
     -DGGML_CPU_AARCH64=OFF \
     -DGGML_RKNPU_RE=ON
@@ -19,4 +22,4 @@ cmake -Bbuild -H. \
 # cmake --build build -j10 --target llama-rknpu-prepack
 
 cmake --build build -j20 --target llama-cli
-adb push build/bin/llama-cli /data/data/com.termux/files/home
+adb push build/bin/llama-cli /data/data/com.termux/files/home/llama-cli

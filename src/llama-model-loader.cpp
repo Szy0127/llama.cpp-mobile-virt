@@ -3,10 +3,14 @@
 #include "ggml.h"
 #include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
 
+#include <algorithm>
 #include <array>
+#include <climits>
 #include <cinttypes>
 #include <cstring>
 #include <future>
+
+#include <openssl/evp.h>
 
 namespace {
 
@@ -26,6 +30,95 @@ static bool llama_is_rknpu_prepack_meta_name(const char * name) {
 
 static bool llama_is_rknpu_prepack_payload_name(const char * name) {
     return llama_has_rknpu_suffix(name, RKNPU_PREPACK_PAYLOAD_SUFFIX);
+}
+
+static constexpr size_t LLAMA_AES_BLOCK_SIZE = 16;
+
+static const uint8_t LLAMA_AES128_ECB_KEY[LLAMA_AES_BLOCK_SIZE] = {
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f,
+};
+
+static std::vector<ggml_tensor *> g_encrypted_tensors;
+static bool g_encrypted_tensors_decrypted = false;
+
+static bool llama_tensor_needs_runtime_decrypt(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    if (std::strstr(name, ".__rknpu") != nullptr && llama_is_rknpu_prepack_meta_name(name)) {
+        return false;
+    }
+
+    const size_t n_size = ggml_nbytes(tensor);
+    return n_size > 0 && n_size % LLAMA_AES_BLOCK_SIZE == 0;
+}
+
+static void llama_remember_encrypted_tensor(ggml_tensor * tensor) {
+    if (!llama_tensor_needs_runtime_decrypt(tensor)) {
+        return;
+    }
+
+    for (const ggml_tensor * existing : g_encrypted_tensors) {
+        if (existing == tensor || existing->data == tensor->data) {
+            return;
+        }
+    }
+
+    g_encrypted_tensors.push_back(tensor);
+}
+
+static int llama_aes128_ecb_decrypt_inplace(uint8_t * data, size_t len) {
+    if (data == nullptr || len % LLAMA_AES_BLOCK_SIZE != 0) {
+        return -1;
+    }
+
+    EVP_CIPHER_CTX * ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+        return -1;
+    }
+
+    int ret = -1;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, LLAMA_AES128_ECB_KEY, nullptr) != 1) {
+        goto cleanup;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    for (size_t done = 0; done < len; ) {
+        size_t chunk = std::min(len - done, static_cast<size_t>(INT_MAX));
+        chunk -= chunk % LLAMA_AES_BLOCK_SIZE;
+        if (chunk == 0) {
+            goto cleanup;
+        }
+
+        int out_len = 0;
+        if (EVP_DecryptUpdate(ctx, data + done, &out_len, data + done, static_cast<int>(chunk)) != 1) {
+            goto cleanup;
+        }
+        if (out_len != static_cast<int>(chunk)) {
+            goto cleanup;
+        }
+
+        done += chunk;
+    }
+
+    {
+        int final_len = 0;
+        if (EVP_DecryptFinal_ex(ctx, data + len, &final_len) != 1 || final_len != 0) {
+            goto cleanup;
+        }
+    }
+
+    ret = 0;
+
+cleanup:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
 }
 
 static bool llama_try_get_u32(const gguf_context * meta, const std::string & key, uint32_t & out) {
@@ -113,6 +206,54 @@ static bool llama_try_load_rknpu_prepack_meta(
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+extern "C" {
+
+LLAMA_API int decrypt_all_tensor(bool only_npu) {
+  struct timespec start_ts;
+  struct timespec end_ts;
+  long long elapsed_us = 0;
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    size_t decrypted_count = 0;
+    size_t decrypted_bytes = 0;
+    for (ggml_tensor * tensor : g_encrypted_tensors) {
+        if (!llama_tensor_needs_runtime_decrypt(tensor)) {
+            continue;
+        }
+
+        if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
+            LLAMA_LOG_ERROR("%s: tensor '%s' is not in host-accessible memory; use --no-mmap and avoid non-host offload for encrypted tensors\n",
+                    __func__, ggml_get_name(tensor));
+            return -1;
+        }
+        if (only_npu && std::strstr(ggml_get_name(tensor), ".__rknpu") == nullptr) {
+            continue;
+        }
+
+
+        const size_t n_size = ggml_nbytes(tensor);
+        if (llama_aes128_ecb_decrypt_inplace(static_cast<uint8_t *>(tensor->data), n_size) != 0) {
+            LLAMA_LOG_ERROR("%s: AES-128-ECB decrypt failed for tensor '%s' (%zu bytes)\n",
+                    __func__, ggml_get_name(tensor), n_size);
+            return -1;
+        }
+
+        decrypted_count++;
+        decrypted_bytes += n_size;
+    }
+  clock_gettime(CLOCK_MONOTONIC, &end_ts);
+  elapsed_us =
+      (long long) (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL +
+      (long long) (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
+  printf("decrypt  elapsed=%lld us\n",
+          elapsed_us);
+
+    LLAMA_LOG_INFO("%s: decrypted %zu tensors, total size = %8.2f MiB\n",
+            __func__, decrypted_count, decrypted_bytes / 1024.0 / 1024.0);
+    return 0;
+}
+
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1294,7 +1435,11 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
-    //TODO add tensor to vector
+    if (size_done == 0) {
+        g_encrypted_tensors.clear();
+        g_encrypted_tensors_decrypted = false;
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1387,6 +1532,7 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        llama_remember_encrypted_tensor(cur);
         size_done += n_size;
     }
 
