@@ -116,6 +116,8 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+    size_t rknpu_payload_tensors_loaded = 0; // host side uses, counts how many tensors are loaded to RKNPU payload, for logging purpose only
+    size_t rknpu_payload_bytes_loaded = 0; // host side uses, counts how many bytes are loaded to RKNPU payload, for logging purpose only
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     llama_model_loader(

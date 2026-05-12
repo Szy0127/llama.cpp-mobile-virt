@@ -1208,21 +1208,6 @@ bool llama_model_loader::load_all_data(
     if( npu_get_layout_info(&npu_layout_info) != 0) {
         GGML_ABORT("%s: failed to get RKNPU layout info\n", __func__);
     }
-    else{
-        // fprintf(stderr, "%s: RKNPU layout info available: gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx domains=%u version=%u reload_entries=%u+%u entry_size=0x%llx reload=0x%llx+0x%llx\n",
-        //         __func__,
-        //         (unsigned long long) npu_layout_info.rknpu.gpa_base,
-        //         (unsigned long long) npu_layout_info.rknpu.donate_size,
-        //         (unsigned long long) npu_layout_info.rknpu.compute_buffer_size,
-        //         (unsigned long long) npu_layout_info.rknpu.iova_window_size,
-        //         npu_layout_info.rknpu.domain_count,
-        //         npu_layout_info.rknpu.layout_version,
-        //         npu_layout_info.payload_reload_start_entry,
-        //         npu_layout_info.payload_reload_entry_count,
-        //         (unsigned long long) npu_layout_info.entry_size,
-        //         (unsigned long long) npu_layout_info.payload_reload_offset,
-        //         (unsigned long long) npu_layout_info.payload_reload_bytes);
-    }
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
@@ -1413,6 +1398,9 @@ bool llama_model_loader::load_all_data(
                     const size_t mapped_size = static_cast<size_t>(tensor_end - load_start);
                     fully_loaded = mapped_offset == 0 && mapped_size == n_size;
 
+                    rknpu_payload_tensors_loaded += 1;
+                    rknpu_payload_bytes_loaded += mapped_size;
+
                     uint64_t read_start = load_start;
                     while (read_start < tensor_end) {
                         const uint64_t entry_end = ((read_start / entry_size) + 1) * entry_size;
@@ -1437,7 +1425,7 @@ bool llama_model_loader::load_all_data(
                     fprintf(stderr, "%s: tensor '%s' is partially loaded to RKNPU, skipping validation\n", __func__, ggml_get_name(cur));
                 }
 
-                if (check_tensors && fully_loaded) {
+                if (check_tensors && fully_loaded) { // TODO: These validations can be removed in future versions.
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
@@ -1508,6 +1496,11 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        std::fprintf(stderr,
+                "[partial-load] summary: actual_loaded_payload_tensors=%zu actual_loaded_payload_bytes=%zx\n",
+                rknpu_payload_tensors_loaded,
+                rknpu_payload_bytes_loaded);
+
         if (!use_mmap) {
             for (const auto & file : files) {
                 file->advise_dontneed(0, file->size());

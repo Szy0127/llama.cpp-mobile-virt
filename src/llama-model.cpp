@@ -4483,54 +4483,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // register the RKNPU prepack meta/payload tensors
-    // actually we don't need register in host-reload version, will be removed in the future
-    size_t rknpu_prepack_bytes_registered = 0;
-    size_t rknpu_prepack_count = 0;
-    for (const auto & it : ordered_rknpu_prepack_metas) {
-        const std::string & tensor_name = it.tensor_name;
-        const auto & meta = *it.meta;
-        const ggml_tensor * meta_tensor = get_tensor(meta.meta_tensor.c_str());
-        const ggml_tensor * payload_tensor = get_tensor(meta.payload_tensor.c_str());
-        if (meta_tensor == nullptr) {
-            throw std::runtime_error(format("%s: missing loaded RKNPU meta tensor '%s' for tensor '%s'", __func__, meta.meta_tensor.c_str(), tensor_name.c_str()));
-        }
-        if (payload_tensor == nullptr) {
-            throw std::runtime_error(format("%s: missing loaded RKNPU payload tensor '%s' for tensor '%s'", __func__, meta.payload_tensor.c_str(), tensor_name.c_str()));
-        }
-
-        ggml_rknpu_prepack_meta backend_meta = {
-            tensor_name.c_str(),
-            meta.meta_tensor.c_str(),
-            meta.payload_tensor.c_str(),
-            meta.layout.c_str(),
-            meta.K,
-            meta.N,
-            meta.block_count,
-            meta.weight_bytes_per_block,
-            meta.scale_type,
-            meta.scales_bytes_total,
-            meta.packed_bytes_total,
-        };
-        if (ggml_rknpu2_register_offline_prepack(&backend_meta, meta_tensor, payload_tensor)) {
-            const size_t meta_size = ggml_nbytes(meta_tensor);
-            const size_t payload_size = ggml_nbytes(payload_tensor);
-            LLAMA_LOG_DEBUG("%s: registered RKNPU meta '%s' (%zu B) and payload '%s' (%zu B) for tensor '%s'\n",
-                    __func__, meta.meta_tensor.c_str(), meta_size, meta.payload_tensor.c_str(), payload_size, tensor_name.c_str());
-            rknpu_prepack_bytes_registered += meta_size + payload_size;
-            rknpu_prepack_count += 1;
-        }
-    }
-    if (rknpu_prepack_count > 0) {
-        LLAMA_LOG_INFO("%s: registered %zu RKNPU prepack pairs, total size = %8.2f MiB\n", __func__, rknpu_prepack_count, rknpu_prepack_bytes_registered / 1024.0 / 1024.0);
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
-    }
-
     LLAMA_LOG_INFO("%s: tensor data fully loaded, exiting before inference\n", __func__);
     std::fflush(stdout);
     std::fflush(stderr);
