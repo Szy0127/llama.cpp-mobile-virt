@@ -685,7 +685,7 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
 // Reports that the custom host and host-DMA buffer types expose CPU-accessible memory.
 static bool ggml_backend_rknpu2_buffer_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return false;
+    return true;
 }
 
 // Returns the tensor alignment used by the custom host and host-DMA buffer types.

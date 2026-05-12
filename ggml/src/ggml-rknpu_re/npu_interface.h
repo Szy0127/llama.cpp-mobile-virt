@@ -29,6 +29,7 @@ void* mem_allocate_compute(size_t size, uint64_t *dma_addr, uint64_t *obj,
 void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle);
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
 int mem_pool_prepare(size_t pool_size);
+void* mem_pool_vaddr(void);
 int mem_payload_mapped_slice(const void *addr, size_t size,
                              size_t *slice_offset, size_t *slice_size);
 

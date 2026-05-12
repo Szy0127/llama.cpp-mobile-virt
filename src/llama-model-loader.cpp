@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <future>
 
@@ -1260,20 +1261,24 @@ bool llama_model_loader::load_all_data(
         void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
-    {
-        struct npu_layout_info info;
-        if (npu_get_layout_info(&info) == 0) {
-            LLAMA_LOG_DEBUG("%s: RKNPU layout info available: gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx domains=%u version=%u reload_entries=%u+%u\n",
-                    __func__,
-                    (unsigned long long) info.rknpu.gpa_base,
-                    (unsigned long long) info.rknpu.donate_size,
-                    (unsigned long long) info.rknpu.compute_buffer_size,
-                    (unsigned long long) info.rknpu.iova_window_size,
-                    info.rknpu.domain_count,
-                    info.rknpu.layout_version,
-                    info.payload_reload_start_entry,
-                    info.payload_reload_entry_count);
-        }
+    struct npu_layout_info npu_layout_info;
+    if( npu_get_layout_info(&npu_layout_info) != 0) {
+        GGML_ABORT("%s: failed to get RKNPU layout info\n", __func__);
+    }
+    else{
+        // fprintf(stderr, "%s: RKNPU layout info available: gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx domains=%u version=%u reload_entries=%u+%u entry_size=0x%llx reload=0x%llx+0x%llx\n",
+        //         __func__,
+        //         (unsigned long long) npu_layout_info.rknpu.gpa_base,
+        //         (unsigned long long) npu_layout_info.rknpu.donate_size,
+        //         (unsigned long long) npu_layout_info.rknpu.compute_buffer_size,
+        //         (unsigned long long) npu_layout_info.rknpu.iova_window_size,
+        //         npu_layout_info.rknpu.domain_count,
+        //         npu_layout_info.rknpu.layout_version,
+        //         npu_layout_info.payload_reload_start_entry,
+        //         npu_layout_info.payload_reload_entry_count,
+        //         (unsigned long long) npu_layout_info.entry_size,
+        //         (unsigned long long) npu_layout_info.payload_reload_offset,
+        //         (unsigned long long) npu_layout_info.payload_reload_bytes);
     }
 
     std::vector<no_init<uint8_t>> read_buf;
@@ -1434,9 +1439,68 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
+                const bool is_rknpu_payload = llama_is_rknpu_prepack_payload_name(ggml_get_name(cur));
+                bool fully_loaded = true; // TODO: 在未来版本由于要加密，我们不再需要check_tensors了，届时可以删除这个变量和相关逻辑
+
+                if (rknpu_partial_load_configured && is_rknpu_payload) {
+                    // customize RKNPU payload loading (When partial load is enabled)
+                    const uint64_t payload_total_bytes =
+                            npu_layout_info.rknpu.donate_size - npu_layout_info.rknpu.compute_buffer_size;
+                    const uintptr_t pool_base = reinterpret_cast<uintptr_t>(mem_pool_vaddr());
+                    const uintptr_t tensor_base = reinterpret_cast<uintptr_t>(cur->data);
+                    if (pool_base == 0 || tensor_base < pool_base) {
+                        throw std::runtime_error(format("%s: tensor '%s' is outside RKNPU pool", __func__, ggml_get_name(cur)));
+                    }
+
+                    const uint64_t tensor_offset = static_cast<uint64_t>(tensor_base - pool_base);
+                    if (tensor_offset > payload_total_bytes || n_size > payload_total_bytes - tensor_offset) {
+                        throw std::runtime_error(format("%s: tensor '%s' range is outside RKNPU payload pool", __func__, ggml_get_name(cur)));
+                    }
+
+                    const uint64_t tensor_end = tensor_offset + n_size;
+                    const uint64_t reload_start = npu_layout_info.payload_reload_offset;
+                    if (tensor_end <= reload_start){
+                        continue; // partial load: should not be loaded
+                    }
+
+                    fprintf(stderr, "[partial-load] loading payload tensor=%s tensor_base=0x%llx pool_base=0x%llx offset=0x%llx size=%zu\n",
+                            ggml_get_name(cur),
+                            (unsigned long long) tensor_base,
+                            (unsigned long long) pool_base,
+                            (unsigned long long) tensor_offset,
+                            n_size);
+                    const uint64_t load_start = tensor_offset > reload_start ? tensor_offset : reload_start;
+                    const uint64_t entry_size = npu_layout_info.entry_size;
+
+                    const size_t mapped_offset = static_cast<size_t>(load_start - tensor_offset);
+                    const size_t mapped_size = static_cast<size_t>(tensor_end - load_start);
+                    fully_loaded = mapped_offset == 0 && mapped_size == n_size;
+
+                    uint64_t read_start = load_start;
+                    while (read_start < tensor_end) {
+                        const uint64_t entry_end = ((read_start / entry_size) + 1) * entry_size;
+                        const uint64_t read_end = entry_end < tensor_end ? entry_end : tensor_end;
+                        const size_t chunk_offset = static_cast<size_t>(read_start - tensor_offset);
+                        const size_t chunk_size = static_cast<size_t>(read_end - read_start);
+                        file->seek(weight->offs + chunk_offset, SEEK_SET);
+                        file->read_raw((char *) cur->data + chunk_offset, chunk_size);
+                        read_start = read_end;
+                        if (read_start % entry_size == 0) {
+                            // TODO: we have fully loaded one entry, time to submit it.
+                            // TODO: 同时要思考下最后一个tensor加载完后，该如何submit?
+                        }
+                    }
+                } else {
+                    // default loading for non-RKNPU payload tensors or when partial load is not enabled
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
+
+                if(!fully_loaded) {
+                    LLAMA_LOG_DEBUG("%s: tensor '%s' is partially loaded to RKNPU, skipping validation\n", __func__, ggml_get_name(cur));
+                }
+
+                if (check_tensors && fully_loaded) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));

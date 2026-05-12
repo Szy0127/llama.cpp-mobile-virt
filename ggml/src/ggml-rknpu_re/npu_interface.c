@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <limits.h>
+#include <assert.h>
 
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
@@ -393,6 +394,11 @@ static int load_prealloc_layout_from_info(struct npu_prealloc_layout *layout) {
   }
   //log_prealloc_layout("llm", layout);
   return 0;
+}
+
+void* mem_pool_vaddr(void) {
+  assert(pool_vaddr);
+  return pool_vaddr;
 }
 
 int mem_payload_mapped_slice(const void *addr, size_t size,
