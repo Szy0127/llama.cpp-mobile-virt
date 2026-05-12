@@ -252,7 +252,7 @@ static int load_prealloc_layout_from_driver(struct npu_prealloc_layout *layout) 
            (unsigned long long) layout->reserve_size);
   }
 
-  log_prealloc_layout("driver", layout);
+  //log_prealloc_layout("driver", layout);
   return 0;
 }
 
@@ -281,11 +281,11 @@ static void init_prealloc_layout_from_env(struct npu_prealloc_layout *layout) {
     if (validate_prealloc_layout(layout, "defaults") != 0) {
       abort();
     }
-    log_prealloc_layout("defaults", layout);
+    //log_prealloc_layout("defaults", layout);
     return;
   }
 
-  log_prealloc_layout("env", layout);
+  //log_prealloc_layout("env", layout);
 }
 
 static void init_prealloc_layout(void) {
@@ -457,9 +457,11 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     *handle = 0;
   }
 
+  /*
   log_prealloc_usage(alloc_kind, alloc_size, phys_addr, iova, alloc_domain_id,
                      prealloc_used_now, left_now,
                      compute_used_now, compute_left_now);
+                     */
 
   //printf("mem allocate addr:0x%lx, size:%d\n", map, size);
   return map;

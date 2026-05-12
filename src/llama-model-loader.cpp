@@ -232,11 +232,15 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
 
 
         const size_t n_size = ggml_nbytes(tensor);
+        printf("[decrypt] before %s(0x%lx):%lx\n", ggml_get_name(tensor), n_size, 
+                *static_cast<uint64_t*>(tensor->data));
         if (llama_aes128_ecb_decrypt_inplace(static_cast<uint8_t *>(tensor->data), n_size) != 0) {
             LLAMA_LOG_ERROR("%s: AES-128-ECB decrypt failed for tensor '%s' (%zu bytes)\n",
                     __func__, ggml_get_name(tensor), n_size);
             return -1;
         }
+        printf("[decrypt] %s(0x%lx):0x%lx, %d 0x%lx\n", ggml_get_name(tensor), n_size, 
+                *static_cast<uint64_t*>(tensor->data), decrypted_count, decrypted_bytes);
 
         decrypted_count++;
         decrypted_bytes += n_size;

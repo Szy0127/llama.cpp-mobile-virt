@@ -519,12 +519,14 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
             tensor->extra = tensor->view_src->extra;
             auto * extra = (ggml_backend_rknpu2_tensor_extra *) tensor->view_src->extra;
             const size_t offset = (size_t) ((const char *) tensor->data - (const char *) extra->cpu_ptr);
+            /*
             ggml_backend_rknpu2_log_tensor_layout("view",
                                                   tensor,
                                                   tensor->data,
                                                   extra->dma + offset,
                                                   ggml_nbytes(tensor),
                                                   extra->domain_id);
+                                                  */
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -540,12 +542,14 @@ static enum ggml_status ggml_backend_rknpu2_buffer_init_tensor(ggml_backend_buff
 
     tensor->extra = extra;
     ctx->tensor_extras.push_back(extra);
+    /*
     ggml_backend_rknpu2_log_tensor_layout("alloc",
                                           tensor,
                                           extra->cpu_ptr,
                                           extra->dma,
                                           extra->size,
                                           extra->domain_id);
+                                          */
     return GGML_STATUS_SUCCESS;
 }
 
