@@ -28,8 +28,9 @@ file_size = os.path.getsize(sys.argv[1])
 offsets = []
 size = 0
 last_size = 0
+print(len(reader.tensors))
 for i, tensor in enumerate(reader.tensors):
-    #print(f"Tensor {i+1}: {tensor.name}")
+    print(f"Tensor {i+1}: {tensor.name}")
     #print(f"  Shape: {tensor.shape}")
     #print(f"  Data offset: {tensor.data.offset}")
     #print(f"  Data offset: {tensor.data_offset}")
@@ -40,8 +41,8 @@ for i, tensor in enumerate(reader.tensors):
     last_size = tensor.data.nbytes
     offsets.append(tensor.data_offset)
 
-    if tensor.data.nbytes % 512 !=0:
-        print("not 512!!!")
+    #if tensor.data.nbytes % 512 !=0:
+        #print("not 512!!!")
     #print("-" * 40)
 
 print(size)

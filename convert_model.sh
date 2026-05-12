@@ -1,3 +1,3 @@
-python3 read_tensor.py ~/models/qwen2.5-3b-q4.gguf > tensor_info
+python3 read_tensor.py ~/models/llama-3-8b-instruct-q8_0-test.gguf > llama3.info
 gcc create_enc_model.c src/chacha12.c
-./a.out tensor_info ~/models/qwen2.5-3b-q4.gguf ~/models/qwen2.5-3b-q4-enc.gguf
+./a.out llama3.info ~/models/llama-3-8b-instruct-q8_0-test.gguf ~/models/llama3-8b-enc.gguf
