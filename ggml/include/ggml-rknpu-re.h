@@ -29,6 +29,8 @@ extern "C" {
 #endif
 
 GGML_API void ggml_rknpu2_reset_compute_used(void);
+GGML_API int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size);
+GGML_API int ggml_rknpu2_flush_all_payload(void);
 
 #ifdef __cplusplus
 }

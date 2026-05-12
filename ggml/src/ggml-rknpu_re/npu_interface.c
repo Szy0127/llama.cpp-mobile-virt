@@ -56,9 +56,12 @@ struct npu_prealloc_layout {
 };
 
 static int fd = -1;
-static int dev_mem_fd = -1;
-static void *dev_mem_vaddr = NULL;
-static size_t dev_mem_map_size = 0;
+static int payload_mem_fd = -1;
+static int compute_mem_fd = -1;
+static void *payload_vaddr = NULL;
+static void *compute_vaddr = NULL;
+static size_t payload_map_size = 0;
+static size_t compute_map_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
@@ -86,17 +89,26 @@ static void log_prealloc_usage(const char *kind, size_t alloc_size,
 }
 
 static void cleanup_dev_mem_mapping(void) {
-  if (dev_mem_vaddr && dev_mem_map_size) {
-    munmap(dev_mem_vaddr, dev_mem_map_size);
+  if (payload_vaddr && payload_map_size) {
+    munmap(payload_vaddr, payload_map_size);
   }
-  dev_mem_vaddr = NULL;
-  dev_mem_map_size = 0;
+  if (compute_vaddr && compute_map_size) {
+    munmap(compute_vaddr, compute_map_size);
+  }
+  payload_vaddr = NULL;
+  compute_vaddr = NULL;
+  payload_map_size = 0;
+  compute_map_size = 0;
   payload_used = 0;
   compute_used = 0;
 
-  if (dev_mem_fd >= 0) {
-    close(dev_mem_fd);
-    dev_mem_fd = -1;
+  if (payload_mem_fd >= 0) {
+    close(payload_mem_fd);
+    payload_mem_fd = -1;
+  }
+  if (compute_mem_fd >= 0) {
+    close(compute_mem_fd);
+    compute_mem_fd = -1;
   }
 }
 
@@ -286,34 +298,68 @@ static void init_prealloc_layout(void) {
 static int ensure_dev_mem_open(void) {
   pthread_once(&layout_once, init_prealloc_layout);
 
-  if (dev_mem_fd >= 0 && dev_mem_vaddr != NULL) {
+  if (payload_mem_fd >= 0 && compute_mem_fd >= 0 &&
+      payload_vaddr != NULL && compute_vaddr != NULL) {
     return 0;
   }
 
-  dev_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-  if (dev_mem_fd < 0) {
-    printf("Failed to open /dev/mem, errno=%d\n", errno);
+  if (g_prealloc_layout.payload_total_bytes > SIZE_MAX ||
+      g_prealloc_layout.compute_buffer_bytes > SIZE_MAX) {
+    printf("RKNPU /dev/mem map too large: payload=0x%llx compute=0x%llx\n",
+           (unsigned long long) g_prealloc_layout.payload_total_bytes,
+           (unsigned long long) g_prealloc_layout.compute_buffer_bytes);
     return -1;
   }
 
-  const uint64_t phys_base = g_prealloc_layout.gpa_base;
-  const size_t map_size = g_prealloc_layout.reserve_size;
-  void *map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                   dev_mem_fd, (off_t)phys_base);
-  if (map == MAP_FAILED) {
-    printf("Failed to mmap /dev/mem pool at phys=0x%llx, size=%zu, errno=%d\n",
-           (unsigned long long)phys_base, map_size, errno);
+  payload_mem_fd = open("/dev/mem", O_RDWR);
+  if (payload_mem_fd < 0) {
+    printf("Failed to open /dev/mem for payload, errno=%d\n", errno);
+    return -1;
+  }
+
+  compute_mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+  if (compute_mem_fd < 0) {
+    printf("Failed to open /dev/mem for compute, errno=%d\n", errno);
     cleanup_dev_mem_mapping();
     return -1;
   }
 
-  dev_mem_vaddr = map;
-  dev_mem_map_size = map_size;
+  const uint64_t payload_phys_base = g_prealloc_layout.gpa_base;
+  const size_t payload_size = (size_t) g_prealloc_layout.payload_total_bytes;
+  void *payload_map = mmap(NULL, payload_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, payload_mem_fd,
+                           (off_t) payload_phys_base);
+  if (payload_map == MAP_FAILED) {
+    printf("Failed to mmap /dev/mem payload at phys=0x%llx, size=%zu, errno=%d\n",
+           (unsigned long long) payload_phys_base, payload_size, errno);
+    cleanup_dev_mem_mapping();
+    return -1;
+  }
+
+  const uint64_t compute_phys_base =
+      g_prealloc_layout.gpa_base + g_prealloc_layout.compute_gpa_offset;
+  const size_t compute_size = (size_t) g_prealloc_layout.compute_buffer_bytes;
+  void *compute_map = mmap(NULL, compute_size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, compute_mem_fd,
+                           (off_t) compute_phys_base);
+  if (compute_map == MAP_FAILED) {
+    printf("Failed to mmap /dev/mem compute at phys=0x%llx, size=%zu, errno=%d\n",
+           (unsigned long long) compute_phys_base, compute_size, errno);
+    cleanup_dev_mem_mapping();
+    return -1;
+  }
+
+  payload_vaddr = payload_map;
+  compute_vaddr = compute_map;
+  payload_map_size = payload_size;
+  compute_map_size = compute_size;
   payload_used = 0;
   compute_used = 0;
   atexit(cleanup_dev_mem_mapping);
-  printf("Mapped /dev/mem pool: phys=0x%llx size=%zu vaddr=%p\n",
-         (unsigned long long)phys_base, map_size, map);
+  printf("Mapped /dev/mem payload: phys=0x%llx size=%zu vaddr=%p\n",
+         (unsigned long long) payload_phys_base, payload_size, payload_map);
+  printf("Mapped /dev/mem compute: phys=0x%llx size=%zu vaddr=%p\n",
+         (unsigned long long) compute_phys_base, compute_size, compute_map);
   return 0;
 }
 
@@ -353,7 +399,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
     phys_addr = g_prealloc_layout.gpa_base +
                 g_prealloc_layout.compute_gpa_offset + (uint64_t) compute_used;
     iova = g_prealloc_layout.payload_window_bytes + (uint64_t) compute_used;
-    map = (char *) dev_mem_vaddr + g_prealloc_layout.compute_gpa_offset + compute_used;
+    map = (char *) compute_vaddr + compute_used;
     compute_used += alloc_size;
     alloc_kind = "compute";
     if (domain_id) {
@@ -386,7 +432,7 @@ static void *mem_allocate_internal(size_t size, uint64_t *dma_addr, uint64_t *ob
 
     phys_addr = g_prealloc_layout.gpa_base + local_payload_used;
     iova = local_payload_used % g_prealloc_layout.payload_window_bytes;
-    map = (char *) dev_mem_vaddr + local_payload_used;
+    map = (char *) payload_vaddr + local_payload_used;
     alloc_domain_id = (uint32_t)
         (local_payload_used / g_prealloc_layout.payload_window_bytes);
     if (domain_id) {
@@ -436,6 +482,58 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj,
 
 void ggml_rknpu2_reset_compute_used(void) {
   compute_used = 0;
+}
+
+int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {
+  struct rknpu_mem_sync sync;
+
+  pthread_once(&fd_once, fd_init);
+  if (fd < 0) {
+    return -1;
+  }
+
+  if (ensure_dev_mem_open() != 0) {
+    return -1;
+  }
+
+  if (payload_offset > g_prealloc_layout.payload_total_bytes ||
+      size > g_prealloc_layout.payload_total_bytes - payload_offset) {
+    errno = EINVAL;
+    printf("Invalid RKNPU payload flush range: offset=0x%llx size=0x%llx total=0x%llx\n",
+           (unsigned long long) payload_offset,
+           (unsigned long long) size,
+           (unsigned long long) g_prealloc_layout.payload_total_bytes);
+    return -1;
+  }
+
+  if (size == 0) {
+    return 0;
+  }
+
+  memset(&sync, 0, sizeof(sync));
+  sync.flags = RKNPU_MEM_SYNC_TO_DEVICE;
+  sync.obj_addr = g_prealloc_layout.gpa_base;
+  sync.offset = payload_offset;
+  sync.size = size;
+
+  int ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &sync);
+  if (ret < 0) {
+    printf("DRM_IOCTL_RKNPU_MEM_SYNC payload flush failed: errno=%d phys=0x%llx offset=0x%llx size=0x%llx\n",
+           errno,
+           (unsigned long long) g_prealloc_layout.gpa_base,
+           (unsigned long long) payload_offset,
+           (unsigned long long) size);
+  }
+  printf("flush success\n");
+  return ret;
+}
+
+int ggml_rknpu2_flush_all_payload(void) {
+  if (ensure_dev_mem_open() != 0) {
+    return -1;
+  }
+
+  return ggml_rknpu2_flush_payload_range(0, g_prealloc_layout.payload_total_bytes);
 }
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {

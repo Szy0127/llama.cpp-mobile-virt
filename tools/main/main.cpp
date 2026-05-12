@@ -668,6 +668,11 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    if (ggml_rknpu2_flush_all_payload() != 0) {
+        LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+        return 1;
+    }
+    LOG("flush all\n");
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
