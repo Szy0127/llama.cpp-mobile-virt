@@ -4,7 +4,7 @@
 cmake -Bbuild -H. \
     -DCMAKE_TOOLCHAIN_FILE=./aarch64-toolchain.cmake\
     -DCMAKE_BUILD_TYPE=Release\
-    -DGGML_STATIC=ON \
+    -DGGML_STATIC=OFF \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_NATIVE=OFF \
     -DGGML_OPENMP=OFF \

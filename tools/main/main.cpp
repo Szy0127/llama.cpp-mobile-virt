@@ -668,6 +668,7 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    //TODO: decrypt all data
     if (ggml_rknpu2_flush_all_payload() != 0) {
         LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
         return 1;
