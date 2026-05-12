@@ -4450,42 +4450,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // configure RKNPU partial load if needed
-    if (params.rknpu_tail_load_bytes > 0 && !ordered_rknpu_prepack_metas.empty()) {
-        std::vector<llama_model_loader::llama_rknpu_partial_load_entry> partial_load_plan;
-        partial_load_plan.reserve(ordered_rknpu_prepack_metas.size());
-
-        size_t total_end = 0;
-        for (const auto & it : ordered_rknpu_prepack_metas) {
-            const std::string & tensor_name = it.tensor_name;
-            const auto & meta = *it.meta;
-            const ggml_tensor * payload_tensor = get_tensor(meta.payload_tensor.c_str());
-            if (payload_tensor == nullptr || payload_tensor->data == nullptr) {
-                throw std::runtime_error(format("%s: missing allocated RKNPU payload tensor '%s' for tensor '%s'", __func__, meta.payload_tensor.c_str(), tensor_name.c_str()));
-            }
-
-            llama_model_loader::llama_rknpu_partial_load_entry entry;
-            entry.tensor_name = tensor_name;
-            entry.payload_tensor_name = meta.payload_tensor;
-            entry.cpu_addr = reinterpret_cast<size_t>(payload_tensor->data);
-            if (!ggml_rknpu2_get_tensor_location(payload_tensor, &entry.dma, &entry.domain_id)) {
-                throw std::runtime_error(format("%s: missing RKNPU DMA metadata for payload tensor '%s'", __func__, meta.payload_tensor.c_str()));
-            }
-            entry.payload_bytes = ggml_nbytes(payload_tensor);
-            total_end = std::max(total_end, entry.cpu_addr + entry.payload_bytes);
-            partial_load_plan.push_back(std::move(entry));
-        }
-
-        if (!partial_load_plan.empty()) {
-            const size_t tail_begin = params.rknpu_tail_load_bytes >= total_end ? 0 : total_end - params.rknpu_tail_load_bytes;
-            for (auto & entry : partial_load_plan) {
-                const size_t payload_end = entry.cpu_addr + entry.payload_bytes;
-                entry.selected = payload_end > tail_begin;
-            }
-            ml.configure_rknpu_partial_load(std::move(partial_load_plan));
-        }
-    }
-
     // load tensor data
     {
         struct npu_layout_info info;
@@ -4520,14 +4484,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // register the RKNPU prepack meta/payload tensors
+    // actually we don't need register in host-reload version, will be removed in the future
     size_t rknpu_prepack_bytes_registered = 0;
     size_t rknpu_prepack_count = 0;
     for (const auto & it : ordered_rknpu_prepack_metas) {
         const std::string & tensor_name = it.tensor_name;
         const auto & meta = *it.meta;
-        if (ml.has_rknpu_partial_load() && !ml.should_load_rknpu_payload(meta.payload_tensor.c_str())) {
-            continue;
-        }
         const ggml_tensor * meta_tensor = get_tensor(meta.meta_tensor.c_str());
         const ggml_tensor * payload_tensor = get_tensor(meta.payload_tensor.c_str());
         if (meta_tensor == nullptr) {
@@ -13696,7 +13658,6 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.rknpu_tail_load_bytes       =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,

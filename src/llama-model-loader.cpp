@@ -551,8 +551,7 @@ llama_model_loader::llama_model_loader(
         bool use_mmap,
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        size_t rknpu_tail_load_bytes) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -565,7 +564,6 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
-    this->rknpu_tail_load_bytes = rknpu_tail_load_bytes;
 
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
@@ -976,61 +974,6 @@ const std::unordered_map<std::string, llama_model_loader::llama_rknpu_prepack_me
     return rknpu_prepack_meta_map;
 }
 
-bool llama_model_loader::has_rknpu_partial_load() const {
-    return rknpu_partial_load_configured;
-}
-
-void llama_model_loader::configure_rknpu_partial_load(std::vector<llama_rknpu_partial_load_entry> plan) {
-    rknpu_partial_load_plan = std::move(plan);
-    rknpu_partial_load_configured = !rknpu_partial_load_plan.empty();
-
-    if (!rknpu_partial_load_configured) {
-        return;
-    }
-
-    size_t total_payload_bytes = 0;
-    size_t selected_payload_bytes = 0;
-    for (const auto & entry : rknpu_partial_load_plan) {
-        total_payload_bytes += entry.payload_bytes;
-        if (entry.selected) {
-            selected_payload_bytes += entry.payload_bytes;
-        } else {
-            size_data -= entry.payload_bytes;
-        }
-
-        std::fprintf(stderr,
-                "[partial-load] payload tensor=%s domain=%u dma=[0x%llx,0x%llx) size=%zu selected=%d\n",
-                entry.payload_tensor_name.c_str(),
-                entry.domain_id,
-                (unsigned long long) entry.dma,
-                (unsigned long long) (entry.dma + entry.payload_bytes),
-                entry.payload_bytes,
-                entry.selected ? 1 : 0);
-    }
-
-    std::fprintf(stderr,
-            "[partial-load] mode enabled: tail_budget=%zu total_payload_bytes=%zu selected_payload_bytes=%zu payload_count=%zu\n",
-            rknpu_tail_load_bytes,
-            total_payload_bytes,
-            selected_payload_bytes,
-            rknpu_partial_load_plan.size());
-}
-
-bool llama_model_loader::should_load_rknpu_payload(const char * payload_tensor_name) const {
-    if (!rknpu_partial_load_configured || payload_tensor_name == nullptr) {
-        return true;
-    }
-
-    // TODO: this is low efficiency, consider building a hash map if the plan can be large
-    for (const auto & entry : rknpu_partial_load_plan) {
-        if (entry.payload_tensor_name == payload_tensor_name) {
-            return entry.selected;
-        }
-    }
-
-    return true;
-}
-
 bool llama_model_loader::get_rknpu_prepack_data(const char * tensor_name, std::vector<uint8_t> & data) const {
     const llama_tensor_weight * weight = get_aux_weight(tensor_name);
     if (!weight) {
@@ -1396,18 +1339,6 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
-        const bool skip_rknpu_payload =
-            rknpu_partial_load_configured &&
-            llama_is_rknpu_prepack_payload_name(ggml_get_name(cur)) &&
-            !should_load_rknpu_payload(ggml_get_name(cur));
-        if (skip_rknpu_payload) {
-            std::fprintf(stderr,
-                    "[partial-load] skip payload tensor=%s size=%zu\n",
-                    ggml_get_name(cur),
-                    n_size);
-            continue;
-        }
-
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
@@ -1442,8 +1373,8 @@ bool llama_model_loader::load_all_data(
                 const bool is_rknpu_payload = llama_is_rknpu_prepack_payload_name(ggml_get_name(cur));
                 bool fully_loaded = true; // TODO: 在未来版本由于要加密，我们不再需要check_tensors了，届时可以删除这个变量和相关逻辑
 
-                if (rknpu_partial_load_configured && is_rknpu_payload) {
-                    // customize RKNPU payload loading (When partial load is enabled)
+                if (is_rknpu_payload) {
+                    // customized RKNPU payload loading
                     const uint64_t payload_total_bytes =
                             npu_layout_info.rknpu.donate_size - npu_layout_info.rknpu.compute_buffer_size;
                     const uintptr_t pool_base = reinterpret_cast<uintptr_t>(mem_pool_vaddr());
@@ -1459,15 +1390,21 @@ bool llama_model_loader::load_all_data(
 
                     const uint64_t tensor_end = tensor_offset + n_size;
                     const uint64_t reload_start = npu_layout_info.payload_reload_offset;
-                    if (tensor_end <= reload_start){
-                        continue; // partial load: should not be loaded
+                    if (tensor_end <= reload_start) {
+                        std::fprintf(stderr,
+                                "[partial-load] skip payload tensor=%s size=%zu\n",
+                                ggml_get_name(cur),
+                                n_size);
+                        size_done += n_size;
+                        continue;
                     }
 
-                    fprintf(stderr, "[partial-load] loading payload tensor=%s tensor_base=0x%llx pool_base=0x%llx offset=0x%llx size=%zu\n",
+                    fprintf(stderr, "[partial-load] loading payload tensor=%s tensor_base=0x%llx pool_base=0x%llx offset=0x%llx, reload_start=0x%llx size=%zu\n",
                             ggml_get_name(cur),
                             (unsigned long long) tensor_base,
                             (unsigned long long) pool_base,
                             (unsigned long long) tensor_offset,
+                            (unsigned long long) reload_start,
                             n_size);
                     const uint64_t load_start = tensor_offset > reload_start ? tensor_offset : reload_start;
                     const uint64_t entry_size = npu_layout_info.entry_size;
@@ -1491,13 +1428,13 @@ bool llama_model_loader::load_all_data(
                         }
                     }
                 } else {
-                    // default loading for non-RKNPU payload tensors or when partial load is not enabled
+                    // non-RKNPU tensors loading
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(cur->data, n_size);
                 }
 
                 if(!fully_loaded) {
-                    LLAMA_LOG_DEBUG("%s: tensor '%s' is partially loaded to RKNPU, skipping validation\n", __func__, ggml_get_name(cur));
+                    fprintf(stderr, "%s: tensor '%s' is partially loaded to RKNPU, skipping validation\n", __func__, ggml_get_name(cur));
                 }
 
                 if (check_tensors && fully_loaded) {
@@ -1536,7 +1473,7 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        if (rknpu_partial_load_configured && llama_is_rknpu_prepack_payload_name(ggml_get_name(cur))) {
+        if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur))) {
             std::fprintf(stderr,
                     "[partial-load] load payload tensor=%s size=%zu\n",
                     ggml_get_name(cur),
