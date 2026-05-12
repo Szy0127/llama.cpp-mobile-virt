@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-rknpu_re/npu_interface.h"
 #include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
 
 #include <array>
@@ -1258,6 +1259,22 @@ bool llama_model_loader::load_all_data(
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+
+    {
+        struct npu_layout_info info;
+        if (npu_get_layout_info(&info) == 0) {
+            LLAMA_LOG_DEBUG("%s: RKNPU layout info available: gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx domains=%u version=%u reload_entries=%u+%u\n",
+                    __func__,
+                    (unsigned long long) info.rknpu.gpa_base,
+                    (unsigned long long) info.rknpu.donate_size,
+                    (unsigned long long) info.rknpu.compute_buffer_size,
+                    (unsigned long long) info.rknpu.iova_window_size,
+                    info.rknpu.domain_count,
+                    info.rknpu.layout_version,
+                    info.payload_reload_start_entry,
+                    info.payload_reload_entry_count);
+        }
+    }
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;

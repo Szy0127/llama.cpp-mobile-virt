@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "../../ggml/src/ggml-rknpu_re/npu_interface.h"
 
 #include <cerrno>
 #include <cinttypes>
@@ -215,6 +216,12 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
+    if (npu_layout_info_init() != 0) {
+        LOG_WRN("%s: warning: failed to initialize RKNPU layout info early: errno=%d (%s)\n",
+                __func__, errno, std::strerror(errno));
+    } else {
+        npu_dump_layout_info("main");
+    }
     llama_numa_init(params.numa);
 
     llama_model * model = nullptr;

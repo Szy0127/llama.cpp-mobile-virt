@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <cfloat>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4486,6 +4487,30 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    {
+        struct npu_layout_info info;
+        if (npu_get_layout_info(&info) == 0) {
+            LLAMA_LOG_INFO("%s: RKNPU layout before load_all_data: gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx compute_gpa=0x%llx domains=%u version=%u reload=0x%llx+0x%llx entries=%u+%u entry_size=0x%llx\n",
+                    __func__,
+                    (unsigned long long) info.rknpu.gpa_base,
+                    (unsigned long long) info.rknpu.donate_size,
+                    (unsigned long long) info.rknpu.compute_buffer_size,
+                    (unsigned long long) info.rknpu.iova_window_size,
+                    (unsigned long long) info.rknpu.reserve_size,
+                    (unsigned long long) info.rknpu.payload_window_size,
+                    (unsigned long long) info.rknpu.compute_buffer_gpa,
+                    info.rknpu.domain_count,
+                    info.rknpu.layout_version,
+                    (unsigned long long) info.payload_reload_offset,
+                    (unsigned long long) info.payload_reload_bytes,
+                    info.payload_reload_start_entry,
+                    info.payload_reload_entry_count,
+                    (unsigned long long) info.entry_size);
+        } else {
+            LLAMA_LOG_WARN("%s: failed to get RKNPU layout before load_all_data: errno=%d (%s)\n",
+                    __func__, errno, std::strerror(errno));
+        }
+    }
     for (auto & it : ctx_bufs) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;

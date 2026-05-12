@@ -1,11 +1,25 @@
 #ifndef NPU_INTERFACE_H
 #define NPU_INTERFACE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "rknpu-ioctl.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <stddef.h>
-#include <stdint.h>
+struct npu_layout_info {
+    struct rknpu_layout_info rknpu;
+    uint64_t entry_size;
+    uint64_t payload_reload_offset;
+    uint64_t payload_reload_bytes;
+    uint32_t payload_entry_count;
+    uint32_t compute_entry_count;
+    uint32_t payload_reload_start_entry;
+    uint32_t payload_reload_entry_count;
+};
 
 void* mem_allocate_payload(size_t size, uint64_t *dma_addr, uint64_t *obj,
                            uint32_t flags, uint64_t *handle,
@@ -17,6 +31,10 @@ void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
 int mem_pool_prepare(size_t pool_size);
 int mem_payload_mapped_slice(const void *addr, size_t size,
                              size_t *slice_offset, size_t *slice_size);
+
+int npu_layout_info_init(void);
+int npu_get_layout_info(struct npu_layout_info *info);
+void npu_dump_layout_info(const char *source);
 
 int npu_reset(void);
 int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id);

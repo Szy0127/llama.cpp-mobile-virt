@@ -69,8 +69,140 @@ static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
 static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
+static struct npu_layout_info g_npu_layout_info;
+static int g_npu_layout_info_initialized = 0;
 
 int npu_open(void);
+static void npu_fd_init(void);
+
+static void log_npu_layout_info(const char *source,
+                                const struct npu_layout_info *info) {
+  printf("RKNPU layout (%s): gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx compute_gpa=0x%llx domains=%u version=%u reload=0x%llx+0x%llx entries=%u+%u entry_size=0x%llx\n",
+         source ? source : "unknown",
+         (unsigned long long) info->rknpu.gpa_base,
+         (unsigned long long) info->rknpu.donate_size,
+         (unsigned long long) info->rknpu.compute_buffer_size,
+         (unsigned long long) info->rknpu.iova_window_size,
+         (unsigned long long) info->rknpu.reserve_size,
+         (unsigned long long) info->rknpu.payload_window_size,
+         (unsigned long long) info->rknpu.compute_buffer_gpa,
+         info->rknpu.domain_count,
+         info->rknpu.layout_version,
+         (unsigned long long) info->payload_reload_offset,
+         (unsigned long long) info->payload_reload_bytes,
+         info->payload_reload_start_entry,
+         info->payload_reload_entry_count,
+         (unsigned long long) info->entry_size);
+}
+
+static int npu_layout_info_is_valid(const struct npu_layout_info *info) {
+  return info->rknpu.gpa_base != 0 &&
+         info->rknpu.donate_size != 0 &&
+         info->rknpu.compute_buffer_size != 0 &&
+         info->rknpu.iova_window_size != 0 &&
+         info->rknpu.domain_count != 0;
+}
+
+static int set_npu_layout_info(const struct npu_layout_info *info,
+                               const char *source) {
+  if (!npu_layout_info_is_valid(info)) {
+    printf("Invalid RKNPU layout: gpa=0x%llx donate=0x%llx compute=0x%llx iova=0x%llx domains=%u\n",
+           (unsigned long long) info->rknpu.gpa_base,
+           (unsigned long long) info->rknpu.donate_size,
+           (unsigned long long) info->rknpu.compute_buffer_size,
+           (unsigned long long) info->rknpu.iova_window_size,
+           info->rknpu.domain_count);
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (g_npu_layout_info_initialized) {
+    return 0;
+  }
+  g_npu_layout_info = *info;
+  g_npu_layout_info_initialized = 1;
+  log_npu_layout_info(source, &g_npu_layout_info);
+  return 0;
+}
+
+static void npu_layout_info_from_llm(const struct llm_layout_info *llm,
+                                     struct npu_layout_info *info) {
+  memset(info, 0, sizeof(*info));
+  info->rknpu.gpa_base = llm->gpa_base;
+  info->rknpu.donate_size = llm->donate_size;
+  info->rknpu.compute_buffer_size = llm->compute_buffer_size;
+  info->rknpu.iova_window_size = llm->iova_window_size;
+  info->rknpu.reserve_size = llm->reserve_size;
+  info->rknpu.payload_window_size = llm->payload_window_size;
+  info->rknpu.compute_buffer_gpa = llm->compute_buffer_gpa;
+  info->rknpu.domain_count = llm->domain_count;
+  info->rknpu.layout_version = llm->layout_version;
+  info->entry_size = llm->entry_size;
+  info->payload_reload_offset = llm->reload_offset;
+  info->payload_reload_bytes = llm->reload_length;
+  info->payload_entry_count = llm->payload_entry_count;
+  info->compute_entry_count = llm->compute_entry_count;
+  info->payload_reload_start_entry = llm->reload_start_entry;
+  info->payload_reload_entry_count = llm->reload_entry_count;
+}
+
+static int set_npu_layout_info_from_llm(const struct llm_layout_info *llm,
+                                        const char *source) {
+  struct npu_layout_info info;
+  npu_layout_info_from_llm(llm, &info);
+  return set_npu_layout_info(&info, source);
+}
+
+int npu_layout_info_init(void) {
+  int fd;
+  struct llm_layout_info llm_info;
+
+  if (g_npu_layout_info_initialized) {
+    return 0;
+  }
+
+  fd = open(LLM_DEVICE, O_RDWR);
+  if (fd < 0) {
+    printf("Failed to open %s for layout errno=%d\n", LLM_DEVICE, errno);
+    return -1;
+  }
+
+  memset(&llm_info, 0, sizeof(llm_info));
+  if (ioctl(fd, LLM_IOC_GET_LAYOUT, &llm_info) < 0) {
+    int saved_errno = errno;
+    printf("LLM_IOC_GET_LAYOUT early failed errno=%d\n", saved_errno);
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  close(fd);
+
+  return set_npu_layout_info_from_llm(&llm_info, "init");
+}
+
+int npu_get_layout_info(struct npu_layout_info *info) {
+  if (info == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (npu_layout_info_init() != 0) {
+    return -1;
+  }
+
+  *info = g_npu_layout_info;
+  return 0;
+}
+
+void npu_dump_layout_info(const char *source) {
+  struct npu_layout_info info;
+  if (npu_get_layout_info(&info) != 0) {
+    printf("RKNPU layout (%s): unavailable errno=%d\n",
+           source ? source : "unknown", errno);
+    return;
+  }
+  log_npu_layout_info(source, &info);
+}
 
 static int finish_llm_entry(unsigned int entry_index) {
   struct llm_extend_info ext;
@@ -103,7 +235,7 @@ static int finish_llm_window(void) {
     }
   }
 
-  printf("LLM_IOC_EXTEND complete %u/%u entries\n",
+  printf("LLM_IOC_EXTEND complete %u entries\n",
          g_prealloc_layout.payload_reload_entry_count);
   return 0;
 }
@@ -213,62 +345,30 @@ static void log_prealloc_layout(const char *source,
          layout->domain_count);
 }
 
-static int load_prealloc_layout_from_llm(struct npu_prealloc_layout *layout) {
-  struct llm_layout_info info;
+static int load_prealloc_layout_from_info(struct npu_prealloc_layout *layout) {
+  struct npu_layout_info info;
 
-  memset(&info, 0, sizeof(info));
-  if (ioctl(llm_fd, LLM_IOC_GET_LAYOUT, &info) < 0) {
-    printf("LLM_IOC_GET_LAYOUT failed errno=%d\n", errno);
+  if (npu_get_layout_info(&info) != 0) {
+    printf("Failed to get initialized RKNPU layout errno=%d\n", errno);
     return -1;
   }
-
   memset(layout, 0, sizeof(*layout));
-  layout->gpa_base = info.gpa_base;
-  layout->donate_size = info.donate_size;
-  layout->iova_window_bytes = info.iova_window_size;
-  layout->compute_buffer_bytes = info.compute_buffer_size;
+  layout->gpa_base = info.rknpu.gpa_base;
+  layout->donate_size = info.rknpu.donate_size;
+  layout->iova_window_bytes = info.rknpu.iova_window_size;
+  layout->compute_buffer_bytes = info.rknpu.compute_buffer_size;
 
   if (validate_prealloc_layout(layout, "llm") != 0) {
     return -1;
   }
 
-  if (info.payload_window_size != 0 &&
-      info.payload_window_size != layout->payload_window_bytes) {
-    printf("LLM payload window mismatch: ioctl=0x%llx local=0x%llx\n",
-           (unsigned long long) info.payload_window_size,
-           (unsigned long long) layout->payload_window_bytes);
-  }
-  if (info.payload_total_size != 0 &&
-      info.payload_total_size != layout->payload_total_bytes) {
-    printf("LLM payload total mismatch: ioctl=0x%llx local=0x%llx\n",
-           (unsigned long long) info.payload_total_size,
-           (unsigned long long) layout->payload_total_bytes);
-    return -1;
-  }
-  if (info.reserve_size != 0 && info.reserve_size != layout->reserve_size) {
-    printf("LLM reserve size mismatch: ioctl=0x%llx local=0x%llx\n",
-           (unsigned long long) info.reserve_size,
-           (unsigned long long) layout->reserve_size);
-  }
-  if (info.compute_buffer_gpa != 0 &&
-      info.compute_buffer_gpa != layout->gpa_base + layout->compute_gpa_offset) {
-    printf("LLM compute gpa mismatch: ioctl=0x%llx local=0x%llx\n",
-           (unsigned long long) info.compute_buffer_gpa,
-           (unsigned long long) (layout->gpa_base + layout->compute_gpa_offset));
-  }
-  if (info.layout_version != 0 &&
-      info.layout_version != LLM_LAYOUT_INFO_VERSION) {
-    printf("LLM layout version mismatch: ioctl=%u expected=%u\n",
-           info.layout_version, LLM_LAYOUT_INFO_VERSION);
-  }
-
   layout->payload_entry_count = info.payload_entry_count;
   layout->compute_entry_count = info.compute_entry_count;
-  layout->payload_reload_offset = info.reload_offset;
-  layout->payload_reload_bytes = info.reload_length;
+  layout->payload_reload_offset = info.payload_reload_offset;
+  layout->payload_reload_bytes = info.payload_reload_bytes;
   layout->entry_size = info.entry_size;
-  layout->payload_reload_start_entry = info.reload_start_entry;
-  layout->payload_reload_entry_count = info.reload_entry_count;
+  layout->payload_reload_start_entry = info.payload_reload_start_entry;
+  layout->payload_reload_entry_count = info.payload_reload_entry_count;
 
   if (layout->payload_reload_start_entry > layout->payload_entry_count ||
       layout->payload_reload_entry_count >
@@ -423,7 +523,7 @@ int mem_pool_prepare(size_t pool_size) {
   }
   llm_window_began = 1;
 
-  if (load_prealloc_layout_from_llm(&g_prealloc_layout) != 0) {
+  if (load_prealloc_layout_from_info(&g_prealloc_layout) != 0) {
     cleanup_pool_mapping();
     return -1;
   }
