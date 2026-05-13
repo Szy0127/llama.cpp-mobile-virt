@@ -411,6 +411,7 @@ extern "C" {
     // Decrypt model tensor data previously encrypted by create_enc_model.c.
     // Returns 0 on success.
     LLAMA_API int decrypt_all_tensor(bool);
+    LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t reclaimed_pages);
 
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations

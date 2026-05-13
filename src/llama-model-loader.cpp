@@ -2,6 +2,9 @@
 
 #include "ggml.h"
 #include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
+#if defined(GGML_USE_RKNPU_RE)
+#include "../ggml/src/ggml-rknpu_re/npu_interface.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -44,6 +47,16 @@ static const uint8_t LLAMA_AES128_ECB_KEY[LLAMA_AES_BLOCK_SIZE] = {
 static std::vector<ggml_tensor *> g_encrypted_tensors;
 static bool g_encrypted_tensors_decrypted = false;
 
+struct llama_npu_decrypt_span {
+    ggml_tensor * tensor;
+    uint64_t start;
+    uint64_t end;
+};
+
+static std::vector<llama_npu_decrypt_span> g_npu_decrypt_spans;
+static uint64_t g_npu_payload_end = 0;
+static bool g_npu_decrypt_index_valid = false;
+
 static bool llama_tensor_needs_runtime_decrypt(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->data == nullptr) {
         return false;
@@ -70,6 +83,7 @@ static void llama_remember_encrypted_tensor(ggml_tensor * tensor) {
     }
 
     g_encrypted_tensors.push_back(tensor);
+    g_npu_decrypt_index_valid = false;
 }
 
 static int llama_aes128_ecb_decrypt_inplace(uint8_t * data, size_t len) {
@@ -120,6 +134,84 @@ cleanup:
     EVP_CIPHER_CTX_free(ctx);
     return ret;
 }
+
+static int llama_decrypt_tensor_range(ggml_tensor * tensor, uint64_t offset, uint64_t len) {
+    if (tensor == nullptr || tensor->data == nullptr || len == 0) {
+        return 0;
+    }
+    if (offset > SIZE_MAX || len > SIZE_MAX) {
+        LLAMA_LOG_ERROR("%s: decrypt range too large for tensor '%s' (offset=%" PRIu64 ", len=%" PRIu64 ")\n",
+                __func__, ggml_get_name(tensor), offset, len);
+        return -1;
+    }
+
+    const size_t n_size = ggml_nbytes(tensor);
+    const size_t range_offset = (size_t) offset;
+    const size_t range_len = (size_t) len;
+    if (range_offset > n_size || range_len > n_size - range_offset) {
+        LLAMA_LOG_ERROR("%s: decrypt range exceeds tensor '%s' (offset=%zu, len=%zu, tensor=%zu)\n",
+                __func__, ggml_get_name(tensor), range_offset, range_len, n_size);
+        return -1;
+    }
+    if ((range_offset % LLAMA_AES_BLOCK_SIZE) != 0 || (range_len % LLAMA_AES_BLOCK_SIZE) != 0) {
+        LLAMA_LOG_ERROR("%s: decrypt range is not AES-block aligned for tensor '%s' (offset=%zu, len=%zu)\n",
+                __func__, ggml_get_name(tensor), range_offset, range_len);
+        return -1;
+    }
+
+    return llama_aes128_ecb_decrypt_inplace(static_cast<uint8_t *>(tensor->data) + range_offset, range_len);
+}
+
+#if defined(GGML_USE_RKNPU_RE)
+static int llama_build_npu_decrypt_index() {
+    if (g_npu_decrypt_index_valid) {
+        return 0;
+    }
+
+    g_npu_decrypt_spans.clear();
+    g_npu_payload_end = ggml_rknpu2_get_payload_total_bytes();
+
+    for (ggml_tensor * tensor : g_encrypted_tensors) {
+        if (!llama_tensor_needs_runtime_decrypt(tensor)) {
+            continue;
+        }
+
+        const char * name = ggml_get_name(tensor);
+        if (!llama_is_rknpu_prepack_payload_name(name)) {
+            continue;
+        }
+        if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
+            LLAMA_LOG_ERROR("%s: tensor '%s' is not in host-accessible memory; use --no-mmap and avoid non-host offload for encrypted tensors\n",
+                    __func__, name);
+            return -1;
+        }
+
+        uint64_t start = 0;
+        if (ggml_rknpu2_payload_ptr_to_offset(tensor->data, &start) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to resolve RKNPU payload offset for tensor '%s'\n",
+                    __func__, name);
+            return -1;
+        }
+
+        const size_t n_size = ggml_nbytes(tensor);
+        if ((uint64_t) n_size > UINT64_MAX - start) {
+            LLAMA_LOG_ERROR("%s: RKNPU payload span overflows for tensor '%s'\n", __func__, name);
+            return -1;
+        }
+
+        const uint64_t end = start + (uint64_t) n_size;
+        g_npu_decrypt_spans.push_back({ tensor, start, end });
+    }
+
+    std::sort(g_npu_decrypt_spans.begin(), g_npu_decrypt_spans.end(),
+            [](const llama_npu_decrypt_span & lhs, const llama_npu_decrypt_span & rhs) {
+                return lhs.start < rhs.start;
+            });
+
+    g_npu_decrypt_index_valid = true;
+    return 0;
+}
+#endif
 
 static bool llama_try_get_u32(const gguf_context * meta, const std::string & key, uint32_t & out) {
     const int kid = gguf_find_key(meta, key.c_str());
@@ -239,7 +331,7 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
                     __func__, ggml_get_name(tensor), n_size);
             return -1;
         }
-        printf("[decrypt] %s(0x%lx):0x%lx, %d 0x%lx\n", ggml_get_name(tensor), n_size, 
+        printf("[decrypt] %s(0x%lx):0x%lx, %zu 0x%lx\n", ggml_get_name(tensor), n_size,
                 *static_cast<uint64_t*>(tensor->data), decrypted_count, decrypted_bytes);
 
         decrypted_count++;
@@ -255,6 +347,115 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
     LLAMA_LOG_INFO("%s: decrypted %zu tensors, total size = %8.2f MiB\n",
             __func__, decrypted_count, decrypted_bytes / 1024.0 / 1024.0);
     return 0;
+}
+
+LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t reclaimed_pages) {
+#if !defined(GGML_USE_RKNPU_RE)
+    (void) total_reclaim_pages;
+    (void) reclaimed_pages;
+    return 0;
+#else
+    static constexpr uint64_t page_size = 4096;
+    static constexpr uint64_t reclaim_compute_bytes = 256ULL * 1024ULL * 1024ULL;
+
+    if (total_reclaim_pages <= reclaimed_pages) {
+        return 0;
+    }
+    if (total_reclaim_pages > UINT64_MAX / page_size || reclaimed_pages > UINT64_MAX / page_size) {
+        LLAMA_LOG_ERROR("%s: reclaim page counter overflows byte conversion (total=%" PRIu64 ", reclaimed=%" PRIu64 ")\n",
+                __func__, total_reclaim_pages, reclaimed_pages);
+        return -1;
+    }
+
+    const uint64_t reclaimed_bytes = total_reclaim_pages * page_size;
+    const uint64_t previously_reclaimed_bytes = reclaimed_pages * page_size;
+    const uint64_t redecrypt_suffix_bytes =
+        reclaimed_bytes > reclaim_compute_bytes ? reclaimed_bytes - reclaim_compute_bytes : 0;
+    const uint64_t previous_suffix_bytes =
+        previously_reclaimed_bytes > reclaim_compute_bytes ? previously_reclaimed_bytes - reclaim_compute_bytes : 0;
+
+    if (redecrypt_suffix_bytes <= previous_suffix_bytes) {
+        LLAMA_LOG_INFO("%s: reclaimed %.2f MiB only covers compute buffers; no RKNPU payload decrypt needed\n",
+                __func__, reclaimed_bytes / 1024.0 / 1024.0);
+        return 0;
+    }
+
+    if (llama_build_npu_decrypt_index() != 0) {
+        return -1;
+    }
+    if (g_npu_decrypt_spans.empty() || g_npu_payload_end == 0) {
+        LLAMA_LOG_INFO("%s: no RKNPU payload tensors are indexed for reclaim decrypt\n", __func__);
+        return 0;
+    }
+
+    const uint64_t redecrypt_start = redecrypt_suffix_bytes >= g_npu_payload_end ? 0 : g_npu_payload_end - redecrypt_suffix_bytes;
+    const uint64_t redecrypt_end = previous_suffix_bytes >= g_npu_payload_end ? 0 : g_npu_payload_end - previous_suffix_bytes;
+    if (redecrypt_start >= redecrypt_end) {
+        return 0;
+    }
+
+    auto it = std::upper_bound(g_npu_decrypt_spans.begin(), g_npu_decrypt_spans.end(), redecrypt_start,
+            [](uint64_t offset, const llama_npu_decrypt_span & span) {
+                return offset < span.end;
+            });
+
+    struct timespec start_ts;
+    struct timespec end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
+    size_t decrypted_count = 0;
+    uint64_t decrypted_bytes = 0;
+    uint64_t flush_start = UINT64_MAX;
+    uint64_t flush_end = 0;
+
+    for (; it != g_npu_decrypt_spans.end(); ++it) {
+        if (it->start >= redecrypt_end) {
+            break;
+        }
+
+        const uint64_t part_start = std::max(it->start, redecrypt_start);
+        const uint64_t part_end = std::min(it->end, redecrypt_end);
+        if (part_start >= part_end) {
+            continue;
+        }
+
+        const uint64_t tensor_offset = part_start - it->start;
+        const uint64_t tensor_len = part_end - part_start;
+        if (llama_decrypt_tensor_range(it->tensor, tensor_offset, tensor_len) != 0) {
+            LLAMA_LOG_ERROR("%s: AES-128-ECB reclaim decrypt failed for tensor '%s' (offset=%" PRIu64 ", len=%" PRIu64 ")\n",
+                    __func__, ggml_get_name(it->tensor), tensor_offset, tensor_len);
+            return -1;
+        }
+
+        decrypted_count++;
+        decrypted_bytes += tensor_len;
+        flush_start = std::min(flush_start, part_start);
+        flush_end = std::max(flush_end, part_end);
+    }
+
+    if (decrypted_bytes > 0 && ggml_rknpu2_flush_payload_range(flush_start, flush_end - flush_start) != 0) {
+        LLAMA_LOG_ERROR("%s: failed to flush RKNPU payload reclaim range offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+                __func__, flush_start, flush_end - flush_start);
+        return -1;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+    const long long elapsed_us =
+        (long long) (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL +
+        (long long) (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
+
+    LLAMA_LOG_INFO("%s: reclaimed %.2f MiB, previous %.2f MiB, payload suffix %.2f MiB, decrypted %zu tensors / %.2f MiB, range=[0x%" PRIx64 ",0x%" PRIx64 "), elapsed=%lld us\n",
+            __func__,
+            reclaimed_bytes / 1024.0 / 1024.0,
+            previously_reclaimed_bytes / 1024.0 / 1024.0,
+            redecrypt_suffix_bytes / 1024.0 / 1024.0,
+            decrypted_count,
+            decrypted_bytes / 1024.0 / 1024.0,
+            redecrypt_start,
+            redecrypt_end,
+            elapsed_us);
+    return 0;
+#endif
 }
 
 }
@@ -1442,6 +1643,9 @@ bool llama_model_loader::load_all_data(
     if (size_done == 0) {
         g_encrypted_tensors.clear();
         g_encrypted_tensors_decrypted = false;
+        g_npu_decrypt_spans.clear();
+        g_npu_payload_end = 0;
+        g_npu_decrypt_index_valid = false;
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {

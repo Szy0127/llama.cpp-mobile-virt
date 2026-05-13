@@ -487,6 +487,37 @@ void ggml_rknpu2_reset_compute_used(void) {
   compute_used = 0;
 }
 
+int ggml_rknpu2_payload_ptr_to_offset(const void *ptr, uint64_t *offset) {
+  uintptr_t begin;
+  uintptr_t end;
+  uintptr_t value;
+
+  if (ptr == NULL || offset == NULL || payload_vaddr == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  begin = (uintptr_t) payload_vaddr;
+  end = begin + payload_map_size;
+  value = (uintptr_t) ptr;
+  if (end < begin || value < begin || value >= end) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  *offset = (uint64_t) (value - begin);
+  return 0;
+}
+
+uint64_t ggml_rknpu2_get_payload_used(void) {
+  return (uint64_t) payload_used;
+}
+
+uint64_t ggml_rknpu2_get_payload_total_bytes(void) {
+  pthread_once(&layout_once, init_prealloc_layout);
+  return g_prealloc_layout.payload_total_bytes;
+}
+
 int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {
   struct rknpu_mem_sync sync;
 

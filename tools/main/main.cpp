@@ -68,10 +68,14 @@ struct pkvm_shinfo {
     uint64_t last_reclaim_gfn;
     uint64_t total_reclaim_pages;
     uint64_t total_reclaim_events;
+    uint64_t reclaimed_pages;
+    uint64_t reclaimed_events;
 };
 
 static constexpr uint64_t PKVM_SHINFO_PHYS_ADDR = 0xa0000000ULL - 0x1000ULL;
 static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
+static int                g_pkvm_shinfo_fd      = -1;
+static void             * g_pkvm_shinfo_map     = nullptr;
 
 static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
     pkvm_shinfo dst = {};
@@ -85,34 +89,34 @@ static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
     dst.last_reclaim_gfn    = src->last_reclaim_gfn;
     dst.total_reclaim_pages = src->total_reclaim_pages;
     dst.total_reclaim_events= src->total_reclaim_events;
+    dst.reclaimed_pages     = src->reclaimed_pages;
+    dst.reclaimed_events    = src->reclaimed_events;
     return dst;
 }
 
-static volatile const pkvm_shinfo * map_pkvm_shinfo() {
-    static int fd = -1;
-    static void * map = nullptr;
-
-    if (map != nullptr) {
-        return static_cast<volatile const pkvm_shinfo *>(map);
+static volatile pkvm_shinfo * map_pkvm_shinfo() {
+    if (g_pkvm_shinfo_map != nullptr) {
+        return static_cast<volatile pkvm_shinfo *>(g_pkvm_shinfo_map);
     }
 
-    fd = open("/dev/mem", O_RDONLY | O_SYNC);
-    if (fd < 0) {
+    g_pkvm_shinfo_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (g_pkvm_shinfo_fd < 0) {
         LOG_ERR("%s: open(/dev/mem) failed: errno=%d (%s)\n", __func__, errno, std::strerror(errno));
         return nullptr;
     }
 
-    map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(PKVM_SHINFO_PHYS_ADDR));
-    if (map == MAP_FAILED) {
+    g_pkvm_shinfo_map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+            g_pkvm_shinfo_fd, static_cast<off_t>(PKVM_SHINFO_PHYS_ADDR));
+    if (g_pkvm_shinfo_map == MAP_FAILED) {
         LOG_ERR("%s: mmap(phys=0x%016" PRIx64 ", len=%zu) failed: errno=%d (%s)\n",
                 __func__, PKVM_SHINFO_PHYS_ADDR, PKVM_SHINFO_MAP_SIZE, errno, std::strerror(errno));
-        close(fd);
-        fd = -1;
-        map = nullptr;
+        close(g_pkvm_shinfo_fd);
+        g_pkvm_shinfo_fd = -1;
+        g_pkvm_shinfo_map = nullptr;
         return nullptr;
     }
 
-    return static_cast<volatile const pkvm_shinfo *>(map);
+    return static_cast<volatile pkvm_shinfo *>(g_pkvm_shinfo_map);
 }
 
 static bool read_pkvm_shinfo(pkvm_shinfo & out) {
@@ -125,10 +129,13 @@ static bool read_pkvm_shinfo(pkvm_shinfo & out) {
     return true;
 }
 
-static bool dump_pkvm_shinfo(const char * reason) {
+static bool dump_pkvm_shinfo(const char * reason, pkvm_shinfo * out_info = nullptr) {
     pkvm_shinfo info = {};
     if (!read_pkvm_shinfo(info)) {
         return false;
+    }
+    if (out_info != nullptr) {
+        *out_info = info;
     }
 
     LOG_INF("[pkvm_shinfo] reason=%s phys=0x%016" PRIx64 "\n",
@@ -141,7 +148,9 @@ static bool dump_pkvm_shinfo(const char * reason) {
             info.donated_pages, info.last_reclaim_pages, info.last_reclaim_gfn);
     LOG_INF("[pkvm_shinfo] total_reclaim_pages=%" PRIu64 ", total_reclaim_events=%" PRIu64 "\n",
             info.total_reclaim_pages, info.total_reclaim_events);
-    return info.total_reclaim_pages > 0;
+    LOG_INF("[pkvm_shinfo] reclaimed_pages=%" PRIu64 ", reclaimed_events=%" PRIu64 "\n",
+            info.reclaimed_pages, info.reclaimed_events);
+    return info.total_reclaim_pages > info.reclaimed_pages;
 }
 #endif
 
@@ -1018,12 +1027,27 @@ int main(int argc, char ** argv) {
                         ? chat_add_and_format("user", std::move(buffer))
                         : std::move(buffer);
 
-                    if (dump_pkvm_shinfo("interactive-user-input")){
-                        if (decrypt_all_tensor(true) != 0) {
-                            LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
+                    pkvm_shinfo reclaim_info = {};
+                    if (dump_pkvm_shinfo("interactive-user-input", &reclaim_info)){
+                        if (decrypt_reclaimed_tensors(reclaim_info.total_reclaim_pages, reclaim_info.reclaimed_pages) != 0) {
+                            LOG_ERR("%s : failed to decrypt reclaimed RKNPU tensors\n", __func__);
                             return 1;
                         }
+                        /*
+                        volatile pkvm_shinfo * shinfo = map_pkvm_shinfo();
+                        if (shinfo == nullptr) {
+                            LOG_ERR("%s : failed to map pkvm shinfo for reclaimed_pages update\n", __func__);
+                            return 1;
+                        }
+                        shinfo->reclaimed_pages = reclaim_info.total_reclaim_pages;
+                        shinfo->reclaimed_events = reclaim_info.total_reclaim_events;
+                        */
                     }
+    if (ggml_rknpu2_flush_all_payload() != 0) {
+        LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+        return 1;
+    }
+    LOG("flush all\n");
 
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);

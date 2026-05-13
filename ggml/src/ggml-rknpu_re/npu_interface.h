@@ -15,6 +15,9 @@ void* mem_allocate_compute(size_t size, uint64_t *dma_addr, uint64_t *obj,
 void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle);
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr);
 void ggml_rknpu2_reset_compute_used(void);
+int ggml_rknpu2_payload_ptr_to_offset(const void *ptr, uint64_t *offset);
+uint64_t ggml_rknpu2_get_payload_used(void);
+uint64_t ggml_rknpu2_get_payload_total_bytes(void);
 int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size);
 int ggml_rknpu2_flush_all_payload(void);
 
