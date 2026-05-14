@@ -1376,14 +1376,17 @@ bool llama_model_loader::load_all_data(
                     const uint64_t tensor_end = tensor_offset + n_size;
                     const uint64_t reload_start = npu_layout_info.payload_reload_offset;
                     if (tensor_end <= reload_start) {
+                        /*
                         std::fprintf(stderr,
                                 "[partial-load] skip payload tensor=%s size=%zu\n",
                                 ggml_get_name(cur),
                                 n_size);
+                                */
                         size_done += n_size;
                         continue;
                     }
 
+                    /*
                     fprintf(stderr, "[partial-load] loading payload tensor=%s tensor_base=0x%llx pool_base=0x%llx offset=0x%llx, reload_start=0x%llx size=%zu\n",
                             ggml_get_name(cur),
                             (unsigned long long) tensor_base,
@@ -1391,6 +1394,7 @@ bool llama_model_loader::load_all_data(
                             (unsigned long long) tensor_offset,
                             (unsigned long long) reload_start,
                             n_size);
+                            */
                     const uint64_t load_start = tensor_offset > reload_start ? tensor_offset : reload_start;
                     const uint64_t entry_size = npu_layout_info.entry_size;
 
@@ -1461,12 +1465,14 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        /*
         if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur))) {
             std::fprintf(stderr,
                     "[partial-load] load payload tensor=%s size=%zu\n",
                     ggml_get_name(cur),
                     n_size);
         }
+        */
 
         size_done += n_size;
     }

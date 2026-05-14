@@ -30,6 +30,7 @@
 #include <sys/ioctl.h>
 #include <limits.h>
 #include <assert.h>
+#include <time.h>
 
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
@@ -221,9 +222,16 @@ static int finish_llm_entry(unsigned int entry_index) {
 }
 
 static int finish_llm_window(void) {
+  struct timespec start;
+  struct timespec finish;
+  int ret = 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
   if (ioctl(llm_fd, LLM_IOC_FINISH) < 0) {
     printf("LLM_IOC_FINISH failed errno=%d\n", errno);
-    return -1;
+    ret = -1;
+    goto out;
   }
 
   for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
@@ -232,13 +240,20 @@ static int finish_llm_window(void) {
         g_prealloc_layout.payload_reload_start_entry + i;
 
     if (finish_llm_entry(entry_index) != 0) {
-      return -1;
+      ret = -1;
+      goto out;
     }
   }
 
   printf("LLM_IOC_EXTEND complete %u entries\n",
          g_prealloc_layout.payload_reload_entry_count);
-  return 0;
+
+out:
+  clock_gettime(CLOCK_MONOTONIC, &finish);
+  printf("finish_llm_window cost %.3f ms\n",
+         (finish.tv_sec - start.tv_sec) * 1000.0 +
+         (finish.tv_nsec - start.tv_nsec) / 1000000.0);
+  return ret;
 }
 
 static void cleanup_pool_mapping(void) {
@@ -484,17 +499,29 @@ static int extend_payload_entry(unsigned int entry_index) {
 }
 
 static int ensure_payload_mapped(void) {
+  struct timespec start;
+  struct timespec finish;
+  int ret = 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
   for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
        i++) {
     unsigned int entry_index =
         g_prealloc_layout.payload_reload_start_entry + i;
 
     if (extend_payload_entry( entry_index) != 0) {
-      return -1;
+      ret = -1;
+      goto out;
     }
   }
 
-  return 0;
+out:
+  clock_gettime(CLOCK_MONOTONIC, &finish);
+  printf("ensure_payload_mapped cost %.3f ms\n",
+         (finish.tv_sec - start.tv_sec) * 1000.0 +
+         (finish.tv_nsec - start.tv_nsec) / 1000000.0);
+  return ret;
 }
 
 int mem_pool_prepare(size_t pool_size) {
