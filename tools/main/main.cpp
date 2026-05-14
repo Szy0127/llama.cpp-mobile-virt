@@ -58,45 +58,27 @@ static void rknpu_clear_after_generation(void) {
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 struct pkvm_shinfo {
-    uint32_t magic;
-    uint32_t version;
-    uint64_t seq;
-    uint64_t donate_gpa_start;
-    uint64_t donate_total_pages;
-    uint64_t donated_pages;
-    uint64_t last_reclaim_pages;
-    uint64_t last_reclaim_gfn;
-    uint64_t total_reclaim_pages;
-    uint64_t total_reclaim_events;
     uint64_t reclaimed_pages;
-    uint64_t reclaimed_events;
+    uint64_t compute_entries_state;
 };
 
+static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL    = 0;
+static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
 static constexpr uint64_t PKVM_SHINFO_PHYS_ADDR = 0xa0000000ULL - 0x1000ULL;
 static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
 static int                g_pkvm_shinfo_fd      = -1;
-static void             * g_pkvm_shinfo_map     = nullptr;
+static volatile pkvm_shinfo * g_pkvm_shinfo_va  = nullptr;
 
 static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
     pkvm_shinfo dst = {};
-    dst.magic               = src->magic;
-    dst.version             = src->version;
-    dst.seq                 = src->seq;
-    dst.donate_gpa_start    = src->donate_gpa_start;
-    dst.donate_total_pages  = src->donate_total_pages;
-    dst.donated_pages       = src->donated_pages;
-    dst.last_reclaim_pages  = src->last_reclaim_pages;
-    dst.last_reclaim_gfn    = src->last_reclaim_gfn;
-    dst.total_reclaim_pages = src->total_reclaim_pages;
-    dst.total_reclaim_events= src->total_reclaim_events;
     dst.reclaimed_pages     = src->reclaimed_pages;
-    dst.reclaimed_events    = src->reclaimed_events;
+    dst.compute_entries_state = src->compute_entries_state;
     return dst;
 }
 
 static volatile pkvm_shinfo * map_pkvm_shinfo() {
-    if (g_pkvm_shinfo_map != nullptr) {
-        return static_cast<volatile pkvm_shinfo *>(g_pkvm_shinfo_map);
+    if (g_pkvm_shinfo_va != nullptr) {
+        return g_pkvm_shinfo_va;
     }
 
     g_pkvm_shinfo_fd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -105,18 +87,28 @@ static volatile pkvm_shinfo * map_pkvm_shinfo() {
         return nullptr;
     }
 
-    g_pkvm_shinfo_map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+    void * const map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
             g_pkvm_shinfo_fd, static_cast<off_t>(PKVM_SHINFO_PHYS_ADDR));
-    if (g_pkvm_shinfo_map == MAP_FAILED) {
+    if (map == MAP_FAILED) {
         LOG_ERR("%s: mmap(phys=0x%016" PRIx64 ", len=%zu) failed: errno=%d (%s)\n",
                 __func__, PKVM_SHINFO_PHYS_ADDR, PKVM_SHINFO_MAP_SIZE, errno, std::strerror(errno));
         close(g_pkvm_shinfo_fd);
         g_pkvm_shinfo_fd = -1;
-        g_pkvm_shinfo_map = nullptr;
         return nullptr;
     }
 
-    return static_cast<volatile pkvm_shinfo *>(g_pkvm_shinfo_map);
+    g_pkvm_shinfo_va = static_cast<volatile pkvm_shinfo *>(map);
+    return g_pkvm_shinfo_va;
+}
+
+static bool clear_pkvm_shinfo_reclaimed() {
+    volatile pkvm_shinfo * shinfo = map_pkvm_shinfo();
+    if (shinfo == nullptr) {
+        return false;
+    }
+
+    shinfo->reclaimed_pages = 0;
+    return true;
 }
 
 static bool read_pkvm_shinfo(pkvm_shinfo & out) {
@@ -140,17 +132,12 @@ static bool dump_pkvm_shinfo(const char * reason, pkvm_shinfo * out_info = nullp
 
     LOG_INF("[pkvm_shinfo] reason=%s phys=0x%016" PRIx64 "\n",
             reason, PKVM_SHINFO_PHYS_ADDR);
-    LOG_INF("[pkvm_shinfo] magic=0x%08" PRIx32 ", version=%" PRIu32 ", seq=%" PRIu64 "\n",
-            info.magic, info.version, info.seq);
-    LOG_INF("[pkvm_shinfo] donate_gpa_start=0x%016" PRIx64 ", donate_total_pages=%" PRIu64 "\n",
-            info.donate_gpa_start, info.donate_total_pages);
-    LOG_INF("[pkvm_shinfo] donated_pages=%" PRIu64 ", last_reclaim_pages=%" PRIu64 ", last_reclaim_gfn=%" PRIu64 "\n",
-            info.donated_pages, info.last_reclaim_pages, info.last_reclaim_gfn);
-    LOG_INF("[pkvm_shinfo] total_reclaim_pages=%" PRIu64 ", total_reclaim_events=%" PRIu64 "\n",
-            info.total_reclaim_pages, info.total_reclaim_events);
-    LOG_INF("[pkvm_shinfo] reclaimed_pages=%" PRIu64 ", reclaimed_events=%" PRIu64 "\n",
-            info.reclaimed_pages, info.reclaimed_events);
-    return info.total_reclaim_pages > info.reclaimed_pages;
+    LOG_INF("[pkvm_shinfo] reclaimed_pages=%" PRIu64 ", compute_entries_state=%" PRIu64 "%s\n",
+            info.reclaimed_pages,
+            info.compute_entries_state,
+            info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED ? " (reclaimed)" :
+            info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL ? " (normal)" : " (unknown)");
+    return info.reclaimed_pages > 0;
 }
 #endif
 
@@ -1029,19 +1016,17 @@ int main(int argc, char ** argv) {
 
                     pkvm_shinfo reclaim_info = {};
                     if (dump_pkvm_shinfo("interactive-user-input", &reclaim_info)){
-                        if (decrypt_reclaimed_tensors(reclaim_info.total_reclaim_pages, reclaim_info.reclaimed_pages) != 0) {
+                        const int decrypt_result = decrypt_reclaimed_tensors(
+                                reclaim_info.reclaimed_pages, 0);
+                        const bool clear_result = clear_pkvm_shinfo_reclaimed();
+                        if (decrypt_result != 0) {
                             LOG_ERR("%s : failed to decrypt reclaimed RKNPU tensors\n", __func__);
                             return 1;
                         }
-                        /*
-                        volatile pkvm_shinfo * shinfo = map_pkvm_shinfo();
-                        if (shinfo == nullptr) {
-                            LOG_ERR("%s : failed to map pkvm shinfo for reclaimed_pages update\n", __func__);
+                        if (!clear_result) {
+                            LOG_ERR("%s : failed to clear pkvm shinfo reclaimed info\n", __func__);
                             return 1;
                         }
-                        shinfo->reclaimed_pages = reclaim_info.total_reclaim_pages;
-                        shinfo->reclaimed_events = reclaim_info.total_reclaim_events;
-                        */
                     }
     if (ggml_rknpu2_flush_all_payload() != 0) {
         LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
