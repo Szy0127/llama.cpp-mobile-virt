@@ -64,9 +64,9 @@ struct pkvm_shinfo {
 
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL    = 0;
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
-static constexpr uint64_t PKVM_SHINFO_PHYS_ADDR = 0xa0000000ULL - 0x1000ULL;
 static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
 static int                g_pkvm_shinfo_fd      = -1;
+static uint64_t           g_pkvm_shinfo_phys_addr = 0;
 static volatile pkvm_shinfo * g_pkvm_shinfo_va  = nullptr;
 
 static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
@@ -81,6 +81,19 @@ static volatile pkvm_shinfo * map_pkvm_shinfo() {
         return g_pkvm_shinfo_va;
     }
 
+#if defined(GGML_USE_RKNPU_RE)
+    if (g_pkvm_shinfo_phys_addr == 0) {
+        if (ggml_rknpu2_get_shinfo_phys_addr(&g_pkvm_shinfo_phys_addr) != 0) {
+            LOG_ERR("%s: failed to get pkvm shinfo phys addr: errno=%d (%s)\n",
+                    __func__, errno, std::strerror(errno));
+            return nullptr;
+        }
+    }
+#else
+    LOG_ERR("%s: RKNPU backend is not enabled; cannot get pkvm shinfo phys addr\n", __func__);
+    return nullptr;
+#endif
+
     g_pkvm_shinfo_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (g_pkvm_shinfo_fd < 0) {
         LOG_ERR("%s: open(/dev/mem) failed: errno=%d (%s)\n", __func__, errno, std::strerror(errno));
@@ -88,10 +101,10 @@ static volatile pkvm_shinfo * map_pkvm_shinfo() {
     }
 
     void * const map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
-            g_pkvm_shinfo_fd, static_cast<off_t>(PKVM_SHINFO_PHYS_ADDR));
+            g_pkvm_shinfo_fd, static_cast<off_t>(g_pkvm_shinfo_phys_addr));
     if (map == MAP_FAILED) {
         LOG_ERR("%s: mmap(phys=0x%016" PRIx64 ", len=%zu) failed: errno=%d (%s)\n",
-                __func__, PKVM_SHINFO_PHYS_ADDR, PKVM_SHINFO_MAP_SIZE, errno, std::strerror(errno));
+                __func__, g_pkvm_shinfo_phys_addr, PKVM_SHINFO_MAP_SIZE, errno, std::strerror(errno));
         close(g_pkvm_shinfo_fd);
         g_pkvm_shinfo_fd = -1;
         return nullptr;
@@ -131,7 +144,7 @@ static bool dump_pkvm_shinfo(const char * reason, pkvm_shinfo * out_info = nullp
     }
 
     LOG_INF("[pkvm_shinfo] reason=%s phys=0x%016" PRIx64 "\n",
-            reason, PKVM_SHINFO_PHYS_ADDR);
+            reason, g_pkvm_shinfo_phys_addr);
     LOG_INF("[pkvm_shinfo] reclaimed_pages=%" PRIu64 ", compute_entries_state=%" PRIu64 "%s\n",
             info.reclaimed_pages,
             info.compute_entries_state,
@@ -849,7 +862,7 @@ int main(int argc, char ** argv) {
                 const std::string token_str = common_token_to_piece(ctx, id, params.special);
 
                 // Console/Stream Output
-                LOG("#%s#", token_str.c_str());
+                LOG("#%s", token_str.c_str());
 
                 // Record Displayed Tokens To Log
                 // Note: Generated tokens are created one by one hence this check

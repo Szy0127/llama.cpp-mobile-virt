@@ -38,11 +38,7 @@
 #include <pthread.h>
 
 #define NPU_DEVICE "/dev/dri/card0"
-#define PREALLOC_GPA_BASE_DEFAULT      0xa0000000ULL
 #define PAGE_SIZE_BYTES                0x1000UL
-#define DONATE_BYTES_DEFAULT           (4ULL << 30)
-#define IOVA_WINDOW_BYTES_DEFAULT      (4ULL << 30)
-#define COMPUTE_BUFFER_BYTES_DEFAULT   (256ULL << 20)
 
 struct npu_prealloc_layout {
   uint64_t gpa_base;
@@ -66,6 +62,7 @@ static size_t compute_map_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
+static int g_prealloc_layout_ready = 0;
 static pthread_once_t fd_once = PTHREAD_ONCE_INIT;
 static pthread_once_t layout_once = PTHREAD_ONCE_INIT;
 
@@ -111,26 +108,6 @@ static void cleanup_dev_mem_mapping(void) {
     close(compute_mem_fd);
     compute_mem_fd = -1;
   }
-}
-
-static uint64_t parse_env_u64(const char *name, uint64_t fallback) {
-  const char *value = getenv(name);
-  char *end = NULL;
-  unsigned long long parsed;
-
-  if (value == NULL || value[0] == '\0') {
-    return fallback;
-  }
-
-  errno = 0;
-  parsed = strtoull(value, &end, 0);
-  if (errno != 0 || end == value || (end && *end != '\0')) {
-    printf("Invalid value for %s: %s, fallback=0x%llx\n",
-           name, value, (unsigned long long) fallback);
-    return fallback;
-  }
-
-  return (uint64_t) parsed;
 }
 
 static void fd_init(void) {
@@ -256,48 +233,31 @@ static int load_prealloc_layout_from_driver(struct npu_prealloc_layout *layout) 
   return 0;
 }
 
-static void init_prealloc_layout_from_env(struct npu_prealloc_layout *layout) {
-  memset(layout, 0, sizeof(*layout));
-  layout->gpa_base = parse_env_u64("RKNPU_GPA_BASE", PREALLOC_GPA_BASE_DEFAULT);
-  layout->donate_size = parse_env_u64("RKNPU_DONATE_SIZE", DONATE_BYTES_DEFAULT);
-  layout->donate_size =
-      parse_env_u64("RKNPU_DONATE_MB", layout->donate_size >> 20) << 20;
-  layout->iova_window_bytes =
-      parse_env_u64("RKNPU_IOVA_WINDOW_SIZE", IOVA_WINDOW_BYTES_DEFAULT);
-  layout->iova_window_bytes =
-      parse_env_u64("RKNPU_IOVA_WINDOW_MB", layout->iova_window_bytes >> 20) << 20;
-  layout->compute_buffer_bytes =
-      parse_env_u64("RKNPU_COMPUTE_BUFFER_SIZE", COMPUTE_BUFFER_BYTES_DEFAULT);
-  layout->compute_buffer_bytes =
-      parse_env_u64("RKNPU_COMPUTE_BUFFER_MB",
-                    layout->compute_buffer_bytes >> 20) << 20;
+static void init_prealloc_layout(void) {
+  memset(&g_prealloc_layout, 0, sizeof(g_prealloc_layout));
+  g_prealloc_layout_ready = 0;
 
-  if (validate_prealloc_layout(layout, "env") != 0) {
-    memset(layout, 0, sizeof(*layout));
-    layout->gpa_base = PREALLOC_GPA_BASE_DEFAULT;
-    layout->donate_size = DONATE_BYTES_DEFAULT;
-    layout->iova_window_bytes = IOVA_WINDOW_BYTES_DEFAULT;
-    layout->compute_buffer_bytes = COMPUTE_BUFFER_BYTES_DEFAULT;
-    if (validate_prealloc_layout(layout, "defaults") != 0) {
-      abort();
-    }
-    //log_prealloc_layout("defaults", layout);
+  if (load_prealloc_layout_from_driver(&g_prealloc_layout) == 0) {
+    g_prealloc_layout_ready = 1;
     return;
   }
 
-  //log_prealloc_layout("env", layout);
+  printf("Failed to load RKNPU prealloc layout from driver\n");
 }
 
-static void init_prealloc_layout(void) {
-  if (load_prealloc_layout_from_driver(&g_prealloc_layout) == 0) {
-    return;
+static int ensure_prealloc_layout_loaded(void) {
+  pthread_once(&layout_once, init_prealloc_layout);
+  if (!g_prealloc_layout_ready) {
+    errno = ENODEV;
+    return -1;
   }
-
-  init_prealloc_layout_from_env(&g_prealloc_layout);
+  return 0;
 }
 
 static int ensure_dev_mem_open(void) {
-  pthread_once(&layout_once, init_prealloc_layout);
+  if (ensure_prealloc_layout_loaded() != 0) {
+    return -1;
+  }
 
   if (payload_mem_fd >= 0 && compute_mem_fd >= 0 &&
       payload_vaddr != NULL && compute_vaddr != NULL) {
@@ -514,8 +474,29 @@ uint64_t ggml_rknpu2_get_payload_used(void) {
 }
 
 uint64_t ggml_rknpu2_get_payload_total_bytes(void) {
-  pthread_once(&layout_once, init_prealloc_layout);
+  if (ensure_prealloc_layout_loaded() != 0) {
+    return 0;
+  }
   return g_prealloc_layout.payload_total_bytes;
+}
+
+int ggml_rknpu2_get_shinfo_phys_addr(uint64_t *phys_addr) {
+  if (phys_addr == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (ensure_prealloc_layout_loaded() != 0) {
+    return -1;
+  }
+
+  if (g_prealloc_layout.gpa_base < PAGE_SIZE_BYTES) {
+    errno = ERANGE;
+    return -1;
+  }
+
+  *phys_addr = g_prealloc_layout.gpa_base - PAGE_SIZE_BYTES;
+  return 0;
 }
 
 int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {

@@ -18,6 +18,7 @@ void ggml_rknpu2_reset_compute_used(void);
 int ggml_rknpu2_payload_ptr_to_offset(const void *ptr, uint64_t *offset);
 uint64_t ggml_rknpu2_get_payload_used(void);
 uint64_t ggml_rknpu2_get_payload_total_bytes(void);
+int ggml_rknpu2_get_shinfo_phys_addr(uint64_t *phys_addr);
 int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size);
 int ggml_rknpu2_flush_all_payload(void);
 
