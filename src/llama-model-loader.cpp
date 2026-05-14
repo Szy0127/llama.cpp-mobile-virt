@@ -1407,6 +1407,13 @@ bool llama_model_loader::load_all_data(
 
                     uint64_t read_start = load_start;
                     while (read_start < tensor_end) {
+                        const uint64_t finished_payload = mem_pool_finished_payload_offset();
+                        if (read_start < finished_payload) {
+                            throw std::runtime_error(format("%s: RKNPU payload load is not monotonic; tensor '%s' wants offset 0x%llx after finish watermark 0x%llx",
+                                        __func__, ggml_get_name(cur),
+                                        (unsigned long long) read_start,
+                                        (unsigned long long) finished_payload));
+                        }
                         const uint64_t entry_end = ((read_start / entry_size) + 1) * entry_size;
                         const uint64_t read_end = entry_end < tensor_end ? entry_end : tensor_end;
                         const size_t chunk_offset = static_cast<size_t>(read_start - tensor_offset);
@@ -1415,10 +1422,13 @@ bool llama_model_loader::load_all_data(
                         file->read_raw((char *) cur->data + chunk_offset, chunk_size);
                         read_start = read_end;
                         if (read_start % entry_size == 0) {
-                            // TODO: we have fully loaded one entry, time to submit it.
-                            // TODO: 同时要思考下最后一个tensor加载完后，该如何submit?
+                            if (mem_pool_finish_payload_until(read_start) != 0) {
+                                throw std::runtime_error(format("%s: failed to finish RKNPU payload entry at offset 0x%llx",
+                                            __func__, (unsigned long long) read_start));
+                            }
                         }
                     }
+                    fully_loaded = false;
                 } else {
                     // non-RKNPU tensors loading
                     file->seek(weight->offs, SEEK_SET);
@@ -1506,6 +1516,10 @@ bool llama_model_loader::load_all_data(
                 "[partial-load] summary: actual_loaded_payload_tensors=%zu actual_loaded_payload_bytes=%zx\n",
                 rknpu_payload_tensors_loaded,
                 rknpu_payload_bytes_loaded);
+
+        if (mem_pool_finish_all_payload() != 0) {
+            throw std::runtime_error(format("%s: failed to finish final RKNPU payload entries", __func__));
+        }
 
         if (!use_mmap) {
             for (const auto & file : files) {

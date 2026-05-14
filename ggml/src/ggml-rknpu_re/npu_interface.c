@@ -70,6 +70,8 @@ static size_t pool_map_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
+static unsigned int g_payload_finish_next_entry = 0;
+static int g_payload_pipeline_complete = 0;
 static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
 static struct npu_layout_info g_npu_layout_info;
 static int g_npu_layout_info_initialized = 0;
@@ -221,6 +223,62 @@ static int finish_llm_entry(unsigned int entry_index) {
   return 0;
 }
 
+static int finish_llm_entries_until(unsigned int end_entry) {
+  const unsigned int reload_start =
+      g_prealloc_layout.payload_reload_start_entry;
+  const unsigned int reload_end =
+      reload_start + g_prealloc_layout.payload_reload_entry_count;
+
+  if (end_entry > reload_end) {
+    end_entry = reload_end;
+  }
+  if (g_payload_finish_next_entry < reload_start) {
+    g_payload_finish_next_entry = reload_start;
+  }
+
+  while (g_payload_finish_next_entry < end_entry) {
+    if (finish_llm_entry(g_payload_finish_next_entry) != 0) {
+      return -1;
+    }
+    g_payload_finish_next_entry++;
+  }
+
+  return 0;
+}
+
+int mem_pool_finish_payload_until(uint64_t payload_end) {
+  if (llm_fd < 0 || !llm_window_began || g_prealloc_layout.entry_size == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  const uint64_t reload_start = g_prealloc_layout.payload_reload_offset;
+  const uint64_t reload_end =
+      reload_start + g_prealloc_layout.payload_reload_bytes;
+  if (payload_end <= reload_start) {
+    return 0;
+  }
+  if (payload_end > reload_end) {
+    payload_end = reload_end;
+  }
+
+  unsigned int end_entry =
+      (unsigned int)(payload_end / g_prealloc_layout.entry_size);
+  return finish_llm_entries_until(end_entry);
+}
+
+int mem_pool_finish_all_payload(void) {
+  const unsigned int reload_end =
+      g_prealloc_layout.payload_reload_start_entry +
+      g_prealloc_layout.payload_reload_entry_count;
+
+  if (finish_llm_entries_until(reload_end) != 0) {
+    return -1;
+  }
+  g_payload_pipeline_complete = 1;
+  return 0;
+}
+
 static int finish_llm_window(void) {
   struct timespec start;
   struct timespec finish;
@@ -234,15 +292,9 @@ static int finish_llm_window(void) {
     goto out;
   }
 
-  for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
-       i++) {
-    unsigned int entry_index =
-        g_prealloc_layout.payload_reload_start_entry + i;
-
-    if (finish_llm_entry(entry_index) != 0) {
-      ret = -1;
-      goto out;
-    }
+  if (mem_pool_finish_all_payload() != 0) {
+    ret = -1;
+    goto out;
   }
 
   printf("LLM_IOC_EXTEND complete %u entries\n",
@@ -261,8 +313,10 @@ static void cleanup_pool_mapping(void) {
     munmap(pool_vaddr, pool_map_size);
   }
 
-  if (llm_fd >= 0 && llm_window_began) {
+  if (llm_fd >= 0 && llm_window_began && g_payload_pipeline_complete) {
     finish_llm_window();
+  } else if (llm_fd >= 0 && llm_window_began) {
+    printf("LLM pipeline closed before all payload entries finished; kernel will publish abort\n");
   }
 
   pool_vaddr = NULL;
@@ -270,6 +324,8 @@ static void cleanup_pool_mapping(void) {
   payload_used = 0;
   compute_used = 0;
   llm_window_began = 0;
+  g_payload_finish_next_entry = 0;
+  g_payload_pipeline_complete = 0;
 
   if (llm_fd >= 0) {
     close(llm_fd);
@@ -462,6 +518,14 @@ int mem_payload_mapped_slice(const void *addr, size_t size,
   return 1;
 }
 
+uint64_t mem_pool_finished_payload_offset(void) {
+  if (g_prealloc_layout.entry_size == 0) {
+    return 0;
+  }
+
+  return (uint64_t)g_payload_finish_next_entry * g_prealloc_layout.entry_size;
+}
+
 static void npu_fd_init(void) {
   npu_fd = npu_open();
   printf("%s %d: npu_fd %d\n", __func__, __LINE__, npu_fd);
@@ -608,10 +672,17 @@ int mem_pool_prepare(size_t pool_size) {
 
   pool_vaddr = map;
   pool_map_size = map_size;
+  g_payload_finish_next_entry = g_prealloc_layout.payload_reload_start_entry;
+  g_payload_pipeline_complete = 0;
 
   if (ensure_payload_mapped() != 0) {
     cleanup_pool_mapping();
     return -1;
+  }
+
+  if (g_prealloc_layout.payload_reload_bytes > 0) {
+    memset((char *)pool_vaddr + g_prealloc_layout.payload_reload_offset, 0,
+           (size_t)g_prealloc_layout.payload_reload_bytes);
   }
 
   memset(&info, 0, sizeof(info));

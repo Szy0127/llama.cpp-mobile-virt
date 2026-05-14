@@ -32,6 +32,9 @@ int mem_pool_prepare(size_t pool_size);
 void* mem_pool_vaddr(void);
 int mem_payload_mapped_slice(const void *addr, size_t size,
                              size_t *slice_offset, size_t *slice_size);
+uint64_t mem_pool_finished_payload_offset(void);
+int mem_pool_finish_payload_until(uint64_t payload_end);
+int mem_pool_finish_all_payload(void);
 
 int npu_layout_info_init(void);
 int npu_get_layout_info(struct npu_layout_info *info);
