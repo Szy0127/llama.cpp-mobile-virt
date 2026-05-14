@@ -1755,6 +1755,11 @@ static std::mutex g_weight_prepack_mtx;
 static std::mutex g_offline_prepack_mtx;
 static std::unordered_map<std::string, rknpu_offline_prepack_blob> g_offline_prepack_registry;
 static std::unordered_map<rknpu_weight_prepack_key, std::shared_ptr<rknpu_weight_prepack_cache>, rknpu_weight_prepack_key_hash> g_weight_prepack_cache;
+static std::atomic<ggml_rknpu2_payload_ready_callback> g_payload_ready_callback{nullptr};
+
+extern "C" void ggml_rknpu2_set_payload_ready_callback(ggml_rknpu2_payload_ready_callback cb) {
+    g_payload_ready_callback.store(cb, std::memory_order_release);
+}
 
 void ggml_rknpu2_clear_offline_prepack_registry(void) {
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
@@ -1818,6 +1823,20 @@ static const rknpu_offline_prepack_blob * ggml_rknpu2_find_offline_prepack(const
         return nullptr;
     }
     return &it->second;
+}
+
+static int ggml_rknpu2_ensure_offline_payload_ready(const rknpu_offline_prepack_blob * offline) {
+    if (offline == nullptr || offline->payload_tensor == nullptr || offline->payload_tensor->data == nullptr) {
+        return -1;
+    }
+
+    ggml_rknpu2_payload_ready_callback cb =
+        g_payload_ready_callback.load(std::memory_order_acquire);
+    if (cb == nullptr) {
+        return 0;
+    }
+
+    return cb(offline->payload_tensor->data, offline->payload_size);
 }
 
 static std::atomic<uint64_t> g_weight_prepack_lookup_cnt{0};
@@ -1960,6 +1979,13 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
     rknn_tensor_type tensor_type) {
 
     g_weight_prepack_lookup_cnt.fetch_add(1);
+    const rknpu_offline_prepack_blob * offline = ggml_rknpu2_find_offline_prepack(src0->name);
+    GGML_ASSERT(offline);
+    if (ggml_rknpu2_ensure_offline_payload_ready(offline) != 0) {
+        GGML_LOG_ERROR("%s: payload is not ready for tensor %s\n", __func__, src0->name);
+        GGML_ABORT("%s: payload is not ready for tensor %s", __func__, src0->name);
+    }
+
     rknpu_weight_prepack_key cache_key = { src0, k, n, K, N, tensor_type };
     {
         std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);

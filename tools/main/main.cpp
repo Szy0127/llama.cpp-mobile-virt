@@ -60,10 +60,24 @@ static void rknpu_clear_after_generation(void) {
 struct pkvm_shinfo {
     uint64_t reclaimed_pages;
     uint64_t compute_entries_state;
+    uint32_t version;
+    uint32_t seq;
+    uint64_t pipeline_epoch;
+    uint64_t pipeline_entry_size;
+    uint64_t pipeline_reload_offset;
+    uint64_t pipeline_reload_length;
+    uint32_t pipeline_payload_entry_count;
+    uint32_t pipeline_reload_start_entry;
+    uint32_t pipeline_reload_entry_count;
+    uint32_t pipeline_ready_count;
+    int32_t pipeline_error;
+    uint32_t pipeline_flags;
+    uint8_t pipeline_block_state[512];
 };
 
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL    = 0;
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
+static constexpr uint32_t PKVM_SHINFO_VERSION_PIPELINE_V2       = 2;
 static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
 static int                g_pkvm_shinfo_fd      = -1;
 static uint64_t           g_pkvm_shinfo_phys_addr = 0;
@@ -73,6 +87,18 @@ static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
     pkvm_shinfo dst = {};
     dst.reclaimed_pages     = src->reclaimed_pages;
     dst.compute_entries_state = src->compute_entries_state;
+    dst.version = src->version;
+    dst.seq = src->seq;
+    dst.pipeline_epoch = src->pipeline_epoch;
+    dst.pipeline_entry_size = src->pipeline_entry_size;
+    dst.pipeline_reload_offset = src->pipeline_reload_offset;
+    dst.pipeline_reload_length = src->pipeline_reload_length;
+    dst.pipeline_payload_entry_count = src->pipeline_payload_entry_count;
+    dst.pipeline_reload_start_entry = src->pipeline_reload_start_entry;
+    dst.pipeline_reload_entry_count = src->pipeline_reload_entry_count;
+    dst.pipeline_ready_count = src->pipeline_ready_count;
+    dst.pipeline_error = src->pipeline_error;
+    dst.pipeline_flags = src->pipeline_flags;
     return dst;
 }
 
@@ -150,6 +176,17 @@ static bool dump_pkvm_shinfo(const char * reason, pkvm_shinfo * out_info = nullp
             info.compute_entries_state,
             info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED ? " (reclaimed)" :
             info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL ? " (normal)" : " (unknown)");
+    if (info.version >= PKVM_SHINFO_VERSION_PIPELINE_V2) {
+        LOG_INF("[pkvm_shinfo] pipeline epoch=%" PRIu64 " ready=%u/%u reload=%u+%u error=%d flags=0x%x\n",
+                info.pipeline_epoch,
+                info.pipeline_ready_count,
+                info.pipeline_reload_entry_count,
+                info.pipeline_reload_start_entry,
+                info.pipeline_reload_entry_count,
+                info.pipeline_error,
+                info.pipeline_flags);
+        return false;
+    }
     return info.reclaimed_pages > 0;
 }
 #endif
@@ -1041,7 +1078,14 @@ int main(int argc, char ** argv) {
                         : std::move(buffer);
 
                     pkvm_shinfo reclaim_info = {};
-                    if (dump_pkvm_shinfo("interactive-user-input", &reclaim_info)){
+                    const bool has_legacy_reclaim = dump_pkvm_shinfo("interactive-user-input", &reclaim_info);
+                    if (reclaim_info.version >= PKVM_SHINFO_VERSION_PIPELINE_V2 &&
+                            reclaim_info.pipeline_epoch != 0) {
+                        if (llama_pipeline_sync_rknpu_payloads(true) != 0) {
+                            LOG_ERR("%s : failed to sync/decrypt pipeline RKNPU payloads\n", __func__);
+                            return 1;
+                        }
+                    } else if (has_legacy_reclaim) {
                         const int decrypt_result = decrypt_reclaimed_tensors(
                                 reclaim_info.reclaimed_pages, 0);
                         const bool clear_result = clear_pkvm_shinfo_reclaimed();
