@@ -1418,6 +1418,10 @@ bool llama_model_loader::load_all_data(
                         const uint64_t read_end = entry_end < tensor_end ? entry_end : tensor_end;
                         const size_t chunk_offset = static_cast<size_t>(read_start - tensor_offset);
                         const size_t chunk_size = static_cast<size_t>(read_end - read_start);
+                        if (mem_pool_ensure_payload_mapped_until(read_end) != 0) {
+                            throw std::runtime_error(format("%s: failed to map RKNPU payload entry at offset 0x%llx",
+                                        __func__, (unsigned long long) read_end));
+                        }
                         file->seek(weight->offs + chunk_offset, SEEK_SET);
                         file->read_raw((char *) cur->data + chunk_offset, chunk_size);
                         read_start = read_end;

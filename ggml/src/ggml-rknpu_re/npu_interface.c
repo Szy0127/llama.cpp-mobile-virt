@@ -70,6 +70,7 @@ static size_t pool_map_size = 0;
 static size_t payload_used = 0;
 static size_t compute_used = 0;
 static struct npu_prealloc_layout g_prealloc_layout;
+static unsigned int g_payload_map_next_entry = 0;
 static unsigned int g_payload_finish_next_entry = 0;
 static int g_payload_pipeline_complete = 0;
 static pthread_once_t npu_fd_once = PTHREAD_ONCE_INIT;
@@ -78,6 +79,7 @@ static int g_npu_layout_info_initialized = 0;
 
 int npu_open(void);
 static void npu_fd_init(void);
+int mem_pool_ensure_payload_mapped_until(uint64_t payload_end);
 
 static void log_npu_layout_info(const char *source,
                                 const struct npu_layout_info *info) {
@@ -219,6 +221,7 @@ static int finish_llm_entry(unsigned int entry_index) {
            entry_index, errno);
     return -1;
   }
+  printf("extend block:%d success\n", entry_index);
 
   return 0;
 }
@@ -237,6 +240,13 @@ static int finish_llm_entries_until(unsigned int end_entry) {
   }
 
   while (g_payload_finish_next_entry < end_entry) {
+    const uint64_t entry_end =
+        ((uint64_t)g_payload_finish_next_entry + 1) *
+        g_prealloc_layout.entry_size;
+
+    if (mem_pool_ensure_payload_mapped_until(entry_end) != 0) {
+      return -1;
+    }
     if (finish_llm_entry(g_payload_finish_next_entry) != 0) {
       return -1;
     }
@@ -324,6 +334,7 @@ static void cleanup_pool_mapping(void) {
   payload_used = 0;
   compute_used = 0;
   llm_window_began = 0;
+  g_payload_map_next_entry = 0;
   g_payload_finish_next_entry = 0;
   g_payload_pipeline_complete = 0;
 
@@ -562,30 +573,45 @@ static int extend_payload_entry(unsigned int entry_index) {
   return 0;
 }
 
-static int ensure_payload_mapped(void) {
-  struct timespec start;
-  struct timespec finish;
-  int ret = 0;
-
-  clock_gettime(CLOCK_MONOTONIC, &start);
-
-  for (unsigned int i = 0; i < g_prealloc_layout.payload_reload_entry_count;
-       i++) {
-    unsigned int entry_index =
-        g_prealloc_layout.payload_reload_start_entry + i;
-
-    if (extend_payload_entry( entry_index) != 0) {
-      ret = -1;
-      goto out;
-    }
+int mem_pool_ensure_payload_mapped_until(uint64_t payload_end) {
+  if (llm_fd < 0 || !llm_window_began || g_prealloc_layout.entry_size == 0) {
+    errno = EINVAL;
+    return -1;
   }
 
-out:
-  clock_gettime(CLOCK_MONOTONIC, &finish);
-  printf("ensure_payload_mapped cost %.3f ms\n",
-         (finish.tv_sec - start.tv_sec) * 1000.0 +
-         (finish.tv_nsec - start.tv_nsec) / 1000000.0);
-  return ret;
+  const unsigned int reload_start =
+      g_prealloc_layout.payload_reload_start_entry;
+  const unsigned int reload_end =
+      reload_start + g_prealloc_layout.payload_reload_entry_count;
+  const uint64_t reload_start_offset = g_prealloc_layout.payload_reload_offset;
+  const uint64_t reload_end_offset =
+      reload_start_offset + g_prealloc_layout.payload_reload_bytes;
+
+  if (payload_end <= reload_start_offset) {
+    return 0;
+  }
+  if (payload_end > reload_end_offset) {
+    payload_end = reload_end_offset;
+  }
+  if (g_payload_map_next_entry < reload_start) {
+    g_payload_map_next_entry = reload_start;
+  }
+
+  unsigned int end_entry =
+      (unsigned int)((payload_end + g_prealloc_layout.entry_size - 1) /
+                     g_prealloc_layout.entry_size);
+  if (end_entry > reload_end) {
+    end_entry = reload_end;
+  }
+
+  while (g_payload_map_next_entry < end_entry) {
+    if (extend_payload_entry(g_payload_map_next_entry) != 0) {
+      return -1;
+    }
+    g_payload_map_next_entry++;
+  }
+
+  return 0;
 }
 
 int mem_pool_prepare(size_t pool_size) {
@@ -672,18 +698,9 @@ int mem_pool_prepare(size_t pool_size) {
 
   pool_vaddr = map;
   pool_map_size = map_size;
+  g_payload_map_next_entry = g_prealloc_layout.payload_reload_start_entry;
   g_payload_finish_next_entry = g_prealloc_layout.payload_reload_start_entry;
   g_payload_pipeline_complete = 0;
-
-  if (ensure_payload_mapped() != 0) {
-    cleanup_pool_mapping();
-    return -1;
-  }
-
-  if (g_prealloc_layout.payload_reload_bytes > 0) {
-    memset((char *)pool_vaddr + g_prealloc_layout.payload_reload_offset, 0,
-           (size_t)g_prealloc_layout.payload_reload_bytes);
-  }
 
   memset(&info, 0, sizeof(info));
   ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
