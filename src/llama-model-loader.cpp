@@ -353,9 +353,8 @@ static int llama_pipeline_decrypt_entry_locked(const llama_pipeline_shinfo & inf
 
     const uint64_t entry_start = (uint64_t) entry * info.pipeline_entry_size;
     const uint64_t entry_end = entry_start + info.pipeline_entry_size;
-    uint64_t flush_start = UINT64_MAX;
-    uint64_t flush_end = 0;
     uint64_t decrypted_bytes = 0;
+    size_t decrypted_tensors = 0;
 
     auto it = std::upper_bound(g_npu_decrypt_spans.begin(), g_npu_decrypt_spans.end(), entry_start,
             [](uint64_t offset, const llama_npu_decrypt_span & span) {
@@ -381,22 +380,20 @@ static int llama_pipeline_decrypt_entry_locked(const llama_pipeline_shinfo & inf
             return -1;
         }
 
-        flush_start = std::min(flush_start, part_start);
-        flush_end = std::max(flush_end, part_end);
-        decrypted_bytes += tensor_len;
-    }
+        if (ggml_rknpu2_flush_payload_range(part_start, tensor_len) != 0) {
+            LLAMA_LOG_ERROR("%s: flush failed for entry=%u tensor='%s' range=[0x%" PRIx64 ",0x%" PRIx64 ") errno=%d\n",
+                    __func__, entry, ggml_get_name(it->tensor), part_start, part_end, errno);
+            return -1;
+        }
 
-    if (decrypted_bytes > 0 &&
-        ggml_rknpu2_flush_payload_range(flush_start, flush_end - flush_start) != 0) {
-        LLAMA_LOG_ERROR("%s: flush failed for entry=%u range=[0x%" PRIx64 ",0x%" PRIx64 ") errno=%d\n",
-                __func__, entry, flush_start, flush_end, errno);
-        return -1;
+        decrypted_bytes += tensor_len;
+        decrypted_tensors++;
     }
 
     if (decrypted_bytes > 0) {
-        LLAMA_LOG_INFO("%s: pipeline entry=%u decrypted %.2f MiB range=[0x%" PRIx64 ",0x%" PRIx64 ")\n",
-                __func__, entry, decrypted_bytes / 1024.0 / 1024.0,
-                flush_start, flush_end);
+        LLAMA_LOG_INFO("%s: pipeline entry=%u decrypted %zu tensor spans / %.2f MiB\n",
+                __func__, entry, decrypted_tensors,
+                decrypted_bytes / 1024.0 / 1024.0);
     }
 
     llama_pipeline_store_entry_stage(entry, PKVM_PIPELINE_STAGE_GUEST_DECRYPT,
@@ -785,6 +782,16 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
                     __func__, ggml_get_name(tensor), n_size);
             return -1;
         }
+
+#if defined(GGML_USE_RKNPU_RE)
+        uint64_t payload_offset = 0;
+        if (ggml_rknpu2_payload_ptr_to_offset(tensor->data, &payload_offset) == 0 &&
+            ggml_rknpu2_flush_payload_range(payload_offset, n_size) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to flush RKNPU payload tensor '%s' offset=0x%" PRIx64 " size=%zu errno=%d\n",
+                    __func__, ggml_get_name(tensor), payload_offset, n_size, errno);
+            return -1;
+        }
+#endif
         /*
         printf("[decrypt] %s(0x%lx):0x%lx, %zu 0x%lx\n", ggml_get_name(tensor), n_size,
                 *static_cast<uint64_t*>(tensor->data), decrypted_count, decrypted_bytes);
@@ -865,8 +872,6 @@ LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t r
 
     size_t decrypted_count = 0;
     uint64_t decrypted_bytes = 0;
-    uint64_t flush_start = UINT64_MAX;
-    uint64_t flush_end = 0;
 
     for (; it != g_npu_decrypt_spans.end(); ++it) {
         if (it->start >= redecrypt_end) {
@@ -887,16 +892,14 @@ LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t r
             return -1;
         }
 
+        if (ggml_rknpu2_flush_payload_range(part_start, tensor_len) != 0) {
+            LLAMA_LOG_ERROR("%s: failed to flush RKNPU payload tensor '%s' offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+                    __func__, ggml_get_name(it->tensor), part_start, tensor_len);
+            return -1;
+        }
+
         decrypted_count++;
         decrypted_bytes += tensor_len;
-        flush_start = std::min(flush_start, part_start);
-        flush_end = std::max(flush_end, part_end);
-    }
-
-    if (decrypted_bytes > 0 && ggml_rknpu2_flush_payload_range(flush_start, flush_end - flush_start) != 0) {
-        LLAMA_LOG_ERROR("%s: failed to flush RKNPU payload reclaim range offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
-                __func__, flush_start, flush_end - flush_start);
-        return -1;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
@@ -904,7 +907,7 @@ LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t r
         (long long) (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL +
         (long long) (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
 
-    LLAMA_LOG_INFO("%s: reclaimed %.2f MiB, previous %.2f MiB, payload suffix %.2f MiB, decrypted %zu tensors / %.2f MiB, range=[0x%" PRIx64 ",0x%" PRIx64 "), elapsed=%lld us\n",
+    LLAMA_LOG_INFO("%s: reclaimed %.2f MiB, previous %.2f MiB, payload suffix %.2f MiB, decrypted %zu tensor spans / %.2f MiB, range=[0x%" PRIx64 ",0x%" PRIx64 "), elapsed=%lld us\n",
             __func__,
             reclaimed_bytes / 1024.0 / 1024.0,
             previously_reclaimed_bytes / 1024.0 / 1024.0,
