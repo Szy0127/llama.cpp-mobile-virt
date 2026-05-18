@@ -1825,6 +1825,34 @@ static const rknpu_offline_prepack_blob * ggml_rknpu2_find_offline_prepack(const
     return &it->second;
 }
 
+int ggml_rknpu2_get_offline_prepack_payload(const char * tensor_name, const void ** payload, size_t * size) {
+    if (payload == nullptr || size == nullptr) {
+        return -1;
+    }
+
+    *payload = nullptr;
+    *size = 0;
+    if (tensor_name == nullptr || tensor_name[0] == '\0') {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
+    auto it = g_offline_prepack_registry.find(tensor_name);
+    if (it == g_offline_prepack_registry.end()) {
+        return -1;
+    }
+
+    const rknpu_offline_prepack_blob & offline = it->second;
+    if (offline.payload_tensor == nullptr || offline.payload_tensor->data == nullptr ||
+        offline.payload_size == 0) {
+        return -1;
+    }
+
+    *payload = offline.payload_tensor->data;
+    *size = offline.payload_size;
+    return 0;
+}
+
 static int ggml_rknpu2_ensure_offline_payload_ready(const rknpu_offline_prepack_blob * offline) {
     if (offline == nullptr || offline->payload_tensor == nullptr || offline->payload_tensor->data == nullptr) {
         return -1;

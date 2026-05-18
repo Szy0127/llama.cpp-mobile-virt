@@ -188,18 +188,12 @@ static int llama_build_npu_decrypt_index() {
         }
 
         const char * name = ggml_get_name(tensor);
-        if (!llama_is_rknpu_prepack_payload_name(name)) {
+        uint64_t start = 0;
+        if (ggml_rknpu2_payload_ptr_to_offset(tensor->data, &start) != 0) {
             continue;
         }
         if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
             LLAMA_LOG_ERROR("%s: tensor '%s' is not in host-accessible memory; use --no-mmap and avoid non-host offload for encrypted tensors\n",
-                    __func__, name);
-            return -1;
-        }
-
-        uint64_t start = 0;
-        if (ggml_rknpu2_payload_ptr_to_offset(tensor->data, &start) != 0) {
-            LLAMA_LOG_ERROR("%s: failed to resolve RKNPU payload offset for tensor '%s'\n",
                     __func__, name);
             return -1;
         }
@@ -223,36 +217,34 @@ static int llama_build_npu_decrypt_index() {
     return 0;
 }
 
-static constexpr uint32_t PKVM_SHINFO_VERSION_PIPELINE_V2 = 2;
 static constexpr uint32_t PKVM_SHINFO_PIPELINE_MAX_ENTRIES = 512;
-static constexpr uint32_t PKVM_SHINFO_PIPELINE_FLAG_ERROR = 1u << 2;
-static constexpr uint8_t PKVM_SHINFO_PIPELINE_BLOCK_READY = 2;
+static constexpr uint32_t PKVM_SHINFO_PIPELINE_STAGE_MAX = 4;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND = 0;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_GUEST_DECRYPT = 1;
+static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
+static constexpr uint8_t PKVM_PIPELINE_READY = 2;
 static constexpr size_t PKVM_SHINFO_MAP_SIZE = 0x1000UL;
+
+struct llama_pipeline_entry {
+    uint8_t stage[PKVM_SHINFO_PIPELINE_STAGE_MAX];
+};
 
 struct llama_pipeline_shinfo {
     uint64_t reclaimed_pages;
     uint64_t compute_entries_state;
-    uint32_t version;
-    uint32_t seq;
-    uint64_t pipeline_epoch;
-    uint64_t pipeline_entry_size;
-    uint64_t pipeline_reload_offset;
-    uint64_t pipeline_reload_length;
-    uint32_t pipeline_payload_entry_count;
+    uint32_t pipeline_entry_count;
+    uint32_t pipeline_entry_size;
     uint32_t pipeline_reload_start_entry;
     uint32_t pipeline_reload_entry_count;
-    uint32_t pipeline_ready_count;
-    int32_t pipeline_error;
-    uint32_t pipeline_flags;
-    uint8_t pipeline_block_state[PKVM_SHINFO_PIPELINE_MAX_ENTRIES];
+    uint32_t pipeline_reserved0;
+    uint32_t pipeline_reserved1;
+    llama_pipeline_entry pipeline_entries[PKVM_SHINFO_PIPELINE_MAX_ENTRIES];
 };
 
 static int g_pipeline_shinfo_fd = -1;
 static uint64_t g_pipeline_shinfo_phys_addr = 0;
 static volatile llama_pipeline_shinfo * g_pipeline_shinfo = nullptr;
 static std::mutex g_pipeline_mtx;
-static uint64_t g_pipeline_epoch = 0;
-static std::vector<uint8_t> g_pipeline_decrypted_entries;
 
 static volatile llama_pipeline_shinfo * llama_pipeline_map_shinfo() {
     if (g_pipeline_shinfo != nullptr) {
@@ -291,38 +283,23 @@ static bool llama_pipeline_read_shinfo(llama_pipeline_shinfo & out) {
         return false;
     }
 
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        const uint32_t seq0 = __atomic_load_n(&src->seq, __ATOMIC_ACQUIRE);
-        if (seq0 & 1) {
-            std::this_thread::yield();
-            continue;
-        }
-
-        out.reclaimed_pages = src->reclaimed_pages;
-        out.compute_entries_state = src->compute_entries_state;
-        out.version = src->version;
-        out.pipeline_epoch = src->pipeline_epoch;
-        out.pipeline_entry_size = src->pipeline_entry_size;
-        out.pipeline_reload_offset = src->pipeline_reload_offset;
-        out.pipeline_reload_length = src->pipeline_reload_length;
-        out.pipeline_payload_entry_count = src->pipeline_payload_entry_count;
-        out.pipeline_reload_start_entry = src->pipeline_reload_start_entry;
-        out.pipeline_reload_entry_count = src->pipeline_reload_entry_count;
-        out.pipeline_ready_count = src->pipeline_ready_count;
-        out.pipeline_error = src->pipeline_error;
-        out.pipeline_flags = src->pipeline_flags;
-        for (uint32_t i = 0; i < PKVM_SHINFO_PIPELINE_MAX_ENTRIES; ++i) {
-            out.pipeline_block_state[i] = src->pipeline_block_state[i];
-        }
-
-        const uint32_t seq1 = __atomic_load_n(&src->seq, __ATOMIC_ACQUIRE);
-        if (seq0 == seq1 && !(seq1 & 1)) {
-            out.seq = seq1;
-            return true;
+    out.reclaimed_pages = src->reclaimed_pages;
+    out.compute_entries_state = src->compute_entries_state;
+    out.pipeline_entry_count = src->pipeline_entry_count;
+    out.pipeline_entry_size =
+        __atomic_load_n(&src->pipeline_entry_size, __ATOMIC_ACQUIRE);
+    out.pipeline_reload_start_entry = src->pipeline_reload_start_entry;
+    out.pipeline_reload_entry_count = src->pipeline_reload_entry_count;
+    out.pipeline_reserved0 = src->pipeline_reserved0;
+    out.pipeline_reserved1 = src->pipeline_reserved1;
+    for (uint32_t i = 0; i < PKVM_SHINFO_PIPELINE_MAX_ENTRIES; ++i) {
+        for (uint32_t j = 0; j < PKVM_SHINFO_PIPELINE_STAGE_MAX; ++j) {
+            out.pipeline_entries[i].stage[j] =
+                __atomic_load_n(&src->pipeline_entries[i].stage[j], __ATOMIC_ACQUIRE);
         }
     }
 
-    return false;
+    return true;
 }
 
 static bool llama_pipeline_entry_in_reload(const llama_pipeline_shinfo & info, uint32_t entry) {
@@ -331,21 +308,43 @@ static bool llama_pipeline_entry_in_reload(const llama_pipeline_shinfo & info, u
     return entry >= reload_start && entry < reload_end;
 }
 
-static void llama_pipeline_update_epoch_locked(const llama_pipeline_shinfo & info) {
-    if (g_pipeline_epoch == info.pipeline_epoch &&
-        g_pipeline_decrypted_entries.size() == info.pipeline_payload_entry_count) {
+static bool llama_pipeline_has_active_reload(const llama_pipeline_shinfo & info) {
+    return info.pipeline_entry_size != 0 &&
+        info.pipeline_entry_count != 0 &&
+        info.pipeline_reload_entry_count != 0;
+}
+
+static bool llama_pipeline_compute_reclaimed(const llama_pipeline_shinfo & info) {
+    return info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED;
+}
+
+static bool llama_pipeline_header_initializing(const llama_pipeline_shinfo & info) {
+    return info.pipeline_entry_size == 0 &&
+        (info.pipeline_entry_count != 0 || info.pipeline_reload_entry_count != 0);
+}
+
+static void llama_pipeline_store_entry_stage(uint32_t entry, uint32_t stage, uint8_t state) {
+    if (entry >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
+        stage >= PKVM_SHINFO_PIPELINE_STAGE_MAX) {
         return;
     }
 
-    g_pipeline_epoch = info.pipeline_epoch;
-    g_pipeline_decrypted_entries.assign(info.pipeline_payload_entry_count, 0);
+    volatile llama_pipeline_shinfo * shinfo = llama_pipeline_map_shinfo();
+    if (shinfo != nullptr) {
+        __atomic_store_n(&shinfo->pipeline_entries[entry].stage[stage],
+                state, __ATOMIC_RELEASE);
+    }
 }
 
 static int llama_pipeline_decrypt_entry_locked(const llama_pipeline_shinfo & info, uint32_t entry) {
-    if (entry >= g_pipeline_decrypted_entries.size()) {
+    if (entry >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
+        entry >= info.pipeline_entry_count) {
+        LLAMA_LOG_ERROR("%s: pipeline entry=%u exceeds capacity\n",
+                __func__, entry);
         return -1;
     }
-    if (g_pipeline_decrypted_entries[entry]) {
+    if (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_GUEST_DECRYPT] ==
+        PKVM_PIPELINE_READY) {
         return 0;
     }
     if (llama_build_npu_decrypt_index() != 0) {
@@ -400,7 +399,8 @@ static int llama_pipeline_decrypt_entry_locked(const llama_pipeline_shinfo & inf
                 flush_start, flush_end);
     }
 
-    g_pipeline_decrypted_entries[entry] = 1;
+    llama_pipeline_store_entry_stage(entry, PKVM_PIPELINE_STAGE_GUEST_DECRYPT,
+            PKVM_PIPELINE_READY);
     return 0;
 }
 
@@ -423,25 +423,30 @@ static int llama_pipeline_ensure_payload_range_ready(const void * payload, size_
     if (!llama_pipeline_read_shinfo(info)) {
         return 0;
     }
-    if (info.version < PKVM_SHINFO_VERSION_PIPELINE_V2 ||
-        info.pipeline_epoch == 0 ||
-        info.pipeline_entry_size == 0 ||
-        info.pipeline_payload_entry_count == 0) {
-        return 0;
-    }
-    if (info.pipeline_flags & PKVM_SHINFO_PIPELINE_FLAG_ERROR) {
-        LLAMA_LOG_ERROR("%s: pipeline error=%d before payload wait\n",
-                __func__, info.pipeline_error);
-        return -1;
+
+    while (llama_pipeline_compute_reclaimed(info) ||
+           llama_pipeline_header_initializing(info)) {
+        lock.unlock();
+        LLAMA_LOG_INFO("%s: USE_PARAM wait shinfo compute=%" PRIu64 " entry_size=%u entries=%u reload=%u\n",
+                __func__, info.compute_entries_state, info.pipeline_entry_size,
+                info.pipeline_entry_count, info.pipeline_reload_entry_count);
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        lock.lock();
+
+        if (!llama_pipeline_read_shinfo(info)) {
+            continue;
+        }
     }
 
-    llama_pipeline_update_epoch_locked(info);
+    if (!llama_pipeline_has_active_reload(info)) {
+        return 0;
+    }
 
     const uint64_t payload_end = payload_offset + (uint64_t) size;
     uint32_t entry_start = (uint32_t) (payload_offset / info.pipeline_entry_size);
     uint32_t entry_end = (uint32_t) ((payload_end + info.pipeline_entry_size - 1) / info.pipeline_entry_size);
-    if (entry_end > info.pipeline_payload_entry_count) {
-        entry_end = info.pipeline_payload_entry_count;
+    if (entry_end > info.pipeline_entry_count) {
+        entry_end = info.pipeline_entry_count;
     }
 
     for (uint32_t entry = entry_start; entry < entry_end; ++entry) {
@@ -454,21 +459,16 @@ static int llama_pipeline_ensure_payload_range_ready(const void * payload, size_
             return -1;
         }
 
-        while (info.pipeline_block_state[entry] != PKVM_SHINFO_PIPELINE_BLOCK_READY) {
-            if (info.pipeline_flags & PKVM_SHINFO_PIPELINE_FLAG_ERROR) {
-                LLAMA_LOG_ERROR("%s: pipeline error=%d while waiting entry=%u\n",
-                        __func__, info.pipeline_error, entry);
-                return -1;
-            }
-
+        while (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND] !=
+               PKVM_PIPELINE_READY) {
             lock.unlock();
+            LLAMA_LOG_INFO("%s: USE_PARAM wait entry=%u\n", __func__, entry);
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             lock.lock();
 
             if (!llama_pipeline_read_shinfo(info)) {
                 continue;
             }
-            llama_pipeline_update_epoch_locked(info);
         }
 
         if (llama_pipeline_decrypt_entry_locked(info, entry) != 0) {
@@ -479,59 +479,33 @@ static int llama_pipeline_ensure_payload_range_ready(const void * payload, size_
     return 0;
 }
 
-static void llama_pipeline_mark_current_epoch_decrypted() {
-    std::lock_guard<std::mutex> lock(g_pipeline_mtx);
-    llama_pipeline_shinfo info = {};
-    if (!llama_pipeline_read_shinfo(info) ||
-        info.version < PKVM_SHINFO_VERSION_PIPELINE_V2 ||
-        info.pipeline_epoch == 0 ||
-        info.pipeline_payload_entry_count == 0) {
-        return;
-    }
-
-    g_pipeline_epoch = info.pipeline_epoch;
-    g_pipeline_decrypted_entries.assign(info.pipeline_payload_entry_count, 1);
-}
-
 static int llama_pipeline_sync_ready_payloads(bool wait_all) {
     std::unique_lock<std::mutex> lock(g_pipeline_mtx);
     llama_pipeline_shinfo info = {};
     if (!llama_pipeline_read_shinfo(info)) {
         return 0;
     }
-    if (info.version < PKVM_SHINFO_VERSION_PIPELINE_V2 ||
-        info.pipeline_epoch == 0 ||
-        info.pipeline_entry_size == 0 ||
-        info.pipeline_payload_entry_count == 0) {
+    if (info.pipeline_entry_size == 0 ||
+        info.pipeline_entry_count == 0 ||
+        info.pipeline_reload_entry_count == 0) {
         return 0;
     }
-    if (info.pipeline_flags & PKVM_SHINFO_PIPELINE_FLAG_ERROR) {
-        LLAMA_LOG_ERROR("%s: pipeline error=%d before sync\n",
-                __func__, info.pipeline_error);
-        return -1;
-    }
-
-    llama_pipeline_update_epoch_locked(info);
 
     const uint64_t reload_start = info.pipeline_reload_start_entry;
     const uint64_t reload_end = reload_start + info.pipeline_reload_entry_count;
     for (uint64_t entry64 = reload_start; entry64 < reload_end; ++entry64) {
         if (entry64 >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
-            entry64 >= info.pipeline_payload_entry_count) {
+            entry64 >= info.pipeline_entry_count) {
             LLAMA_LOG_ERROR("%s: pipeline entry=%" PRIu64 " exceeds capacity\n",
                     __func__, entry64);
             return -1;
         }
 
         const uint32_t entry = (uint32_t) entry64;
-        while (info.pipeline_block_state[entry] != PKVM_SHINFO_PIPELINE_BLOCK_READY) {
+        while (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND] !=
+               PKVM_PIPELINE_READY) {
             if (!wait_all) {
                 break;
-            }
-            if (info.pipeline_flags & PKVM_SHINFO_PIPELINE_FLAG_ERROR) {
-                LLAMA_LOG_ERROR("%s: pipeline error=%d while waiting entry=%u\n",
-                        __func__, info.pipeline_error, entry);
-                return -1;
             }
 
             lock.unlock();
@@ -541,10 +515,10 @@ static int llama_pipeline_sync_ready_payloads(bool wait_all) {
             if (!llama_pipeline_read_shinfo(info)) {
                 continue;
             }
-            llama_pipeline_update_epoch_locked(info);
         }
 
-        if (info.pipeline_block_state[entry] == PKVM_SHINFO_PIPELINE_BLOCK_READY &&
+        if (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND] ==
+                PKVM_PIPELINE_READY &&
             llama_pipeline_decrypt_entry_locked(info, entry) != 0) {
             return -1;
         }
@@ -553,16 +527,86 @@ static int llama_pipeline_sync_ready_payloads(bool wait_all) {
     return 0;
 }
 
-static bool llama_pipeline_has_active_epoch() {
+static bool llama_pipeline_has_pending_work() {
     std::lock_guard<std::mutex> lock(g_pipeline_mtx);
-    llama_pipeline_shinfo info = {};
+    volatile llama_pipeline_shinfo * shinfo = llama_pipeline_map_shinfo();
+    if (shinfo == nullptr) {
+        return false;
+    }
 
-    return llama_pipeline_read_shinfo(info) &&
-        info.version >= PKVM_SHINFO_VERSION_PIPELINE_V2 &&
-        info.pipeline_epoch != 0 &&
-        info.pipeline_entry_size != 0 &&
-        info.pipeline_payload_entry_count != 0 &&
-        info.pipeline_reload_entry_count != 0;
+    const uint64_t compute_entries_state = shinfo->compute_entries_state;
+    const uint32_t entry_size =
+        __atomic_load_n(&shinfo->pipeline_entry_size, __ATOMIC_ACQUIRE);
+    const uint32_t entry_count = shinfo->pipeline_entry_count;
+    const uint32_t reload_start = shinfo->pipeline_reload_start_entry;
+    const uint32_t reload_count = shinfo->pipeline_reload_entry_count;
+
+    if (compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED) {
+        return true;
+    }
+    if (entry_size == 0) {
+        return entry_count != 0 || reload_count != 0;
+    }
+    if (entry_count == 0 || reload_count == 0) {
+        return false;
+    }
+
+    const uint64_t reload_end64 = std::min<uint64_t>(
+            (uint64_t) reload_start + reload_count,
+            std::min<uint64_t>(entry_count, PKVM_SHINFO_PIPELINE_MAX_ENTRIES));
+    for (uint64_t entry64 = reload_start; entry64 < reload_end64; ++entry64) {
+        const uint32_t entry = (uint32_t) entry64;
+        const uint8_t host_state =
+            __atomic_load_n(&shinfo->pipeline_entries[entry].stage[
+                                PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND],
+                            __ATOMIC_ACQUIRE);
+        const uint8_t decrypt_state =
+            __atomic_load_n(&shinfo->pipeline_entries[entry].stage[
+                                PKVM_PIPELINE_STAGE_GUEST_DECRYPT],
+                            __ATOMIC_ACQUIRE);
+        if (host_state != PKVM_PIPELINE_READY ||
+            decrypt_state != PKVM_PIPELINE_READY) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool llama_tensor_uses_rknpu_payload(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+
+    const void * payload = nullptr;
+    size_t payload_size = 0;
+    if (ggml_rknpu2_get_offline_prepack_payload(ggml_get_name(tensor), &payload, &payload_size) == 0) {
+        return true;
+    }
+
+    uint64_t payload_offset = 0;
+    return tensor->data != nullptr &&
+        ggml_rknpu2_payload_ptr_to_offset(tensor->data, &payload_offset) == 0;
+}
+
+static int llama_pipeline_use_param_tensor(ggml_tensor * tensor, int ith) {
+    if (ith != 0 || tensor == nullptr) {
+        return 0;
+    }
+
+    const void * payload = nullptr;
+    size_t payload_size = 0;
+    if (ggml_rknpu2_get_offline_prepack_payload(ggml_get_name(tensor), &payload, &payload_size) == 0) {
+        return llama_pipeline_ensure_payload_range_ready(payload, payload_size);
+    }
+
+    uint64_t payload_offset = 0;
+    if (tensor->data != nullptr &&
+        ggml_rknpu2_payload_ptr_to_offset(tensor->data, &payload_offset) == 0) {
+        return llama_pipeline_ensure_payload_range_ready(tensor->data, ggml_nbytes(tensor));
+    }
+
+    return 0;
 }
 #endif
 
@@ -673,6 +717,31 @@ LLAMA_API int llama_pipeline_sync_rknpu_payloads(bool wait_all) {
 #endif
 }
 
+LLAMA_API bool llama_pipeline_is_active(void) {
+#if !defined(GGML_USE_RKNPU_RE)
+    return false;
+#else
+    return llama_pipeline_has_pending_work();
+#endif
+}
+
+LLAMA_API struct ggml_tensor * llama_pipeline_use_param_if_needed(
+        struct ggml_context * ctx,
+        struct ggml_tensor * self,
+        struct ggml_tensor * dep) {
+#if !defined(GGML_USE_RKNPU_RE)
+    (void) ctx;
+    (void) dep;
+    return self;
+#else
+    if (ctx == nullptr || self == nullptr || !llama_tensor_uses_rknpu_payload(self)) {
+        return self;
+    }
+
+    return ggml_use_param(ctx, self, dep, llama_pipeline_use_param_tensor);
+#endif
+}
+
 LLAMA_API int decrypt_all_tensor(bool only_npu) {
   struct timespec start_ts;
   struct timespec end_ts;
@@ -681,11 +750,7 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
     size_t decrypted_count = 0;
     size_t decrypted_bytes = 0;
 #if defined(GGML_USE_RKNPU_RE)
-    const bool pipeline_active = llama_pipeline_has_active_epoch();
-    if (pipeline_active && llama_pipeline_sync_ready_payloads(true) != 0) {
-        LLAMA_LOG_ERROR("%s: failed to sync pipeline RKNPU payloads before bulk decrypt\n", __func__);
-        return -1;
-    }
+    const bool pipeline_active = llama_pipeline_has_pending_work();
 #else
     const bool pipeline_active = false;
 #endif
@@ -703,9 +768,11 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
         if (only_npu && std::strstr(ggml_get_name(tensor), ".__rknpu") == nullptr) {
             continue;
         }
-        if (pipeline_active && llama_is_rknpu_prepack_payload_name(ggml_get_name(tensor))) {
+#if defined(GGML_USE_RKNPU_RE)
+        if (pipeline_active && llama_tensor_uses_rknpu_payload(tensor)) {
             continue;
         }
+#endif
 
 
         const size_t n_size = ggml_nbytes(tensor);
@@ -736,9 +803,7 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
     LLAMA_LOG_INFO("%s: decrypted %zu tensors, total size = %8.2f MiB\n",
             __func__, decrypted_count, decrypted_bytes / 1024.0 / 1024.0);
 #if defined(GGML_USE_RKNPU_RE)
-    if (!only_npu && !pipeline_active) {
-        llama_pipeline_mark_current_epoch_decrypted();
-    }
+    (void) only_npu;
     ggml_rknpu2_set_payload_ready_callback(llama_pipeline_ensure_rknpu_payload_ready);
 #endif
     return 0;
