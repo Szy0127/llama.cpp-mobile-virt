@@ -772,13 +772,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!llama_pipeline_is_active()) {
-        if (ggml_rknpu2_flush_all_payload() != 0) {
-            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-            return 1;
-        }
-        LOG("flush all\n");
+        LOG("RKNPU payload tensors flushed during decrypt\n");
     } else {
-        LOG("pipeline active; defer RKNPU payload flush to per-block decrypt\n");
+        LOG("pipeline active; defer RKNPU payload flush to per-tensor decrypt\n");
     }
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
@@ -1140,13 +1136,9 @@ int main(int argc, char ** argv) {
                         }
                     }
                     if (!defer_to_pipeline && !reclaim_pending) {
-                        if (ggml_rknpu2_flush_all_payload() != 0) {
-                            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-                            return 1;
-                        }
-                        LOG("flush all\n");
-                    } else if (defer_to_pipeline || reclaim_pending) {
-                        LOG("reclaim pending; defer RKNPU payload flush to pipeline wait\n");
+                        LOG("RKNPU payload tensors flushed during reclaim decrypt\n");
+                    } else {
+                        LOG("reclaim pending; defer RKNPU payload flush to per-tensor pipeline decrypt\n");
                     }
 
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)

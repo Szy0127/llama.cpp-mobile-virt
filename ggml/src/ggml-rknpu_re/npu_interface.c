@@ -39,6 +39,7 @@
 
 #define NPU_DEVICE "/dev/dri/card0"
 #define PAGE_SIZE_BYTES                0x1000UL
+#define RKNPU_PAYLOAD_FLUSH_CHUNK      (64ULL * 1024ULL * 1024ULL)
 
 struct npu_prealloc_layout {
   uint64_t gpa_base;
@@ -500,8 +501,6 @@ int ggml_rknpu2_get_shinfo_phys_addr(uint64_t *phys_addr) {
 }
 
 int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {
-  struct rknpu_mem_sync sync;
-
   pthread_once(&fd_once, fd_init);
   if (fd < 0) {
     return -1;
@@ -525,21 +524,35 @@ int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size) {
     return 0;
   }
 
-  memset(&sync, 0, sizeof(sync));
-  sync.flags = RKNPU_MEM_SYNC_TO_DEVICE;
-  sync.obj_addr = g_prealloc_layout.gpa_base;
-  sync.offset = payload_offset;
-  sync.size = size;
+  uint64_t flushed = 0;
+  while (flushed < size) {
+    struct rknpu_mem_sync sync;
+    uint64_t chunk = size - flushed;
 
-  int ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &sync);
-  if (ret < 0) {
-    printf("DRM_IOCTL_RKNPU_MEM_SYNC payload flush failed: errno=%d phys=0x%llx offset=0x%llx size=0x%llx\n",
-           errno,
-           (unsigned long long) g_prealloc_layout.gpa_base,
-           (unsigned long long) payload_offset,
-           (unsigned long long) size);
+    if (chunk > RKNPU_PAYLOAD_FLUSH_CHUNK) {
+      chunk = RKNPU_PAYLOAD_FLUSH_CHUNK;
+    }
+
+    memset(&sync, 0, sizeof(sync));
+    sync.flags = RKNPU_MEM_SYNC_TO_DEVICE;
+    sync.obj_addr = g_prealloc_layout.gpa_base;
+    sync.offset = payload_offset + flushed;
+    sync.size = chunk;
+
+    int ret = ioctl(fd, DRM_IOCTL_RKNPU_MEM_SYNC, &sync);
+    if (ret < 0) {
+      printf("DRM_IOCTL_RKNPU_MEM_SYNC payload flush failed: errno=%d phys=0x%llx offset=0x%llx size=0x%llx\n",
+             errno,
+             (unsigned long long) g_prealloc_layout.gpa_base,
+             (unsigned long long) sync.offset,
+             (unsigned long long) sync.size);
+      return ret;
+    }
+
+    flushed += chunk;
   }
-  return ret;
+
+  return 0;
 }
 
 int ggml_rknpu2_flush_all_payload(void) {
@@ -554,10 +567,7 @@ int ggml_rknpu2_flush_all_payload(void) {
     return -1;
   }
 
-  //ret = ggml_rknpu2_flush_payload_range(0, g_prealloc_layout.payload_total_bytes);
-  for(uint64_t offset = 0 ; offset < g_prealloc_layout.payload_total_bytes ; offset += 64*1024*1024){
-    ret = ggml_rknpu2_flush_payload_range(offset, 64*1024*1024);
-  }
+  ret = ggml_rknpu2_flush_payload_range(0, g_prealloc_layout.payload_total_bytes);
 
   clock_gettime(CLOCK_MONOTONIC, &end_ts);
   elapsed_us =

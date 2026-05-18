@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <atomic>
 #include <vector>
@@ -1016,6 +1017,8 @@ inline size_t rknn_type_size_C(rknn_tensor_type type) {
 
 static uint64_t total_allocated = 0;
 
+static int ggml_rknpu2_ensure_payload_ready(const void * payload, size_t size);
+
 enum class rknpu_mem_kind {
     payload,
     compute,
@@ -1212,6 +1215,8 @@ struct npu_task {
     uint64_t npu_regs[112];
     matmul_params_t params;
     rknn_tensor_type type;
+    const void * weight_payload = nullptr;
+    size_t weight_payload_size = 0;
 
     npu_task(int M, int N, int K, int nn, int kk, rknn_tensor_type type,
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
@@ -1303,6 +1308,7 @@ struct npu_task {
         //     fprintf(stderr, "weight->ptr[%d] = %d\n", i, ((int32_t*)weight->ptr)[i]);
         // }
         // *((int32_t*)weight->ptr) = 1;
+        //log_submit_weight("single", (__u32)core_mask);
         int ret = npu_submit(regcmd_dma, (__u32)core_mask, domain_id);
         if (ret) {
             printf("RKNPU_SUBMIT returned %d, submitted m=%hu, k=%hu, n=%hu, errno %d\n",
@@ -1329,8 +1335,14 @@ struct npu_task {
         output->scale = input->scale * weight->scale;
     }
 
-    void set_weight_location(uint64_t weights_dma, uint32_t weights_domain_id) {
-        if (params.weights_dma == weights_dma && domain_id == weights_domain_id) {
+    void set_weight_location(uint64_t weights_dma, uint32_t weights_domain_id,
+                             const void * payload, size_t payload_size) {
+        const bool same_location =
+            params.weights_dma == weights_dma && domain_id == weights_domain_id;
+        weight_payload = payload;
+        weight_payload_size = payload_size;
+
+        if (same_location) {
             return;
         }
 
@@ -1349,6 +1361,37 @@ struct npu_task {
 
         memcpy(regcmd, npu_regs, sizeof(npu_regs));
     }
+
+    void log_submit_weight(const char * mode, uint32_t core_mask) const {
+        const void * dma_ptr = weight_payload != nullptr ? weight_payload :
+            (weight ? weight->dma_ptr : nullptr);
+        std::fprintf(stderr,
+                "[GUEST_NPU_SUBMIT] mode=%s M=%d N=%d K=%d nn=%d kk=%d weight_dma_ptr=%p weight_dma=0x%llx domain=%u payload_size=0x%zx regcmd_dma=0x%llx core_mask=0x%x\n",
+                mode,
+                M, N, K, nn, kk,
+                dma_ptr,
+                (unsigned long long) params.weights_dma,
+                domain_id,
+                weight_payload_size,
+                (unsigned long long) regcmd_dma,
+                core_mask);
+    }
+
+    int ensure_weight_ready(void) const {
+        if (weight_payload == nullptr || weight_payload_size == 0) {
+            return 0;
+        }
+
+        const int ret = ggml_rknpu2_ensure_payload_ready(weight_payload,
+                                                        weight_payload_size);
+        if (ret != 0) {
+            GGML_LOG_ERROR("%s: weight payload not ready nn=%d kk=%d dma=0x%llx domain=%u size=%zu\n",
+                    __func__, nn, kk,
+                    (unsigned long long) params.weights_dma,
+                    domain_id, weight_payload_size);
+        }
+        return ret;
+    }
 };
 
 extern "C" {
@@ -1366,6 +1409,10 @@ struct npu_task_multi_core {
 
     void submit(void) {
         GGML_ASSERT(npu_tasks.size() <= NPU_CORE_NUM);
+        for (auto npu_task: npu_tasks) {
+            GGML_ASSERT(npu_task->ensure_weight_ready() == 0);
+        }
+
         uint32_t domain_id = npu_tasks.front()->domain_id;
         bool same_domain = true;
         std::vector<uint64_t> tasks_objs;
@@ -1380,6 +1427,11 @@ struct npu_task_multi_core {
     #endif
         }
         if (same_domain) {
+            /*
+            for (size_t idx = 0; idx < npu_tasks.size(); ++idx) {
+                npu_tasks[idx]->log_submit_weight("multi", 1u << idx);
+            }
+            */
             int ret = npu_submit_multi(tasks_objs.data(), tasks_objs.size(), domain_id,
                                        (void *)ggml_thread_cpu_relax_out);
             GGML_ASSERT(ret == 0);
@@ -1699,6 +1751,8 @@ struct rknpu_weight_prepack_block {
     float scale;
     uint64_t packed_dma = 0; // weight_dma may legitimately be 0 when the packed payload starts at the beginning of an IOVA window
     uint32_t domain_id = 0;
+    const void * payload = nullptr;
+    size_t payload_size = 0;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1759,6 +1813,20 @@ static std::atomic<ggml_rknpu2_payload_ready_callback> g_payload_ready_callback{
 
 extern "C" void ggml_rknpu2_set_payload_ready_callback(ggml_rknpu2_payload_ready_callback cb) {
     g_payload_ready_callback.store(cb, std::memory_order_release);
+}
+
+static int ggml_rknpu2_ensure_payload_ready(const void * payload, size_t size) {
+    if (payload == nullptr || size == 0) {
+        return 0;
+    }
+
+    ggml_rknpu2_payload_ready_callback cb =
+        g_payload_ready_callback.load(std::memory_order_acquire);
+    if (cb == nullptr) {
+        return 0;
+    }
+
+    return cb(payload, size);
 }
 
 void ggml_rknpu2_clear_offline_prepack_registry(void) {
@@ -1858,13 +1926,8 @@ static int ggml_rknpu2_ensure_offline_payload_ready(const rknpu_offline_prepack_
         return -1;
     }
 
-    ggml_rknpu2_payload_ready_callback cb =
-        g_payload_ready_callback.load(std::memory_order_acquire);
-    if (cb == nullptr) {
-        return 0;
-    }
-
-    return cb(offline->payload_tensor->data, offline->payload_size);
+    return ggml_rknpu2_ensure_payload_ready(offline->payload_tensor->data,
+                                            offline->payload_size);
 }
 
 static std::atomic<uint64_t> g_weight_prepack_lookup_cnt{0};
@@ -1983,12 +2046,16 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
         for (int kk = 0; kk < k; kk += K) {
+            const uint64_t payload_offset = uint64_t(block_index) * packed_size;
             rknpu_weight_prepack_block block;
             block.nn = nn;
             block.kk = kk;
             block.scale = scales ? scales[block_index] : 1.0f;
-            block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
+            block.packed_dma = packed_dma_base + payload_offset;
             block.domain_id = offline->payload_domain_id;
+            block.payload = static_cast<const uint8_t *>(offline->payload_tensor->data) +
+                payload_offset;
+            block.payload_size = packed_size;
             cache->blocks.emplace(rknpu_block_key(nn, kk), block);
             ++block_index;
         }
@@ -2501,7 +2568,9 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 for (const auto & task_group : kernel->npu_tasks) {
                     for (const auto & task : task_group->npu_tasks) {
                         if (task->nn == nn && task->kk == kk) {
-                            task->set_weight_location(weight_dma, weight_domain_id);
+                            task->set_weight_location(weight_dma, weight_domain_id,
+                                                      block->payload,
+                                                      block->payload_size);
                         }
                     }
                 }
