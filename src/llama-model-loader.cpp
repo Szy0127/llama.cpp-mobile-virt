@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <future>
@@ -1221,6 +1222,32 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    const uint64_t rknpu_payload_total_bytes =
+            npu_layout_info.rknpu.donate_size - npu_layout_info.rknpu.compute_buffer_size;
+    auto log_host_tensor_load_offset = [&](const ggml_tensor * tensor, size_t tensor_size, const char * state) {
+        if (tensor == nullptr || tensor->data == nullptr) {
+            return;
+        }
+
+        const uintptr_t base_va = reinterpret_cast<uintptr_t>(mem_pool_vaddr());
+        const uintptr_t tensor_va = reinterpret_cast<uintptr_t>(tensor->data);
+        if (rknpu_payload_total_bytes > UINTPTR_MAX - base_va) {
+            return;
+        }
+
+        const uintptr_t pool_end = base_va + static_cast<uintptr_t>(rknpu_payload_total_bytes);
+        if (tensor_va < base_va || tensor_va >= pool_end) {
+            return;
+        }
+
+        const uint64_t offset = static_cast<uint64_t>(tensor_va - base_va);
+        std::fprintf(stderr,
+                "[HOST_TENSOR_LOAD] tensor=%s offset=0x%llx size=0x%zx state=%s\n",
+                ggml_get_name(tensor),
+                (unsigned long long) offset,
+                tensor_size,
+                state);
+    };
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1376,6 +1403,7 @@ bool llama_model_loader::load_all_data(
                     const uint64_t tensor_end = tensor_offset + n_size;
                     const uint64_t reload_start = npu_layout_info.payload_reload_offset;
                     if (tensor_end <= reload_start) {
+                        log_host_tensor_load_offset(cur, n_size, "skip-before-reload");
                         /*
                         std::fprintf(stderr,
                                 "[partial-load] skip payload tensor=%s size=%zu\n",
@@ -1478,6 +1506,8 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+
+        log_host_tensor_load_offset(cur, n_size, "loaded");
 
         /*
         if (llama_is_rknpu_prepack_payload_name(ggml_get_name(cur))) {

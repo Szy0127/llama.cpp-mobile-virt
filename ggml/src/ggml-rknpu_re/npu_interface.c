@@ -289,48 +289,83 @@ int mem_pool_finish_all_payload(void) {
   return 0;
 }
 
-static int finish_llm_window(void) {
+/*
+ * Drain any reload payload entries that the model loader did not
+ * explicitly finish (e.g. trailing holes after the last tensor, or an
+ * abort flow where the loader bailed out mid-stream).
+ *
+ * NOTE on ordering: per-block FINISH (LLM_IOC_EXTEND | FINISH) requires
+ * the user-space mmap to still be alive, because the kernel validates
+ * that the vma it has on file matches the entry's user vaddr.
+ * Therefore we *must* drain before munmap. The window-wide
+ * LLM_IOC_FINISH on the other hand requires active_mappings == 0
+ * (otherwise the kernel returns -EBUSY), so it has to wait until
+ * after munmap.
+ */
+static int drain_remaining_reload_entries(void) {
   struct timespec start;
   struct timespec finish;
   int ret = 0;
 
   clock_gettime(CLOCK_MONOTONIC, &start);
 
-  if (ioctl(llm_fd, LLM_IOC_FINISH) < 0) {
-    printf("LLM_IOC_FINISH failed errno=%d\n", errno);
-    ret = -1;
-    goto out;
-  }
-
   if (mem_pool_finish_all_payload() != 0) {
+    printf("mem_pool_finish_all_payload before LLM_IOC_FINISH failed\n");
     ret = -1;
-    goto out;
   }
 
-  printf("LLM_IOC_EXTEND complete %u entries\n",
-         g_prealloc_layout.payload_reload_entry_count);
-
-out:
   clock_gettime(CLOCK_MONOTONIC, &finish);
-  printf("finish_llm_window cost %.3f ms\n",
+  printf("drain_remaining_reload_entries cost %.3f ms\n",
          (finish.tv_sec - start.tv_sec) * 1000.0 +
          (finish.tv_nsec - start.tv_nsec) / 1000000.0);
   return ret;
 }
 
+static int close_llm_window(void) {
+  if (ioctl(llm_fd, LLM_IOC_FINISH) < 0) {
+    printf("LLM_IOC_FINISH failed errno=%d\n", errno);
+    return -1;
+  }
+  printf("LLM_IOC_EXTEND complete %u entries\n",
+         g_prealloc_layout.payload_reload_entry_count);
+  return 0;
+}
+
 static void cleanup_pool_mapping(void) {
+  int drained_ok = 0;
+
+  /*
+   * Phase 1: drain remaining ALLOCATED reload entries while the
+   * user-space mapping is still alive. This must happen before munmap
+   * because each per-block FINISH ioctl re-validates the entry's VMA.
+   */
+  if (llm_fd >= 0 && llm_window_began) {
+    drained_ok = (drain_remaining_reload_entries() == 0) ? 1 : 0;
+    if (!drained_ok) {
+      printf("LLM pipeline cleanup: drain failed, "
+             "kernel will see an abort\n");
+    }
+  }
+
+  /* Phase 2: drop the user mapping so LLM_IOC_FINISH won't see EBUSY. */
   if (pool_vaddr && pool_map_size) {
     munmap(pool_vaddr, pool_map_size);
+    pool_vaddr = NULL;
+    pool_map_size = 0;
   }
 
-  if (llm_fd >= 0 && llm_window_began && g_payload_pipeline_complete) {
-    finish_llm_window();
-  } else if (llm_fd >= 0 && llm_window_began) {
-    printf("LLM pipeline closed before all payload entries finished; kernel will publish abort\n");
+  /*
+   * Phase 3: close the kernel window. Only attempt this when the drain
+   * succeeded; otherwise LLM_IOC_FINISH would just return -EAGAIN
+   * because some pmalloc entries are still ALLOCATED, and the abort
+   * path in llm_release() is the right place to clean those up.
+   */
+  if (llm_fd >= 0 && llm_window_began && drained_ok) {
+    if (close_llm_window() != 0) {
+      printf("LLM pipeline cleanup: close_llm_window failed\n");
+    }
   }
 
-  pool_vaddr = NULL;
-  pool_map_size = 0;
   payload_used = 0;
   compute_used = 0;
   llm_window_began = 0;
