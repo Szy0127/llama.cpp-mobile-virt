@@ -449,6 +449,7 @@ extern "C" {
         GGML_OP_REPEAT,
         GGML_OP_REPEAT_BACK,
         GGML_OP_CONCAT,
+        GGML_OP_USE_PARAM,
         GGML_OP_SILU_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
@@ -571,6 +572,10 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+    struct ggml_tensor;
+
+    typedef int (*ggml_use_param_callback)(struct ggml_tensor * tensor, int ith);
+
     // n-dimensional tensor
     struct ggml_tensor {
         enum ggml_type type;
@@ -603,7 +608,7 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        ggml_use_param_callback extra2;
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -948,6 +953,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             int                   dim);
+
+    GGML_API struct ggml_tensor * ggml_use_param(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * self,
+            struct ggml_tensor  * dep,
+            ggml_use_param_callback cb);
 
     GGML_API struct ggml_tensor * ggml_abs(
             struct ggml_context * ctx,

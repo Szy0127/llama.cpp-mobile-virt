@@ -410,6 +410,8 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    const bool pipeline_use_param;
+
     const llama_adapter_cvec  * cvec;
     const llama_adapter_loras * loras;
     const llama_memory_i      * memory;
@@ -432,6 +434,10 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    ggml_tensor * use_param_if_needed(
+             ggml_tensor * w,
+             ggml_tensor * dep) const;
 
     // do mat_mul, while optionally apply lora
     ggml_tensor * build_lora_mm(

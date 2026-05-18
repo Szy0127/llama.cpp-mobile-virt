@@ -414,6 +414,11 @@ extern "C" {
     LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t reclaimed_pages);
     LLAMA_API int llama_pipeline_ensure_rknpu_payload_ready(const void * payload, size_t size);
     LLAMA_API int llama_pipeline_sync_rknpu_payloads(bool wait_all);
+    LLAMA_API bool llama_pipeline_is_active(void);
+    LLAMA_API struct ggml_tensor * llama_pipeline_use_param_if_needed(
+            struct ggml_context * ctx,
+            struct ggml_tensor * self,
+            struct ggml_tensor * dep);
 
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations

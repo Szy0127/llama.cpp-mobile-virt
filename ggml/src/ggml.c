@@ -883,6 +883,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "REPEAT",
     "REPEAT_BACK",
     "CONCAT",
+    "USE_PARAM",
     "SILU_BACK",
     "NORM",
     "RMS_NORM",
@@ -953,7 +954,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -978,6 +979,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "repeat(x)",
     "repeat_back(x)",
     "concat(x, y)",
+    "use_param(x)",
     "silu_back(x)",
     "norm(x)",
     "rms_norm(x)",
@@ -1048,7 +1050,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "adamw(x)",
 };
 
-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1584,7 +1586,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.padding      =*/ { 0 },
+        /*.extra2       =*/ NULL,
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
@@ -2323,6 +2325,31 @@ struct ggml_tensor * ggml_concat(
     result->op     = GGML_OP_CONCAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_use_param
+
+struct ggml_tensor * ggml_use_param(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * self,
+        struct ggml_tensor  * dep,
+        ggml_use_param_callback cb) {
+    if (self == NULL) {
+        return NULL;
+    }
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, self);
+
+    result->op     = GGML_OP_USE_PARAM;
+    result->src[0] = self;
+    result->src[1] = dep;
+    result->buffer = self->buffer;
+    result->extra  = self->extra;
+    result->flags  = self->flags;
+    result->extra2 = cb;
+    ggml_set_name(result, self->name);
 
     return result;
 }
@@ -5548,6 +5575,11 @@ static void ggml_compute_backward(
                 ggml_acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
             }
         } break;
+        case GGML_OP_USE_PARAM: {
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, grad);
+            }
+        } break;
         case GGML_OP_PERMUTE: {
             if (src0_needs_grads) {
                 const int32_t * axes = (const int32_t *) tensor->op_params;
@@ -5853,7 +5885,8 @@ void ggml_build_backward_expand(
 
         // inplace operations are currently not supported
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_USE_PARAM);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

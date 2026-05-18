@@ -1877,6 +1877,26 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static void ggml_compute_forward_use_param(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    struct ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(src0 != NULL);
+
+    if (params->ith == 0 && dst->extra2 != NULL) {
+        const int ret = dst->extra2(src0, params->ith);
+        if (ret != 0) {
+            GGML_ABORT("use_param callback failed");
+        }
+    }
+
+    dst->data   = src0->data;
+    dst->buffer = src0->buffer;
+    dst->extra  = src0->extra;
+}
+
+/////////////////////////////////
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1969,6 +1989,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CONCAT:
             {
                 ggml_compute_forward_concat(params, tensor);
+            } break;
+        case GGML_OP_USE_PARAM:
+            {
+                ggml_compute_forward_use_param(params, tensor);
             } break;
         case GGML_OP_SILU_BACK:
             {
@@ -2392,6 +2416,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_USE_PARAM:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_GET_ROWS:
             {

@@ -55,3 +55,4 @@ struct ggml_rknpu_prepack_meta {
 
 GGML_API void ggml_rknpu2_clear_offline_prepack_registry(void);
 GGML_API bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * meta_tensor, const struct ggml_tensor * payload_tensor);
+GGML_API int ggml_rknpu2_get_offline_prepack_payload(const char * tensor_name, const void ** payload, size_t * size);

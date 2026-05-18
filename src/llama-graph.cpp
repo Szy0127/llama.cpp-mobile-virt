@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-kv-cache.h"
+#include "llama.h"
 
 #include <cassert>
 #include <cmath>
@@ -570,6 +571,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (params.ctx),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    pipeline_use_param(llama_pipeline_is_active()),
     cvec             (params.cvec),
     loras            (params.loras),
     memory           (params.memory),
@@ -594,10 +596,21 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::use_param_if_needed(
+         ggml_tensor * w,
+         ggml_tensor * dep) const {
+    if (!pipeline_use_param) {
+        return w;
+    }
+
+    return llama_pipeline_use_param_if_needed(ctx0, w, dep);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * ww = use_param_if_needed(w, cur);
+    ggml_tensor * res = ggml_mul_mat(ctx0, ww, cur);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -624,7 +637,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * ww = use_param_if_needed(w, cur);
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, ww, cur, ids);
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -670,6 +684,7 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mw) {
+        mw = use_param_if_needed(mw, cur);
         cur = ggml_mul(ctx0, cur, mw);
         if (mb) {
             cb(cur, "norm_w", il);
@@ -677,6 +692,7 @@ ggml_tensor * llm_graph_context::build_norm(
     }
 
     if (mb) {
+        mb = use_param_if_needed(mb, cur);
         cur = ggml_add(ctx0, cur, mb);
     }
 
@@ -973,6 +989,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         ggml_set_input(inp->tokens);
         res->t_tokens = inp->tokens;
 
+        tok_embd = use_param_if_needed(tok_embd, inp->tokens);
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
         // apply lora for embedding tokens if needed
@@ -1237,7 +1254,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
-            cur = ggml_mul_mat(ctx0, v_mla, cur);
+            cur = ggml_mul_mat(ctx0, use_param_if_needed(v_mla, cur), cur);
             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
@@ -1283,7 +1300,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+            kqv = ggml_mul_mat(ctx0, use_param_if_needed(v_mla, kqv), kqv);
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
@@ -1690,7 +1707,9 @@ void llm_graph_context::build_pooling(
                 GGML_ASSERT(cls   != nullptr);
                 GGML_ASSERT(cls_b != nullptr);
 
-                cur = ggml_add (ctx0, ggml_mul_mat(ctx0, cls, inp), cls_b);
+                cur = ggml_add(ctx0,
+                        ggml_mul_mat(ctx0, use_param_if_needed(cls, inp), inp),
+                        use_param_if_needed(cls_b, inp));
                 cur = ggml_tanh(ctx0, cur);
 
                 // some models don't have `cls_out`, for example: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
@@ -1698,7 +1717,9 @@ void llm_graph_context::build_pooling(
                 if (cls_out) {
                     GGML_ASSERT(cls_out_b != nullptr);
 
-                    cur = ggml_add (ctx0, ggml_mul_mat(ctx0, cls_out, cur), cls_out_b);
+                    cur = ggml_add(ctx0,
+                            ggml_mul_mat(ctx0, use_param_if_needed(cls_out, cur), cur),
+                            use_param_if_needed(cls_out_b, cur));
                 }
             } break;
         default:

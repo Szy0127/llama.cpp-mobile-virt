@@ -60,24 +60,23 @@ static void rknpu_clear_after_generation(void) {
 struct pkvm_shinfo {
     uint64_t reclaimed_pages;
     uint64_t compute_entries_state;
-    uint32_t version;
-    uint32_t seq;
-    uint64_t pipeline_epoch;
-    uint64_t pipeline_entry_size;
-    uint64_t pipeline_reload_offset;
-    uint64_t pipeline_reload_length;
-    uint32_t pipeline_payload_entry_count;
+    uint32_t pipeline_entry_count;
+    uint32_t pipeline_entry_size;
     uint32_t pipeline_reload_start_entry;
     uint32_t pipeline_reload_entry_count;
-    uint32_t pipeline_ready_count;
-    int32_t pipeline_error;
-    uint32_t pipeline_flags;
-    uint8_t pipeline_block_state[512];
+    uint32_t pipeline_reserved0;
+    uint32_t pipeline_reserved1;
+    struct {
+        uint8_t stage[4];
+    } pipeline_entries[512];
 };
 
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL    = 0;
 static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
-static constexpr uint32_t PKVM_SHINFO_VERSION_PIPELINE_V2       = 2;
+static constexpr uint32_t PKVM_SHINFO_PIPELINE_MAX_ENTRIES      = 512;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND  = 0;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_GUEST_DECRYPT     = 1;
+static constexpr uint8_t  PKVM_PIPELINE_READY                   = 2;
 static constexpr size_t   PKVM_SHINFO_MAP_SIZE  = 0x1000UL;
 static int                g_pkvm_shinfo_fd      = -1;
 static uint64_t           g_pkvm_shinfo_phys_addr = 0;
@@ -87,19 +86,55 @@ static pkvm_shinfo read_pkvm_shinfo_once(volatile const pkvm_shinfo * src) {
     pkvm_shinfo dst = {};
     dst.reclaimed_pages     = src->reclaimed_pages;
     dst.compute_entries_state = src->compute_entries_state;
-    dst.version = src->version;
-    dst.seq = src->seq;
-    dst.pipeline_epoch = src->pipeline_epoch;
-    dst.pipeline_entry_size = src->pipeline_entry_size;
-    dst.pipeline_reload_offset = src->pipeline_reload_offset;
-    dst.pipeline_reload_length = src->pipeline_reload_length;
-    dst.pipeline_payload_entry_count = src->pipeline_payload_entry_count;
+    dst.pipeline_entry_count = src->pipeline_entry_count;
+    dst.pipeline_entry_size = __atomic_load_n(&src->pipeline_entry_size, __ATOMIC_ACQUIRE);
     dst.pipeline_reload_start_entry = src->pipeline_reload_start_entry;
     dst.pipeline_reload_entry_count = src->pipeline_reload_entry_count;
-    dst.pipeline_ready_count = src->pipeline_ready_count;
-    dst.pipeline_error = src->pipeline_error;
-    dst.pipeline_flags = src->pipeline_flags;
+    dst.pipeline_reserved0 = src->pipeline_reserved0;
+    dst.pipeline_reserved1 = src->pipeline_reserved1;
+    for (uint32_t i = 0; i < PKVM_SHINFO_PIPELINE_MAX_ENTRIES; ++i) {
+        for (uint32_t j = 0; j < 4; ++j) {
+            dst.pipeline_entries[i].stage[j] =
+                __atomic_load_n(&src->pipeline_entries[i].stage[j], __ATOMIC_ACQUIRE);
+        }
+    }
     return dst;
+}
+
+static bool pkvm_shinfo_pipeline_active(const pkvm_shinfo & info) {
+    if (info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED) {
+        return true;
+    }
+    if (info.pipeline_entry_size == 0) {
+        return info.pipeline_entry_count != 0 ||
+            info.pipeline_reload_entry_count != 0;
+    }
+    if (info.pipeline_entry_count == 0 ||
+        info.pipeline_reload_entry_count == 0) {
+        return false;
+    }
+
+    const uint64_t reload_start = info.pipeline_reload_start_entry;
+    uint64_t reload_end = reload_start + info.pipeline_reload_entry_count;
+    reload_end = std::min<uint64_t>(reload_end, info.pipeline_entry_count);
+    reload_end = std::min<uint64_t>(reload_end, PKVM_SHINFO_PIPELINE_MAX_ENTRIES);
+
+    for (uint64_t entry64 = reload_start; entry64 < reload_end; ++entry64) {
+        const uint32_t entry = (uint32_t) entry64;
+        if (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND] !=
+                PKVM_PIPELINE_READY ||
+            info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_GUEST_DECRYPT] !=
+                PKVM_PIPELINE_READY) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool pkvm_shinfo_reclaim_pending(const pkvm_shinfo & info) {
+    return info.reclaimed_pages != 0 ||
+        info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED;
 }
 
 static volatile pkvm_shinfo * map_pkvm_shinfo() {
@@ -176,15 +211,32 @@ static bool dump_pkvm_shinfo(const char * reason, pkvm_shinfo * out_info = nullp
             info.compute_entries_state,
             info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED ? " (reclaimed)" :
             info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_NORMAL ? " (normal)" : " (unknown)");
-    if (info.version >= PKVM_SHINFO_VERSION_PIPELINE_V2) {
-        LOG_INF("[pkvm_shinfo] pipeline epoch=%" PRIu64 " ready=%u/%u reload=%u+%u error=%d flags=0x%x\n",
-                info.pipeline_epoch,
-                info.pipeline_ready_count,
-                info.pipeline_reload_entry_count,
+    if (pkvm_shinfo_pipeline_active(info)) {
+        uint32_t host_ready = 0;
+        uint32_t guest_decrypt_ready = 0;
+        const uint64_t reload_start = info.pipeline_reload_start_entry;
+        uint64_t reload_end = reload_start + info.pipeline_reload_entry_count;
+        if (reload_end > info.pipeline_entry_count) {
+            reload_end = info.pipeline_entry_count;
+        }
+        if (reload_end > PKVM_SHINFO_PIPELINE_MAX_ENTRIES) {
+            reload_end = PKVM_SHINFO_PIPELINE_MAX_ENTRIES;
+        }
+        for (uint64_t entry = reload_start; entry < reload_end; ++entry) {
+            if (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND] == PKVM_PIPELINE_READY) {
+                host_ready++;
+            }
+            if (info.pipeline_entries[entry].stage[PKVM_PIPELINE_STAGE_GUEST_DECRYPT] == PKVM_PIPELINE_READY) {
+                guest_decrypt_ready++;
+            }
+        }
+        LOG_INF("[pkvm_shinfo] pipeline entry_size=%u entries=%u reload=%u+%u host_ready=%u decrypt_ready=%u\n",
+                info.pipeline_entry_size,
+                info.pipeline_entry_count,
                 info.pipeline_reload_start_entry,
                 info.pipeline_reload_entry_count,
-                info.pipeline_error,
-                info.pipeline_flags);
+                host_ready,
+                guest_decrypt_ready);
         return false;
     }
     return info.reclaimed_pages > 0;
@@ -719,11 +771,15 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
         return 1;
     }
-    if (ggml_rknpu2_flush_all_payload() != 0) {
-        LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-        return 1;
+    if (!llama_pipeline_is_active()) {
+        if (ggml_rknpu2_flush_all_payload() != 0) {
+            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+            return 1;
+        }
+        LOG("flush all\n");
+    } else {
+        LOG("pipeline active; defer RKNPU payload flush to per-block decrypt\n");
     }
-    LOG("flush all\n");
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -1066,13 +1122,11 @@ int main(int argc, char ** argv) {
 
                     pkvm_shinfo reclaim_info = {};
                     const bool has_legacy_reclaim = dump_pkvm_shinfo("interactive-user-input", &reclaim_info);
-                    if (reclaim_info.version >= PKVM_SHINFO_VERSION_PIPELINE_V2 &&
-                            reclaim_info.pipeline_epoch != 0) {
-                        if (llama_pipeline_sync_rknpu_payloads(true) != 0) {
-                            LOG_ERR("%s : failed to sync/decrypt pipeline RKNPU payloads\n", __func__);
-                            return 1;
-                        }
-                    } else if (has_legacy_reclaim) {
+                    const bool pipeline_active = pkvm_shinfo_pipeline_active(reclaim_info);
+                    const bool reclaim_pending = pkvm_shinfo_reclaim_pending(reclaim_info);
+                    const bool defer_to_pipeline = pipeline_active ||
+                        reclaim_info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED;
+                    if (has_legacy_reclaim && !defer_to_pipeline) {
                         const int decrypt_result = decrypt_reclaimed_tensors(
                                 reclaim_info.reclaimed_pages, 0);
                         const bool clear_result = clear_pkvm_shinfo_reclaimed();
@@ -1085,11 +1139,15 @@ int main(int argc, char ** argv) {
                             return 1;
                         }
                     }
-    if (ggml_rknpu2_flush_all_payload() != 0) {
-        LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-        return 1;
-    }
-    LOG("flush all\n");
+                    if (!defer_to_pipeline && !reclaim_pending) {
+                        if (ggml_rknpu2_flush_all_payload() != 0) {
+                            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+                            return 1;
+                        }
+                        LOG("flush all\n");
+                    } else if (defer_to_pipeline || reclaim_pending) {
+                        LOG("reclaim pending; defer RKNPU payload flush to pipeline wait\n");
+                    }
 
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);
