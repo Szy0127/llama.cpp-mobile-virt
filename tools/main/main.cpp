@@ -643,6 +643,8 @@ int main(int argc, char ** argv) {
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
     std::ostringstream output_ss;     g_output_ss     = &output_ss;
     std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
+    int64_t ttft_start_us = 0;
+    bool    ttft_pending  = false;
 
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(console::prompt);
@@ -841,6 +843,12 @@ int main(int argc, char ** argv) {
 
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
+            if (ttft_pending) {
+                const int64_t ttft_us = llama_time_us() - ttft_start_us;
+                LOG("\nTTFT: %" PRId64 " us (%.3f ms)\n", ttft_us, ttft_us / 1000.0);
+                ttft_pending = false;
+            }
+
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
@@ -1020,6 +1028,8 @@ int main(int argc, char ** argv) {
                     LOG_DBG("buffer: '%s'\n", buffer.c_str());
 
                     const size_t original_size = embd_inp.size();
+                    ttft_start_us = llama_time_us();
+                    ttft_pending  = true;
 
                     if (params.escape) {
                         string_process_escapes(buffer);
@@ -1044,11 +1054,13 @@ int main(int argc, char ** argv) {
                             return 1;
                         }
                     }
+                    /*
     if (ggml_rknpu2_flush_all_payload() != 0) {
         LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
         return 1;
     }
     LOG("flush all\n");
+    */
 
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);
