@@ -1,6 +1,10 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cinttypes>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <atomic>
@@ -205,6 +209,8 @@ uint64_t ggml_backend_rknpure_get_npu_count(void) {
 #include <chrono>
 #include <queue>
 #include <future>
+
+#include <openssl/evp.h>
 
 static inline int64_t get_micro(void) {
     auto now = std::chrono::high_resolution_clock::now();
@@ -1699,6 +1705,8 @@ struct rknpu_weight_prepack_block {
     float scale;
     uint64_t packed_dma = 0; // weight_dma may legitimately be 0 when the packed payload starts at the beginning of an IOVA window
     uint32_t domain_id = 0;
+    const void * payload = nullptr;
+    size_t payload_size = 0;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1756,9 +1764,537 @@ static std::mutex g_offline_prepack_mtx;
 static std::unordered_map<std::string, rknpu_offline_prepack_blob> g_offline_prepack_registry;
 static std::unordered_map<rknpu_weight_prepack_key, std::shared_ptr<rknpu_weight_prepack_cache>, rknpu_weight_prepack_key_hash> g_weight_prepack_cache;
 
+static constexpr size_t   RKNPU_PIPELINE_AES_BLOCK_SIZE         = 16;
+static constexpr uint32_t PKVM_SHINFO_PIPELINE_MAX_ENTRIES      = 512;
+static constexpr uint32_t PKVM_SHINFO_PIPELINE_STAGE_MAX        = 4;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND  = 0;
+static constexpr uint32_t PKVM_PIPELINE_STAGE_GUEST_DECRYPT     = 1;
+static constexpr uint64_t PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED = 1;
+static constexpr uint8_t  PKVM_PIPELINE_READY                   = 2;
+static constexpr size_t   PKVM_SHINFO_MAP_SIZE                  = 0x1000UL;
+
+static const uint8_t RKNPU_PIPELINE_AES128_ECB_KEY[RKNPU_PIPELINE_AES_BLOCK_SIZE] = {
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f,
+};
+
+struct ggml_rknpu2_pipeline_entry {
+    uint8_t stage[PKVM_SHINFO_PIPELINE_STAGE_MAX];
+};
+
+struct ggml_rknpu2_pipeline_shinfo {
+    uint64_t reclaimed_pages;
+    uint64_t compute_entries_state;
+    uint32_t pipeline_entry_count;
+    uint32_t pipeline_entry_size;
+    uint32_t pipeline_reload_start_entry;
+    uint32_t pipeline_reload_entry_count;
+    uint32_t pipeline_reserved0;
+    uint32_t pipeline_reserved1;
+    ggml_rknpu2_pipeline_entry pipeline_entries[PKVM_SHINFO_PIPELINE_MAX_ENTRIES];
+};
+
+struct ggml_rknpu2_pipeline_header {
+    uint64_t reclaimed_pages = 0;
+    uint64_t compute_entries_state = 0;
+    uint32_t entry_count = 0;
+    uint32_t entry_size = 0;
+    uint32_t reload_start_entry = 0;
+    uint32_t reload_entry_count = 0;
+};
+
+struct ggml_rknpu2_pipeline_decrypt_span {
+    const ggml_tensor * tensor = nullptr;
+    uint64_t start = 0;
+    uint64_t end = 0;
+};
+
+static int g_pipeline_shinfo_fd = -1;
+static uint64_t g_pipeline_shinfo_phys_addr = 0;
+static volatile ggml_rknpu2_pipeline_shinfo * g_pipeline_shinfo = nullptr;
+static std::mutex g_pipeline_mtx;
+static std::vector<ggml_rknpu2_pipeline_decrypt_span> g_pipeline_decrypt_spans;
+static bool g_pipeline_decrypt_index_valid = false;
+
+static volatile ggml_rknpu2_pipeline_shinfo * ggml_rknpu2_pipeline_map_shinfo() {
+    if (g_pipeline_shinfo != nullptr) {
+        return g_pipeline_shinfo;
+    }
+
+    if (g_pipeline_shinfo_phys_addr == 0 &&
+        ggml_rknpu2_get_shinfo_phys_addr(&g_pipeline_shinfo_phys_addr) != 0) {
+        GGML_LOG_ERROR("%s: failed to get pkvm shinfo phys addr: errno=%d\n", __func__, errno);
+        return nullptr;
+    }
+
+    g_pipeline_shinfo_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (g_pipeline_shinfo_fd < 0) {
+        GGML_LOG_ERROR("%s: open(/dev/mem) failed: errno=%d\n", __func__, errno);
+        return nullptr;
+    }
+
+    void * map = mmap(nullptr, PKVM_SHINFO_MAP_SIZE, PROT_READ | PROT_WRITE,
+            MAP_SHARED, g_pipeline_shinfo_fd, (off_t) g_pipeline_shinfo_phys_addr);
+    if (map == MAP_FAILED) {
+        GGML_LOG_ERROR("%s: mmap shinfo phys=0x%" PRIx64 " failed: errno=%d\n",
+                __func__, g_pipeline_shinfo_phys_addr, errno);
+        close(g_pipeline_shinfo_fd);
+        g_pipeline_shinfo_fd = -1;
+        return nullptr;
+    }
+
+    g_pipeline_shinfo = static_cast<volatile ggml_rknpu2_pipeline_shinfo *>(map);
+    return g_pipeline_shinfo;
+}
+
+static bool ggml_rknpu2_pipeline_read_header(ggml_rknpu2_pipeline_header & out) {
+    volatile ggml_rknpu2_pipeline_shinfo * shinfo = ggml_rknpu2_pipeline_map_shinfo();
+    if (shinfo == nullptr) {
+        return false;
+    }
+
+    out.reclaimed_pages =
+        __atomic_load_n(&shinfo->reclaimed_pages, __ATOMIC_ACQUIRE);
+    out.compute_entries_state =
+        __atomic_load_n(&shinfo->compute_entries_state, __ATOMIC_ACQUIRE);
+    out.entry_count =
+        __atomic_load_n(&shinfo->pipeline_entry_count, __ATOMIC_ACQUIRE);
+    out.entry_size =
+        __atomic_load_n(&shinfo->pipeline_entry_size, __ATOMIC_ACQUIRE);
+    out.reload_start_entry =
+        __atomic_load_n(&shinfo->pipeline_reload_start_entry, __ATOMIC_ACQUIRE);
+    out.reload_entry_count =
+        __atomic_load_n(&shinfo->pipeline_reload_entry_count, __ATOMIC_ACQUIRE);
+    return true;
+}
+
+static bool ggml_rknpu2_pipeline_header_initializing(const ggml_rknpu2_pipeline_header & info) {
+    return info.entry_size == 0 && (info.entry_count != 0 || info.reload_entry_count != 0);
+}
+
+static bool ggml_rknpu2_pipeline_has_active_reload(const ggml_rknpu2_pipeline_header & info) {
+    return info.entry_size != 0 && info.entry_count != 0 && info.reload_entry_count != 0;
+}
+
+static bool ggml_rknpu2_pipeline_entry_in_reload(const ggml_rknpu2_pipeline_header & info, uint32_t entry) {
+    const uint64_t reload_start = info.reload_start_entry;
+    const uint64_t reload_end = reload_start + info.reload_entry_count;
+    return entry >= reload_start && entry < reload_end;
+}
+
+static uint32_t ggml_rknpu2_pipeline_entry_limit(const ggml_rknpu2_pipeline_header & info) {
+    return std::min<uint32_t>(info.entry_count, PKVM_SHINFO_PIPELINE_MAX_ENTRIES);
+}
+
+static uint8_t ggml_rknpu2_pipeline_load_stage(uint32_t entry, uint32_t stage) {
+    volatile ggml_rknpu2_pipeline_shinfo * shinfo = ggml_rknpu2_pipeline_map_shinfo();
+    if (shinfo == nullptr ||
+        entry >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
+        stage >= PKVM_SHINFO_PIPELINE_STAGE_MAX) {
+        return 0;
+    }
+
+    return __atomic_load_n(&shinfo->pipeline_entries[entry].stage[stage], __ATOMIC_ACQUIRE);
+}
+
+static void ggml_rknpu2_pipeline_store_stage(uint32_t entry, uint32_t stage, uint8_t state) {
+    volatile ggml_rknpu2_pipeline_shinfo * shinfo = ggml_rknpu2_pipeline_map_shinfo();
+    if (shinfo == nullptr ||
+        entry >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
+        stage >= PKVM_SHINFO_PIPELINE_STAGE_MAX) {
+        return;
+    }
+
+    __atomic_store_n(&shinfo->pipeline_entries[entry].stage[stage], state, __ATOMIC_RELEASE);
+}
+
+static int ggml_rknpu2_pipeline_aes128_ecb_decrypt_inplace(uint8_t * data, size_t len) {
+    if (data == nullptr || len % RKNPU_PIPELINE_AES_BLOCK_SIZE != 0) {
+        return -1;
+    }
+
+    EVP_CIPHER_CTX * ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+        return -1;
+    }
+
+    int ret = -1;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr,
+                           RKNPU_PIPELINE_AES128_ECB_KEY, nullptr) != 1) {
+        goto cleanup;
+    }
+
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    for (size_t done = 0; done < len; ) {
+        size_t chunk = std::min(len - done, static_cast<size_t>(INT_MAX));
+        chunk -= chunk % RKNPU_PIPELINE_AES_BLOCK_SIZE;
+        if (chunk == 0) {
+            goto cleanup;
+        }
+
+        int out_len = 0;
+        if (EVP_DecryptUpdate(ctx, data + done, &out_len, data + done,
+                              static_cast<int>(chunk)) != 1 ||
+            out_len != static_cast<int>(chunk)) {
+            goto cleanup;
+        }
+        done += chunk;
+    }
+
+    {
+        int final_len = 0;
+        if (EVP_DecryptFinal_ex(ctx, data + len, &final_len) != 1 || final_len != 0) {
+            goto cleanup;
+        }
+    }
+
+    ret = 0;
+
+cleanup:
+    EVP_CIPHER_CTX_free(ctx);
+    return ret;
+}
+
+static int ggml_rknpu2_pipeline_decrypt_tensor_range(const ggml_tensor * tensor, uint64_t offset, uint64_t len) {
+    if (tensor == nullptr || tensor->data == nullptr || len == 0) {
+        return 0;
+    }
+    if (offset > SIZE_MAX || len > SIZE_MAX) {
+        GGML_LOG_ERROR("%s: decrypt range too large for tensor '%s' offset=%" PRIu64 " len=%" PRIu64 "\n",
+                __func__, ggml_get_name(tensor), offset, len);
+        return -1;
+    }
+
+    const size_t n_size = ggml_nbytes(tensor);
+    const size_t range_offset = (size_t) offset;
+    const size_t range_len = (size_t) len;
+    if (range_offset > n_size || range_len > n_size - range_offset) {
+        GGML_LOG_ERROR("%s: decrypt range exceeds tensor '%s' offset=%zu len=%zu tensor=%zu\n",
+                __func__, ggml_get_name(tensor), range_offset, range_len, n_size);
+        return -1;
+    }
+    if ((range_offset % RKNPU_PIPELINE_AES_BLOCK_SIZE) != 0 ||
+        (range_len % RKNPU_PIPELINE_AES_BLOCK_SIZE) != 0) {
+        GGML_LOG_ERROR("%s: decrypt range is not AES-block aligned for tensor '%s' offset=%zu len=%zu\n",
+                __func__, ggml_get_name(tensor), range_offset, range_len);
+        return -1;
+    }
+
+    return ggml_rknpu2_pipeline_aes128_ecb_decrypt_inplace(
+            static_cast<uint8_t *>(tensor->data) + range_offset, range_len);
+}
+
+static int ggml_rknpu2_pipeline_build_decrypt_index_locked() {
+    if (g_pipeline_decrypt_index_valid) {
+        return 0;
+    }
+
+    g_pipeline_decrypt_spans.clear();
+
+    std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
+    for (const auto & it : g_offline_prepack_registry) {
+        const rknpu_offline_prepack_blob & offline = it.second;
+        const ggml_tensor * tensor = offline.payload_tensor;
+        if (tensor == nullptr || tensor->data == nullptr || offline.payload_size == 0) {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (const auto & span : g_pipeline_decrypt_spans) {
+            if (span.tensor == tensor || (span.tensor != nullptr && span.tensor->data == tensor->data)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+
+        uint64_t start = 0;
+        if (ggml_rknpu2_payload_ptr_to_offset(tensor->data, &start) != 0) {
+            GGML_LOG_ERROR("%s: failed to resolve RKNPU payload offset for tensor '%s'\n",
+                    __func__, ggml_get_name(tensor));
+            return -1;
+        }
+        if ((uint64_t) offline.payload_size > UINT64_MAX - start) {
+            GGML_LOG_ERROR("%s: RKNPU payload span overflows for tensor '%s'\n",
+                    __func__, ggml_get_name(tensor));
+            return -1;
+        }
+        if ((offline.payload_size % RKNPU_PIPELINE_AES_BLOCK_SIZE) != 0) {
+            GGML_LOG_ERROR("%s: RKNPU payload tensor '%s' size=%zu is not AES-block aligned\n",
+                    __func__, ggml_get_name(tensor), offline.payload_size);
+            return -1;
+        }
+
+        g_pipeline_decrypt_spans.push_back({ tensor, start, start + (uint64_t) offline.payload_size });
+    }
+
+    std::sort(g_pipeline_decrypt_spans.begin(), g_pipeline_decrypt_spans.end(),
+            [](const ggml_rknpu2_pipeline_decrypt_span & lhs,
+               const ggml_rknpu2_pipeline_decrypt_span & rhs) {
+                return lhs.start < rhs.start;
+            });
+
+    g_pipeline_decrypt_index_valid = true;
+    return 0;
+}
+
+static int ggml_rknpu2_pipeline_decrypt_entry_locked(
+        const ggml_rknpu2_pipeline_header & info,
+        uint32_t entry) {
+    if (entry >= PKVM_SHINFO_PIPELINE_MAX_ENTRIES ||
+        entry >= info.entry_count) {
+        GGML_LOG_ERROR("%s: pipeline entry=%u exceeds capacity\n", __func__, entry);
+        return -1;
+    }
+    if (ggml_rknpu2_pipeline_load_stage(entry, PKVM_PIPELINE_STAGE_GUEST_DECRYPT) ==
+            PKVM_PIPELINE_READY) {
+        return 0;
+    }
+    if (ggml_rknpu2_pipeline_build_decrypt_index_locked() != 0) {
+        return -1;
+    }
+
+    const uint64_t entry_start = (uint64_t) entry * info.entry_size;
+    const uint64_t entry_end = entry_start + info.entry_size;
+    uint64_t decrypted_bytes = 0;
+    size_t decrypted_spans = 0;
+
+    auto span_it = std::upper_bound(g_pipeline_decrypt_spans.begin(), g_pipeline_decrypt_spans.end(), entry_start,
+            [](uint64_t offset, const ggml_rknpu2_pipeline_decrypt_span & span) {
+                return offset < span.end;
+            });
+
+    for (; span_it != g_pipeline_decrypt_spans.end(); ++span_it) {
+        if (span_it->start >= entry_end) {
+            break;
+        }
+
+        const uint64_t part_start = std::max(span_it->start, entry_start);
+        const uint64_t part_end = std::min(span_it->end, entry_end);
+        if (part_start >= part_end) {
+            continue;
+        }
+
+        const uint64_t tensor_offset = part_start - span_it->start;
+        const uint64_t tensor_len = part_end - part_start;
+        if (ggml_rknpu2_pipeline_decrypt_tensor_range(span_it->tensor, tensor_offset, tensor_len) != 0) {
+            GGML_LOG_ERROR("%s: decrypt failed for entry=%u tensor='%s' offset=%" PRIu64 " len=%" PRIu64 "\n",
+                    __func__, entry, ggml_get_name(span_it->tensor), tensor_offset, tensor_len);
+            return -1;
+        }
+
+        if (ggml_rknpu2_flush_payload_range(part_start, tensor_len) != 0) {
+            GGML_LOG_ERROR("%s: flush failed for entry=%u tensor='%s' range=[0x%" PRIx64 ",0x%" PRIx64 ") errno=%d\n",
+                    __func__, entry, ggml_get_name(span_it->tensor), part_start, part_end, errno);
+            return -1;
+        }
+
+        decrypted_bytes += tensor_len;
+        decrypted_spans++;
+    }
+
+    if (decrypted_bytes > 0) {
+        GGML_LOG_INFO("%s: pipeline entry=%u decrypted %zu spans / %.2f MiB\n",
+                __func__, entry, decrypted_spans, decrypted_bytes / 1024.0 / 1024.0);
+    }
+
+    ggml_rknpu2_pipeline_store_stage(entry, PKVM_PIPELINE_STAGE_GUEST_DECRYPT, PKVM_PIPELINE_READY);
+    return 0;
+}
+
+static int ggml_rknpu2_pipeline_wait_compute_ready_locked(
+        std::unique_lock<std::mutex> & lock,
+        const char * caller,
+        ggml_rknpu2_pipeline_header * out_info) {
+    uint64_t wait_loops = 0;
+    ggml_rknpu2_pipeline_header info = {};
+
+    while (true) {
+        if (!ggml_rknpu2_pipeline_read_header(info)) {
+            if (out_info != nullptr) {
+                *out_info = {};
+            }
+            return 0;
+        }
+
+        if (info.compute_entries_state != PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED &&
+            !ggml_rknpu2_pipeline_header_initializing(info)) {
+            if (out_info != nullptr) {
+                *out_info = info;
+            }
+            return 0;
+        }
+
+        if ((wait_loops % 2000) == 0) {
+            GGML_LOG_INFO("%s: wait compute/header compute=%" PRIu64 " entry_size=%u entries=%u reload=%u+%u\n",
+                    caller,
+                    info.compute_entries_state,
+                    info.entry_size,
+                    info.entry_count,
+                    info.reload_start_entry,
+                    info.reload_entry_count);
+        }
+        wait_loops++;
+
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        lock.lock();
+    }
+}
+
+static bool ggml_rknpu2_pipeline_reload_all_ready_locked(const ggml_rknpu2_pipeline_header & info) {
+    if (!ggml_rknpu2_pipeline_has_active_reload(info)) {
+        return false;
+    }
+
+    const uint64_t reload_start = info.reload_start_entry;
+    uint64_t reload_end = reload_start + info.reload_entry_count;
+    const uint32_t entry_limit = ggml_rknpu2_pipeline_entry_limit(info);
+    if (reload_start >= entry_limit) {
+        return false;
+    }
+    reload_end = std::min<uint64_t>(reload_end, entry_limit);
+
+    for (uint64_t entry64 = reload_start; entry64 < reload_end; ++entry64) {
+        const uint32_t entry = (uint32_t) entry64;
+        if (ggml_rknpu2_pipeline_load_stage(entry, PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND) !=
+                PKVM_PIPELINE_READY ||
+            ggml_rknpu2_pipeline_load_stage(entry, PKVM_PIPELINE_STAGE_GUEST_DECRYPT) !=
+                PKVM_PIPELINE_READY) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int ggml_rknpu2_pipeline_ensure_payload_ready(const void * payload, size_t size) {
+    if (payload == nullptr || size == 0) {
+        return 0;
+    }
+
+    uint64_t payload_offset = 0;
+    if (ggml_rknpu2_payload_ptr_to_offset(payload, &payload_offset) != 0) {
+        GGML_LOG_ERROR("%s: failed to resolve RKNPU payload offset\n", __func__);
+        return -1;
+    }
+    if ((uint64_t) size > UINT64_MAX - payload_offset) {
+        GGML_LOG_ERROR("%s: payload range overflows offset=0x%" PRIx64 " size=%zu\n",
+                __func__, payload_offset, size);
+        return -1;
+    }
+
+    std::unique_lock<std::mutex> lock(g_pipeline_mtx);
+    ggml_rknpu2_pipeline_header info = {};
+    if (ggml_rknpu2_pipeline_wait_compute_ready_locked(lock, __func__, &info) != 0) {
+        return -1;
+    }
+    if (!ggml_rknpu2_pipeline_has_active_reload(info)) {
+        return 0;
+    }
+
+    const uint64_t payload_end = payload_offset + (uint64_t) size;
+    const uint32_t entry_limit = ggml_rknpu2_pipeline_entry_limit(info);
+    uint64_t entry_start64 = payload_offset / info.entry_size;
+    uint64_t entry_end64 = ((payload_end - 1) / info.entry_size) + 1;
+    entry_end64 = std::min<uint64_t>(entry_end64, entry_limit);
+
+    for (uint64_t entry64 = entry_start64; entry64 < entry_end64; ++entry64) {
+        const uint32_t entry = (uint32_t) entry64;
+        if (!ggml_rknpu2_pipeline_entry_in_reload(info, entry)) {
+            continue;
+        }
+
+        uint64_t wait_loops = 0;
+        while (ggml_rknpu2_pipeline_load_stage(entry, PKVM_PIPELINE_STAGE_HOST_LOAD_EXTEND) !=
+                PKVM_PIPELINE_READY) {
+            if ((wait_loops % 2000) == 0) {
+                GGML_LOG_INFO("%s: wait entry=%u payload=[0x%" PRIx64 ",0x%" PRIx64 ")\n",
+                        __func__, entry, payload_offset, payload_end);
+            }
+            wait_loops++;
+
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            lock.lock();
+
+            if (ggml_rknpu2_pipeline_wait_compute_ready_locked(lock, __func__, &info) != 0) {
+                return -1;
+            }
+            if (!ggml_rknpu2_pipeline_has_active_reload(info) ||
+                !ggml_rknpu2_pipeline_entry_in_reload(info, entry)) {
+                break;
+            }
+        }
+
+        if (!ggml_rknpu2_pipeline_has_active_reload(info) ||
+            !ggml_rknpu2_pipeline_entry_in_reload(info, entry)) {
+            continue;
+        }
+
+        if (ggml_rknpu2_pipeline_decrypt_entry_locked(info, entry) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+bool ggml_rknpu2_pipeline_has_pending_work(void) {
+    std::lock_guard<std::mutex> lock(g_pipeline_mtx);
+    ggml_rknpu2_pipeline_header info = {};
+    if (!ggml_rknpu2_pipeline_read_header(info)) {
+        return false;
+    }
+
+    if (info.compute_entries_state == PKVM_SHINFO_COMPUTE_ENTRIES_RECLAIMED ||
+        ggml_rknpu2_pipeline_header_initializing(info)) {
+        return true;
+    }
+    if (!ggml_rknpu2_pipeline_has_active_reload(info)) {
+        return false;
+    }
+
+    return !ggml_rknpu2_pipeline_reload_all_ready_locked(info);
+}
+
+int ggml_rknpu2_pipeline_wait_compute_ready(void) {
+    std::unique_lock<std::mutex> lock(g_pipeline_mtx);
+    return ggml_rknpu2_pipeline_wait_compute_ready_locked(lock, __func__, nullptr);
+}
+
+int ggml_rknpu2_pipeline_clear_legacy_reclaim_if_done(void) {
+    std::lock_guard<std::mutex> lock(g_pipeline_mtx);
+    volatile ggml_rknpu2_pipeline_shinfo * shinfo = ggml_rknpu2_pipeline_map_shinfo();
+    if (shinfo == nullptr) {
+        return 0;
+    }
+
+    ggml_rknpu2_pipeline_header info = {};
+    if (!ggml_rknpu2_pipeline_read_header(info) ||
+        !ggml_rknpu2_pipeline_reload_all_ready_locked(info)) {
+        return 0;
+    }
+
+    if (info.reclaimed_pages != 0) {
+        __atomic_store_n(&shinfo->reclaimed_pages, 0, __ATOMIC_RELEASE);
+        GGML_LOG_INFO("%s: cleared legacy reclaimed_pages after pipeline completion\n", __func__);
+        return 1;
+    }
+
+    return 0;
+}
+
 void ggml_rknpu2_clear_offline_prepack_registry(void) {
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry.clear();
+    g_pipeline_decrypt_spans.clear();
+    g_pipeline_decrypt_index_valid = false;
 }
 
 bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const struct ggml_tensor * meta_tensor, const struct ggml_tensor * payload_tensor) {
@@ -1804,6 +2340,7 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
     g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
+    g_pipeline_decrypt_index_valid = false;
     return true;
 }
 
@@ -1936,12 +2473,15 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
         for (int kk = 0; kk < k; kk += K) {
+            const uint64_t payload_offset = uint64_t(block_index) * packed_size;
             rknpu_weight_prepack_block block;
             block.nn = nn;
             block.kk = kk;
             block.scale = scales ? scales[block_index] : 1.0f;
-            block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
+            block.packed_dma = packed_dma_base + payload_offset;
             block.domain_id = offline->payload_domain_id;
+            block.payload = static_cast<const uint8_t *>(offline->payload_tensor->data) + payload_offset;
+            block.payload_size = packed_size;
             cache->blocks.emplace(rknpu_block_key(nn, kk), block);
             ++block_index;
         }
@@ -2241,6 +2781,10 @@ void rknpu2_matmul_pre0(struct ggml_tensor * dst, int nth, int ith) {
     rknn_tensor_type tensor_type = ggml_type_to_rknn_type(type);
 
     if (ith == 0) {
+        if (ggml_rknpu2_pipeline_wait_compute_ready() != 0) {
+            GGML_ABORT("%s: failed waiting for RKNPU compute entries", __func__);
+        }
+
         auto kernel = ggml_rknpu2_matmul_kernel_create(m, k, n, tensor_type);
         GGML_ASSERT(kernel);
         memset(dst->data, 0, m * n * sizeof(float));
@@ -2438,6 +2982,11 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
             }
             if (ith == 0) {
+                if (ggml_rknpu2_pipeline_ensure_payload_ready(block->payload, block->payload_size) != 0) {
+                    GGML_ABORT("%s: payload is not ready for tensor %s block nn=%d kk=%d",
+                            __func__, src0->name, nn, kk);
+                }
+
                 const uint64_t weight_dma = block->packed_dma;
                 const uint32_t weight_domain_id = block->domain_id;
                 if (tensor_type == RKNN_TENSOR_INT8) {

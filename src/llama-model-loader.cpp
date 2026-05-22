@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
 #if defined(GGML_USE_RKNPU_RE)
+#include "ggml-rknpu-re.h"
 #include "../ggml/src/ggml-rknpu_re/npu_interface.h"
 #endif
 
@@ -308,6 +309,11 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
     size_t decrypted_count = 0;
     size_t decrypted_bytes = 0;
+#if defined(GGML_USE_RKNPU_RE)
+    const bool pipeline_pending = ggml_rknpu2_pipeline_has_pending_work();
+#else
+    const bool pipeline_pending = false;
+#endif
     for (ggml_tensor * tensor : g_encrypted_tensors) {
         if (!llama_tensor_needs_runtime_decrypt(tensor)) {
             continue;
@@ -321,6 +327,11 @@ LLAMA_API int decrypt_all_tensor(bool only_npu) {
         if (only_npu && std::strstr(ggml_get_name(tensor), ".__rknpu") == nullptr) {
             continue;
         }
+#if defined(GGML_USE_RKNPU_RE)
+        if (pipeline_pending && llama_is_rknpu_prepack_payload_name(ggml_get_name(tensor))) {
+            continue;
+        }
+#endif
 
 
         const size_t n_size = ggml_nbytes(tensor);

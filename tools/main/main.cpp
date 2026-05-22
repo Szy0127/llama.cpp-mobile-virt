@@ -699,11 +699,17 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
         return 1;
     }
-    if (ggml_rknpu2_flush_all_payload() != 0) {
-        LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-        return 1;
+#if defined(GGML_USE_RKNPU_RE)
+    if (!ggml_rknpu2_pipeline_has_pending_work()) {
+        if (ggml_rknpu2_flush_all_payload() != 0) {
+            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+            return 1;
+        }
+        LOG("flush all\n");
+    } else {
+        LOG_INF("%s : RKNPU pipeline pending; payload flush is deferred to per-entry decrypt\n", __func__);
     }
-    LOG("flush all\n");
+#endif
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -1042,16 +1048,25 @@ int main(int argc, char ** argv) {
 
                     pkvm_shinfo reclaim_info = {};
                     if (dump_pkvm_shinfo("interactive-user-input", &reclaim_info)){
-                        const int decrypt_result = decrypt_reclaimed_tensors(
-                                reclaim_info.reclaimed_pages, 0);
-                        const bool clear_result = clear_pkvm_shinfo_reclaimed();
-                        if (decrypt_result != 0) {
-                            LOG_ERR("%s : failed to decrypt reclaimed RKNPU tensors\n", __func__);
-                            return 1;
-                        }
-                        if (!clear_result) {
-                            LOG_ERR("%s : failed to clear pkvm shinfo reclaimed info\n", __func__);
-                            return 1;
+#if defined(GGML_USE_RKNPU_RE)
+                        if (ggml_rknpu2_pipeline_has_pending_work()) {
+                            LOG_INF("%s : RKNPU pipeline pending; legacy suffix decrypt is skipped\n", __func__);
+                        } else if (ggml_rknpu2_pipeline_clear_legacy_reclaim_if_done() > 0) {
+                            LOG_INF("%s : RKNPU pipeline completed; legacy reclaimed_pages cleared\n", __func__);
+                        } else
+#endif
+                        {
+                            const int decrypt_result = decrypt_reclaimed_tensors(
+                                    reclaim_info.reclaimed_pages, 0);
+                            const bool clear_result = clear_pkvm_shinfo_reclaimed();
+                            if (decrypt_result != 0) {
+                                LOG_ERR("%s : failed to decrypt reclaimed RKNPU tensors\n", __func__);
+                                return 1;
+                            }
+                            if (!clear_result) {
+                                LOG_ERR("%s : failed to clear pkvm shinfo reclaimed info\n", __func__);
+                                return 1;
+                            }
                         }
                     }
                     /*

@@ -32,6 +32,9 @@ GGML_API void ggml_rknpu2_reset_compute_used(void);
 GGML_API int ggml_rknpu2_get_shinfo_phys_addr(uint64_t *phys_addr);
 GGML_API int ggml_rknpu2_flush_payload_range(uint64_t payload_offset, uint64_t size);
 GGML_API int ggml_rknpu2_flush_all_payload(void);
+GGML_API bool ggml_rknpu2_pipeline_has_pending_work(void);
+GGML_API int ggml_rknpu2_pipeline_wait_compute_ready(void);
+GGML_API int ggml_rknpu2_pipeline_clear_legacy_reclaim_if_done(void);
 
 #ifdef __cplusplus
 }
