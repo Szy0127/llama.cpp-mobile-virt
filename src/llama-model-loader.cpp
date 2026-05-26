@@ -588,6 +588,10 @@ llama_model_loader::llama_model_loader(
     // For subsidiary files, `meta` tensor data offset must not be used,
     // so we build a unified tensors index for weights.
     for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (rknpu_prepack_is_padding_name(cur->name)) {
+            // These tensors only materialize holes in the file layout.
+            continue;
+        }
         std::string tensor_name = std::string(cur->name);
         const bool is_aux = llama_is_rknpu_prepack_meta_name(cur->name) || llama_is_rknpu_prepack_payload_name(cur->name);
         auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;
@@ -656,6 +660,9 @@ llama_model_loader::llama_model_loader(
 
             // Save tensors data offset info of the shard.
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (rknpu_prepack_is_padding_name(cur->name)) {
+                    continue;
+                }
                 std::string tensor_name = std::string(cur->name);
                 const bool is_aux = llama_is_rknpu_prepack_meta_name(cur->name) || llama_is_rknpu_prepack_payload_name(cur->name);
                 auto & tensor_map = is_aux ? auxiliary_weights_map : weights_map;

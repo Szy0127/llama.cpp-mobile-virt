@@ -500,7 +500,7 @@ static int run(const params & p) {
     // padding tensor so standard GGUF readers still see monotonically increasing tensor offsets.
     size_t payload_cursor = 0;
     size_t padding_index = 0;
-    std::string first_payload_tensor_name;
+    std::string first_payload_region_tensor_name;
 
     for (const auto & prepared : prepared_tensors) {
         if (payload_cursor < prepared.payload_pool_offset) {
@@ -516,6 +516,9 @@ static int run(const params & p) {
             padding_tensor->data = padding_storage.data();
             gguf_add_tensor(ctx_out.get(), padding_tensor);
             out_tensors[padding_name] = padding_tensor;
+            if (first_payload_region_tensor_name.empty()) {
+                first_payload_region_tensor_name = padding_name;
+            }
             payload_cursor += gap_bytes;
         }
 
@@ -530,8 +533,8 @@ static int run(const params & p) {
         gguf_add_tensor(ctx_out.get(), payload_tensor);
         out_tensors[payload_name] = payload_tensor;
 
-        if (first_payload_tensor_name.empty()) {
-            first_payload_tensor_name = payload_name;
+        if (first_payload_region_tensor_name.empty()) {
+            first_payload_region_tensor_name = payload_name;
         }
 
         const size_t payload_tensor_file_bytes = GGML_PAD(payload_storage.size(), align);
@@ -539,6 +542,7 @@ static int run(const params & p) {
 
         const size_t tail_padding_bytes = prepared.payload_alloc_size - payload_tensor_file_bytes;
         if (tail_padding_bytes > 0) {
+            // Guest payload allocation is page-aligned, so the file image must preserve the same slack.
             GGML_ASSERT(GGML_PAD(tail_padding_bytes, align) == tail_padding_bytes);
             blob_parts.emplace_back(tail_padding_bytes, 0);
             auto & padding_storage = blob_parts.back();
@@ -557,9 +561,11 @@ static int run(const params & p) {
     GGML_ASSERT(payload_cursor == payload_region_bytes);
 
     uint64_t payload_start = 0;
-    if (!first_payload_tensor_name.empty()) {
-        const int64_t tid = gguf_find_tensor(ctx_out.get(), first_payload_tensor_name.c_str());
+    if (!first_payload_region_tensor_name.empty()) {
+        const int64_t tid = gguf_find_tensor(ctx_out.get(), first_payload_region_tensor_name.c_str());
         GGML_ASSERT(tid >= 0);
+        // Host reload uses an absolute file offset into the start of the whole payload-pool image,
+        // not the first real payload tensor.
         payload_start = static_cast<uint64_t>(gguf_get_meta_size(ctx_out.get()) + gguf_get_tensor_offset(ctx_out.get(), tid));
     }
 
