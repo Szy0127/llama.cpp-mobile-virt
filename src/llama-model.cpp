@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rknpu-re.h"
 #include "../ggml/src/ggml-rknpu_re/npu_interface.h"
+#include "../ggml/src/ggml-rknpu_re/rknpu-prepack-common.h"
 
 #include <algorithm>
 #include <cassert>
