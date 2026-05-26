@@ -1745,8 +1745,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
         return nullptr;
     }
 
-    std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
-            __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
+    //std::fprintf(stderr, "[RKNPU_OFFLINE] %s: loaded offline prepack for tensor %s via meta %s payload %s\n",
+      //      __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str());
 
     if (offline->meta_size < sizeof(rknpu_offline_blob_header)) {
         return nullptr;
@@ -1808,12 +1808,14 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     const uint8_t * packed_base = offline->payload_cpu_ptr;
     const uint64_t packed_dma_base = offline->payload_dma;
 
+    /*
     std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s meta=%s payload=%s payload_dma=0x%llx meta_size=%zu payload_size=%zu packed_size=%u\n",
             __func__, src0->name, offline->meta_tensor_name.c_str(), offline->payload_tensor_name.c_str(),
             (unsigned long long) offline->payload_dma,
             offline->meta_size,
             offline->payload_size,
             packed_size);
+            */
 
     uint32_t block_index = 0;
     for (int nn = 0; nn < n; nn += N) {
@@ -1824,11 +1826,13 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.scale = scales ? scales[block_index] : 1.0f;
             block.packed_cpu = packed_base + size_t(block_index) * packed_size;
             block.packed_dma = packed_dma_base + uint64_t(block_index) * packed_size;
+            /*
             if (block_index < 4) {
                 std::fprintf(stderr, "[RKNPU_OFFLINE] %s: tensor=%s block=%u nn=%d kk=%d packed_dma=0x%llx packed_cpu=%p\n",
                         __func__, src0->name, block_index, nn, kk,
                         (unsigned long long) block.packed_dma, block.packed_cpu);
             }
+            */
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
