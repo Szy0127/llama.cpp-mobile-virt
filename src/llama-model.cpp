@@ -55,49 +55,6 @@ struct llama_rknpu_prepack_ordered_entry {
     const llama_model_loader::llama_rknpu_prepack_meta * meta;
 };
 
-struct llama_rknpu_prepack_sort_key {
-    bool is_output = false;
-    bool has_layer = false;
-    int layer = -1;
-    int component_rank = 100;
-};
-
-static llama_rknpu_prepack_sort_key llama_get_rknpu_prepack_sort_key(const std::string & tensor_name) {
-    llama_rknpu_prepack_sort_key key;
-
-    if (tensor_name == "output.weight") {
-        key.is_output = true;
-        return key;
-    }
-
-    int layer = -1;
-    if (sscanf(tensor_name.c_str(), "blk.%d.", &layer) == 1) {
-        key.has_layer = true;
-        key.layer = layer;
-    }
-
-    static const std::pair<const char *, int> component_ranks[] = {
-        {".attn_q.weight",      0},
-        {".attn_k.weight",      1},
-        {".attn_v.weight",      2},
-        {".attn_output.weight", 3},
-        {".ffn_gate.weight",    4},
-        {".ffn_up.weight",      5},
-        {".ffn_down.weight",    6},
-    };
-
-    for (const auto & component : component_ranks) {
-        const size_t suffix_len = strlen(component.first);
-        if (tensor_name.size() >= suffix_len &&
-            tensor_name.compare(tensor_name.size() - suffix_len, suffix_len, component.first) == 0) {
-            key.component_rank = component.second;
-            break;
-        }
-    }
-
-    return key;
-}
-
 static std::vector<llama_rknpu_prepack_ordered_entry> llama_order_rknpu_prepack_metas(
         const std::unordered_map<std::string, llama_model_loader::llama_rknpu_prepack_meta> & metas) {
     std::vector<llama_rknpu_prepack_ordered_entry> ordered;
@@ -108,30 +65,7 @@ static std::vector<llama_rknpu_prepack_ordered_entry> llama_order_rknpu_prepack_
     }
 
     std::sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
-        const auto a_key = llama_get_rknpu_prepack_sort_key(a.tensor_name);
-        const auto b_key = llama_get_rknpu_prepack_sort_key(b.tensor_name);
-
-        if (a_key.is_output != b_key.is_output) {
-            return !a_key.is_output;
-        }
-        if (a_key.has_layer != b_key.has_layer) {
-            return a_key.has_layer;
-        }
-        if (a_key.has_layer) {
-            if (a_key.layer != b_key.layer) {
-                return a_key.layer < b_key.layer;
-            }
-            const bool a_known = a_key.component_rank < 100;
-            const bool b_known = b_key.component_rank < 100;
-            if (a_known != b_known) {
-                return a_known;
-            }
-            if (a_key.component_rank != b_key.component_rank) {
-                return a_key.component_rank < b_key.component_rank;
-            }
-        }
-
-        return a.tensor_name < b.tensor_name;
+        return rknpu_prepack_tensor_name_less(a.tensor_name, b.tensor_name);
     });
 
     return ordered;
