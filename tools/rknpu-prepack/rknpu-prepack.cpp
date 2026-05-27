@@ -31,10 +31,10 @@ struct params {
     std::string input;
     std::string output;
     std::unordered_set<std::string> include_tensors;
-    // These two values are mirrored into plaintext GGUF KV so the standalone host reloader
+    // These fixed values are mirrored into plaintext GGUF KV so the standalone host reloader
     // can reject files generated for a different guest layout.
-    uint64_t entry_size = 0;
-    uint64_t compute_buffer_size = 0;
+    uint64_t entry_size = RKNPU_HOST_LOAD_ENTRY_SIZE_BYTES;
+    uint64_t compute_buffer_size = RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_BYTES;
     bool list_only = false;
 };
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
@@ -103,19 +103,9 @@ static void zeros(std::ofstream & file, size_t n) {
 
 static void print_usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s [--list] [--tensor NAME ...] [--entry-size BYTES] [--compute-buffer-size BYTES] INPUT.gguf OUTPUT.gguf\n"
+        "usage: %s [--list] [--tensor NAME ...] INPUT.gguf OUTPUT.gguf\n"
         "       %s --list INPUT.gguf\n",
         argv0, argv0);
-}
-
-static uint64_t parse_u64_arg(const char * name, const char * value) {
-    char * end = nullptr;
-    errno = 0;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (errno != 0 || end == value || (end != nullptr && *end != '\0')) {
-        throw std::invalid_argument(std::string("invalid value for ") + name + ": " + value);
-    }
-    return static_cast<uint64_t>(parsed);
 }
 
 static size_t get_page_size() {
@@ -153,20 +143,6 @@ static params parse_args(int argc, char ** argv) {
             p.include_tensors.insert(argv[++i]);
             continue;
         }
-        if (arg == "--entry-size") {
-            if (i + 1 >= argc) {
-                throw std::invalid_argument("missing value after --entry-size");
-            }
-            p.entry_size = parse_u64_arg("--entry-size", argv[++i]);
-            continue;
-        }
-        if (arg == "--compute-buffer-size") {
-            if (i + 1 >= argc) {
-                throw std::invalid_argument("missing value after --compute-buffer-size");
-            }
-            p.compute_buffer_size = parse_u64_arg("--compute-buffer-size", argv[++i]);
-            continue;
-        }
         if (!arg.empty() && arg[0] == '-') {
             throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -188,14 +164,8 @@ static params parse_args(int argc, char ** argv) {
     if (p.list_only && !p.output.empty()) {
         throw std::invalid_argument("--list takes only an input path");
     }
-    if (!p.list_only && p.entry_size == 0) {
-        throw std::invalid_argument("missing --entry-size");
-    }
-    if (!p.list_only && p.compute_buffer_size == 0) {
-        throw std::invalid_argument("missing --compute-buffer-size");
-    }
     if (!p.list_only && p.compute_buffer_size >= RKNPU_PREPACK_DOMAIN_BYTES) {
-        throw std::invalid_argument("--compute-buffer-size must be smaller than one 4 GiB payload domain");
+        throw std::invalid_argument("fixed compute buffer size must be smaller than one 4 GiB payload domain");
     }
 
     return p;

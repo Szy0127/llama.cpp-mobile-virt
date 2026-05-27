@@ -42,7 +42,12 @@ static const char * const RKNPU_HOST_LOAD_PAYLOAD_START_KEY = "rknpu.host_load.p
 static const char * const RKNPU_HOST_LOAD_PAYLOAD_BYTES_KEY = "rknpu.host_load.payload_bytes";
 static const char * const RKNPU_HOST_LOAD_ENTRY_SIZE_KEY = "rknpu.host_load.entry_size";
 static const char * const RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_KEY = "rknpu.host_load.compute_buffer_size";
-static const uint64_t RKNPU_PREPACK_DOMAIN_BYTES = 1ull << 32;
+
+// The current host/guest reload contract is fixed to one entry size and one compute buffer size.
+// Should be consistent with crosvm configuration.
+static const uint64_t RKNPU_HOST_LOAD_ENTRY_SIZE_BYTES = 128ull << 20;
+static const uint64_t RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_BYTES = 256ull << 20;
+static const uint64_t RKNPU_PREPACK_DOMAIN_BYTES = 4ull << 30;
 
 struct rknpu_offline_blob_header {
     uint32_t magic;
