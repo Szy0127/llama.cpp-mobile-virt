@@ -18,5 +18,5 @@ cmake -Bbuild -H. \
 
 # cmake --build build -j10 --target llama-rknpu-prepack
 
-cmake --build build -j20 --target llama-cli
-adb push build/bin/llama-cli /data/data/com.termux/files/home/host-reload
+cmake --build build -j20 --target llama-rknpu-host-reload
+adb push build/bin/llama-rknpu-host-reload /data/data/com.termux/files/home/host-reload
