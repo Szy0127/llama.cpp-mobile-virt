@@ -35,6 +35,8 @@ GGML_API int ggml_rknpu2_flush_all_payload(void);
 GGML_API bool ggml_rknpu2_pipeline_has_pending_work(void);
 GGML_API int ggml_rknpu2_pipeline_wait_compute_ready(void);
 GGML_API int ggml_rknpu2_pipeline_clear_legacy_reclaim_if_done(void);
+GGML_API int ggml_rknpu2_pipeline_start_async_decrypt(void);
+GGML_API void ggml_rknpu2_pipeline_stop_async_decrypt(void);
 
 #ifdef __cplusplus
 }

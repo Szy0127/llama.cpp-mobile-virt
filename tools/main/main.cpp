@@ -56,6 +56,22 @@ static void rknpu_clear_after_generation(void) {
 #endif
 }
 
+static int rknpu_start_async_decrypt_if_pending(const char * reason) {
+#if defined(GGML_USE_RKNPU_RE)
+    if (!ggml_rknpu2_pipeline_has_pending_work()) {
+        return 0;
+    }
+    if (ggml_rknpu2_pipeline_start_async_decrypt() != 0) {
+        LOG_ERR("%s : failed to start RKNPU async decrypt thread (%s)\n", __func__, reason);
+        return -1;
+    }
+    LOG_INF("%s : RKNPU pipeline pending; async tensor decrypt started (%s)\n", __func__, reason);
+#else
+    (void) reason;
+#endif
+    return 0;
+}
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 struct pkvm_shinfo {
     uint64_t reclaimed_pages;
@@ -254,6 +270,14 @@ int main(int argc, char ** argv) {
 
     model = llama_init.model.get();
     ctx = llama_init.context.get();
+
+#if defined(GGML_USE_RKNPU_RE)
+    struct rknpu_async_decrypt_guard {
+        ~rknpu_async_decrypt_guard() {
+            ggml_rknpu2_pipeline_stop_async_decrypt();
+        }
+    } rknpu_async_guard;
+#endif
 
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
@@ -700,14 +724,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
 #if defined(GGML_USE_RKNPU_RE)
-    if (!ggml_rknpu2_pipeline_has_pending_work()) {
+    const bool rknpu_pipeline_pending = ggml_rknpu2_pipeline_has_pending_work();
+    if (!rknpu_pipeline_pending) {
         if (ggml_rknpu2_flush_all_payload() != 0) {
             LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
             return 1;
         }
         LOG("flush all\n");
     } else {
-        LOG_INF("%s : RKNPU pipeline pending; payload flush is deferred to per-entry decrypt\n", __func__);
+        if (rknpu_start_async_decrypt_if_pending("initial-prompt") != 0) {
+            return 1;
+        }
+        LOG_INF("%s : RKNPU pipeline pending; payload flush is deferred to async tensor decrypt\n", __func__);
     }
 #endif
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -1050,6 +1078,9 @@ int main(int argc, char ** argv) {
                     if (dump_pkvm_shinfo("interactive-user-input", &reclaim_info)){
 #if defined(GGML_USE_RKNPU_RE)
                         if (ggml_rknpu2_pipeline_has_pending_work()) {
+                            if (rknpu_start_async_decrypt_if_pending("interactive-user-input") != 0) {
+                                return 1;
+                            }
                             LOG_INF("%s : RKNPU pipeline pending; legacy suffix decrypt is skipped\n", __func__);
                         } else if (ggml_rknpu2_pipeline_clear_legacy_reclaim_if_done() > 0) {
                             LOG_INF("%s : RKNPU pipeline completed; legacy reclaimed_pages cleared\n", __func__);
@@ -1150,6 +1181,10 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+
+#if defined(GGML_USE_RKNPU_RE)
+    ggml_rknpu2_pipeline_stop_async_decrypt();
+#endif
 
     common_sampler_free(smpl);
 
