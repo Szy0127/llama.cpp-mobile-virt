@@ -7,6 +7,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef __cplusplus
+#include <cstdio>
+#include <string>
+#endif
+
 #define RKNN_TENSOR_INT8 0x9
 #define RKNN_TENSOR_FLOAT16 0x16
 #define RKNN_TENSOR_FLOAT32 0x33
@@ -31,6 +36,18 @@ static const char * const RKNPU_PREPACK_VERSION_KEY = "rknpu.prepack.version";
 static const char * const RKNPU_PREPACK_BACKEND_KEY = "rknpu.prepack.backend";
 static const char * const RKNPU_PREPACK_FORMAT_KEY = "rknpu.prepack.format";
 static const char * const RKNPU_PREPACK_META_FORMAT_KEY = "rknpu.prepack.meta_format";
+// These keys stay plaintext so a standalone host reloader can locate the NPU payload data
+// segment without parsing tensor metadata.
+static const char * const RKNPU_HOST_LOAD_PAYLOAD_START_KEY = "rknpu.host_load.payload_start";
+static const char * const RKNPU_HOST_LOAD_PAYLOAD_BYTES_KEY = "rknpu.host_load.payload_bytes";
+static const char * const RKNPU_HOST_LOAD_ENTRY_SIZE_KEY = "rknpu.host_load.entry_size";
+static const char * const RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_KEY = "rknpu.host_load.compute_buffer_size";
+
+// The current host/guest reload contract is fixed to one entry size and one compute buffer size.
+// Should be consistent with crosvm configuration.
+static const uint64_t RKNPU_HOST_LOAD_ENTRY_SIZE_BYTES = 128ull << 20;
+static const uint64_t RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_BYTES = 256ull << 20;
+static const uint64_t RKNPU_PREPACK_DOMAIN_BYTES = 4ull << 30;
 
 struct rknpu_offline_blob_header {
     uint32_t magic;
@@ -210,7 +227,8 @@ static inline bool rknpu_prepack_is_candidate_name(const char * name) {
         return false;
     }
     if (strstr(name, RKNPU_PREPACK_META_SUFFIX) != NULL ||
-        strstr(name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != NULL) {
+        strstr(name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != NULL ||
+        rknpu_prepack_is_padding_name(name)) {
         return false;
     }
     if (strcmp(name, "token_embd.weight") == 0) {
@@ -238,3 +256,78 @@ static inline bool rknpu_prepack_is_candidate_tensor(const struct ggml_tensor * 
     }
     return rknpu_prepack_is_candidate_name(tensor->name);
 }
+
+#ifdef __cplusplus
+struct rknpu_prepack_sort_key {
+    bool is_output = false;
+    bool has_layer = false;
+    int layer = -1;
+    int component_rank = 100;
+};
+
+static inline rknpu_prepack_sort_key rknpu_prepack_get_sort_key(const std::string & tensor_name) {
+    rknpu_prepack_sort_key key;
+
+    if (tensor_name == "output.weight") {
+        key.is_output = true;
+        return key;
+    }
+
+    int layer = -1;
+    if (std::sscanf(tensor_name.c_str(), "blk.%d.", &layer) == 1) {
+        key.has_layer = true;
+        key.layer = layer;
+    }
+
+    static const struct {
+        const char * suffix;
+        int rank;
+    } component_ranks[] = {
+        {".attn_q.weight",      0},
+        {".attn_k.weight",      1},
+        {".attn_v.weight",      2},
+        {".attn_output.weight", 3},
+        {".ffn_gate.weight",    4},
+        {".ffn_up.weight",      5},
+        {".ffn_down.weight",    6},
+    };
+
+    for (const auto & component : component_ranks) {
+        const size_t suffix_len = strlen(component.suffix);
+        if (tensor_name.size() >= suffix_len &&
+            tensor_name.compare(tensor_name.size() - suffix_len, suffix_len, component.suffix) == 0) {
+            key.component_rank = component.rank;
+            break;
+        }
+    }
+
+    return key;
+}
+
+static inline bool rknpu_prepack_tensor_name_less(const std::string & a, const std::string & b) {
+    const auto a_key = rknpu_prepack_get_sort_key(a);
+    const auto b_key = rknpu_prepack_get_sort_key(b);
+
+    if (a_key.is_output != b_key.is_output) {
+        return !a_key.is_output;
+    }
+    if (a_key.has_layer != b_key.has_layer) {
+        return a_key.has_layer;
+    }
+    if (a_key.has_layer) {
+        if (a_key.layer != b_key.layer) {
+            return a_key.layer < b_key.layer;
+        }
+        const bool a_known = a_key.component_rank < 100;
+        const bool b_known = b_key.component_rank < 100;
+        if (a_known != b_known) {
+            return a_known;
+        }
+        if (a_key.component_rank != b_key.component_rank) {
+            return a_key.component_rank < b_key.component_rank;
+        }
+    }
+
+    return a < b;
+}
+#endif

@@ -2,6 +2,7 @@
 #include "gguf.h"
 #include "rknpu-prepack-common.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -29,6 +31,10 @@ struct params {
     std::string input;
     std::string output;
     std::unordered_set<std::string> include_tensors;
+    // These fixed values are mirrored into plaintext GGUF KV so the standalone host reloader
+    // can reject files generated for a different guest layout.
+    uint64_t entry_size = RKNPU_HOST_LOAD_ENTRY_SIZE_BYTES;
+    uint64_t compute_buffer_size = RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_BYTES;
     bool list_only = false;
 };
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
@@ -39,6 +45,15 @@ struct selected_tensor_desc {
     std::string source_name;
     const ggml_tensor * source_tensor = nullptr;
     bool synthesized_output = false;
+};
+
+struct prepared_tensor_blob {
+    selected_tensor_desc desc;
+    blob_result blob;
+    // guest payload pool offset for this tensor's real payload bytes
+    size_t payload_pool_offset = 0;
+    // guest payload pool bytes consumed by this tensor after guest-side allocation alignment
+    size_t payload_alloc_size = 0;
 };
 
 struct tensor_stats {
@@ -93,6 +108,21 @@ static void print_usage(const char * argv0) {
         argv0, argv0);
 }
 
+static size_t get_page_size() {
+    const long value = sysconf(_SC_PAGESIZE);
+    if (value <= 0) {
+        return 4096;
+    }
+    return static_cast<size_t>(value);
+}
+
+static size_t page_align(size_t size, size_t page_size) {
+    if ((size % page_size) == 0) {
+        return size;
+    }
+    return size + (page_size - (size % page_size));
+}
+
 static params parse_args(int argc, char ** argv) {
     params p;
 
@@ -133,6 +163,9 @@ static params parse_args(int argc, char ** argv) {
     }
     if (p.list_only && !p.output.empty()) {
         throw std::invalid_argument("--list takes only an input path");
+    }
+    if (!p.list_only && p.compute_buffer_size >= RKNPU_PREPACK_DOMAIN_BYTES) {
+        throw std::invalid_argument("fixed compute buffer size must be smaller than one 4 GiB payload domain");
     }
 
     return p;
@@ -331,19 +364,78 @@ static int run(const params & p) {
         return 0;
     }
 
+    // Phase 1: build one prepack blob per selected tensor, then place the payloads in the
+    // same global order that guest-side RKNPU allocation expects.
+    std::vector<prepared_tensor_blob> prepared_tensors;
+    prepared_tensors.reserve(selected_tensors.size());
+    for (const auto & desc : selected_tensors) {
+        if (desc.synthesized_output) {
+            std::fprintf(stderr, "converting synthesized tensor '%s' from source '%s'...\n", desc.output_name.c_str(), desc.source_name.c_str());
+        } else {
+            std::fprintf(stderr, "converting tensor '%s'...\n", desc.output_name.c_str());
+        }
+        GGML_ASSERT(desc.source_tensor != nullptr);
+
+        prepared_tensor_blob prepared;
+        prepared.desc = desc;
+        prepared.blob = build_blob(desc.source_tensor);
+        prepared_tensors.push_back(std::move(prepared));
+    }
+
+    std::sort(prepared_tensors.begin(), prepared_tensors.end(), [](const auto & a, const auto & b) {
+        return rknpu_prepack_tensor_name_less(a.desc.output_name, b.desc.output_name);
+    });
+
+    const size_t align = gguf_get_alignment(ctx_in.get());
+    const size_t page_size = get_page_size();
+    const size_t payload_window_bytes = static_cast<size_t>(RKNPU_PREPACK_DOMAIN_BYTES - p.compute_buffer_size);
+    size_t payload_region_bytes = 0;
+    size_t padding_tensor_count = 0;
+
+    for (auto & prepared : prepared_tensors) {
+        prepared.payload_alloc_size = page_align(prepared.blob.payload_bytes.size(), page_size);
+        if (prepared.payload_alloc_size > payload_window_bytes) {
+            throw std::runtime_error("payload tensor exceeds one payload domain");
+        }
+
+        const size_t used_in_window = payload_region_bytes % payload_window_bytes;
+        if (used_in_window + prepared.payload_alloc_size > payload_window_bytes) {
+            const size_t domain_padding_bytes = payload_window_bytes - used_in_window;
+            if (domain_padding_bytes > 0) {
+                ++padding_tensor_count;
+                payload_region_bytes += domain_padding_bytes;
+            }
+        }
+
+        prepared.payload_pool_offset = payload_region_bytes;
+
+        const size_t payload_tensor_file_bytes = GGML_PAD(prepared.blob.payload_bytes.size(), align);
+        GGML_ASSERT(payload_tensor_file_bytes <= prepared.payload_alloc_size);
+        if (prepared.payload_alloc_size > payload_tensor_file_bytes) {
+            ++padding_tensor_count;
+        }
+
+        payload_region_bytes += prepared.payload_alloc_size;
+    }
+
     gguf_ptr ctx_out(gguf_init_empty(), gguf_free);
     gguf_set_kv(ctx_out.get(), ctx_in.get());
     gguf_set_val_u32(ctx_out.get(), RKNPU_PREPACK_VERSION_KEY, RKNPU_PREPACK_VERSION);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_BACKEND_KEY, RKNPU_PREPACK_BACKEND);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_FORMAT_KEY, RKNPU_PREPACK_FORMAT);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_META_FORMAT_KEY, RKNPU_PREPACK_META_FORMAT);
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_PAYLOAD_START_KEY, 0);
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_PAYLOAD_BYTES_KEY, static_cast<uint64_t>(payload_region_bytes));
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_ENTRY_SIZE_KEY, p.entry_size);
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_KEY, p.compute_buffer_size);
 
-    const size_t output_tensor_count = static_cast<size_t>(passthrough_stats.count + selected_tensors.size() * 2);
+    const size_t output_tensor_count = static_cast<size_t>(passthrough_stats.count + prepared_tensors.size() * 2 + padding_tensor_count);
     ggml_ptr out_ctx = make_output_ctx(output_tensor_count);
     std::vector<std::vector<uint8_t>> blob_parts;
-    blob_parts.reserve(selected_tensors.size() * 2);
+    blob_parts.reserve(prepared_tensors.size() * 2 + padding_tensor_count);
     std::unordered_map<std::string, ggml_tensor *> out_tensors;
 
+    // Phase 2: write passthrough tensors and prepack metadata before the host-visible payload data segment.
     for (int64_t i = 0; i < n_tensors; ++i) {
         ggml_tensor * src_tensor = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(ctx_in.get(), i));
         GGML_ASSERT(src_tensor != nullptr);
@@ -361,44 +453,101 @@ static int run(const params & p) {
         out_tensors.emplace(out_tensor->name, out_tensor);
     }
 
-    for (const auto & desc : selected_tensors) {
-        if (desc.synthesized_output) {
-            std::fprintf(stderr, "converting synthesized tensor '%s' from source '%s'...\n", desc.output_name.c_str(), desc.source_name.c_str());
-        } else {
-            std::fprintf(stderr, "converting tensor '%s'...\n", desc.output_name.c_str());
-        }
-        GGML_ASSERT(desc.source_tensor != nullptr);
-
-        blob_result blob = build_blob(desc.source_tensor);
-
-        blob_parts.push_back(std::move(blob.meta_bytes));
+    for (const auto & prepared : prepared_tensors) {
+        blob_parts.push_back(prepared.blob.meta_bytes);
         auto & meta_storage = blob_parts.back();
         int64_t meta_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(meta_storage.size()), 1, 1, 1 };
         ggml_tensor * meta_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, meta_ne);
         GGML_ASSERT(meta_tensor != nullptr);
-        const std::string meta_name = desc.output_name + RKNPU_PREPACK_META_SUFFIX;
+        const std::string meta_name = prepared.desc.output_name + RKNPU_PREPACK_META_SUFFIX;
         ggml_set_name(meta_tensor, meta_name.c_str());
         meta_tensor->data = meta_storage.data();
         gguf_add_tensor(ctx_out.get(), meta_tensor);
         out_tensors[meta_name] = meta_tensor;
+    }
 
-        blob_parts.push_back(std::move(blob.payload_bytes));
+    // Phase 3: materialize the NPU payload data segment. Each hole is emitted as a zero-filled
+    // padding tensor so standard GGUF readers still see monotonically increasing tensor offsets.
+    size_t payload_cursor = 0;
+    size_t padding_index = 0;
+    std::string first_payload_region_tensor_name;
+
+    for (const auto & prepared : prepared_tensors) {
+        if (payload_cursor < prepared.payload_pool_offset) {
+            const size_t gap_bytes = prepared.payload_pool_offset - payload_cursor;
+            GGML_ASSERT(GGML_PAD(gap_bytes, align) == gap_bytes);
+            blob_parts.emplace_back(gap_bytes, 0);
+            auto & padding_storage = blob_parts.back();
+            int64_t padding_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(padding_storage.size()), 1, 1, 1 };
+            ggml_tensor * padding_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, padding_ne);
+            GGML_ASSERT(padding_tensor != nullptr);
+            const std::string padding_name = std::string(RKNPU_PREPACK_PADDING_PREFIX) + std::to_string(padding_index++);
+            ggml_set_name(padding_tensor, padding_name.c_str());
+            padding_tensor->data = padding_storage.data();
+            gguf_add_tensor(ctx_out.get(), padding_tensor);
+            out_tensors[padding_name] = padding_tensor;
+            if (first_payload_region_tensor_name.empty()) {
+                first_payload_region_tensor_name = padding_name;
+            }
+            payload_cursor += gap_bytes;
+        }
+
+        blob_parts.push_back(prepared.blob.payload_bytes);
         auto & payload_storage = blob_parts.back();
         int64_t payload_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(payload_storage.size()), 1, 1, 1 };
         ggml_tensor * payload_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, payload_ne);
         GGML_ASSERT(payload_tensor != nullptr);
-        const std::string payload_name = desc.output_name + RKNPU_PREPACK_PAYLOAD_SUFFIX;
+        const std::string payload_name = prepared.desc.output_name + RKNPU_PREPACK_PAYLOAD_SUFFIX;
         ggml_set_name(payload_tensor, payload_name.c_str());
         payload_tensor->data = payload_storage.data();
         gguf_add_tensor(ctx_out.get(), payload_tensor);
         out_tensors[payload_name] = payload_tensor;
+
+        if (first_payload_region_tensor_name.empty()) {
+            first_payload_region_tensor_name = payload_name;
+        }
+
+        const size_t payload_tensor_file_bytes = GGML_PAD(payload_storage.size(), align);
+        payload_cursor += payload_tensor_file_bytes;
+
+        const size_t tail_padding_bytes = prepared.payload_alloc_size - payload_tensor_file_bytes;
+        if (tail_padding_bytes > 0) {
+            // Guest payload allocation is page-aligned, so the file image must preserve the same slack.
+            GGML_ASSERT(GGML_PAD(tail_padding_bytes, align) == tail_padding_bytes);
+            blob_parts.emplace_back(tail_padding_bytes, 0);
+            auto & padding_storage = blob_parts.back();
+            int64_t padding_ne[GGML_MAX_DIMS] = { static_cast<int64_t>(padding_storage.size()), 1, 1, 1 };
+            ggml_tensor * padding_tensor = ggml_new_tensor(out_ctx.get(), GGML_TYPE_I8, 1, padding_ne);
+            GGML_ASSERT(padding_tensor != nullptr);
+            const std::string padding_name = std::string(RKNPU_PREPACK_PADDING_PREFIX) + std::to_string(padding_index++);
+            ggml_set_name(padding_tensor, padding_name.c_str());
+            padding_tensor->data = padding_storage.data();
+            gguf_add_tensor(ctx_out.get(), padding_tensor);
+            out_tensors[padding_name] = padding_tensor;
+            payload_cursor += tail_padding_bytes;
+        }
     }
+
+    GGML_ASSERT(payload_cursor == payload_region_bytes);
+
+    uint64_t payload_start = 0;
+    if (!first_payload_region_tensor_name.empty()) {
+        const int64_t tid = gguf_find_tensor(ctx_out.get(), first_payload_region_tensor_name.c_str());
+        GGML_ASSERT(tid >= 0);
+        // Host reload uses an absolute file offset into the start of the whole payload-pool image,
+        // not the first real payload tensor.
+        payload_start = static_cast<uint64_t>(gguf_get_meta_size(ctx_out.get()) + gguf_get_tensor_offset(ctx_out.get(), tid));
+    }
+
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_PAYLOAD_START_KEY, payload_start);
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_PAYLOAD_BYTES_KEY, static_cast<uint64_t>(payload_region_bytes));
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_ENTRY_SIZE_KEY, p.entry_size);
+    gguf_set_val_u64(ctx_out.get(), RKNPU_HOST_LOAD_COMPUTE_BUFFER_SIZE_KEY, p.compute_buffer_size);
 
     std::ofstream out(p.output, std::ios::binary);
     out.exceptions(std::ofstream::failbit | std::ofstream::badbit);
     zeros(out, gguf_get_meta_size(ctx_out.get()));
 
-    const size_t align = gguf_get_alignment(ctx_out.get());
     for (int64_t i = 0; i < gguf_get_n_tensors(ctx_out.get()); ++i) {
         const char * name = gguf_get_tensor_name(ctx_out.get(), i);
         auto it = out_tensors.find(name);
@@ -416,9 +565,10 @@ static int run(const params & p) {
     out.close();
 
     std::printf(
-            "wrote %s with %zu RKNPU prepacked tensors (%zu meta + %zu payload); "
-            "selected input tensors: %zu (%zu bytes); synthesized output tensors: %zu (%zu bytes); passthrough tensors: %zu (%zu bytes)\n",
-            p.output.c_str(), selected_tensors.size() * 2, selected_tensors.size(), selected_tensors.size(),
+            "wrote %s with %zu RKNPU prepacked tensors (%zu meta + %zu payload + %zu padding); "
+            "payload_start=%" PRIu64 " payload_bytes=%zu; selected input tensors: %zu (%zu bytes); synthesized output tensors: %zu (%zu bytes); passthrough tensors: %zu (%zu bytes)\n",
+            p.output.c_str(), prepared_tensors.size() * 2, prepared_tensors.size(), prepared_tensors.size(), padding_tensor_count,
+            payload_start, payload_region_bytes,
             selected_input_stats.count, selected_input_stats.bytes,
             synthesized_output_stats.count, synthesized_output_stats.bytes,
             passthrough_stats.count, passthrough_stats.bytes);
