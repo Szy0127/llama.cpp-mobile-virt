@@ -134,6 +134,16 @@ void validate_header_against_file(const host_load_header & header, uint64_t file
     }
 }
 
+void print_host_load_header_hex(const char * source, const host_load_header & header) {
+    std::printf(
+            "RKNPU host-load header (%s): payload_start=0x%llx payload_bytes=0x%llx entry_size=0x%llx compute_buffer_size=0x%llx\n",
+            source != nullptr ? source : "unknown",
+            (unsigned long long) header.payload_start,
+            (unsigned long long) header.payload_bytes,
+            (unsigned long long) header.entry_size,
+            (unsigned long long) header.compute_buffer_size);
+}
+
 void validate_header_against_layout(const host_load_header & header, const npu_layout_info & layout) {
     if (header.entry_size != layout.entry_size) {
         throw std::runtime_error("entry_size mismatch between GGUF header and ioctl layout");
@@ -149,11 +159,6 @@ void validate_header_against_layout(const host_load_header & header, const npu_l
     const uint64_t payload_capacity = layout.rknpu.donate_size - layout.rknpu.compute_buffer_size;
     if (header.payload_bytes > payload_capacity) {
         throw std::runtime_error("payload_bytes exceeds current payload capacity");
-    }
-
-    if (layout.payload_reload_offset > header.payload_bytes ||
-        layout.payload_reload_bytes > header.payload_bytes - layout.payload_reload_offset) {
-        throw std::runtime_error("reload range exceeds the GGUF payload image");
     }
 
     if ((layout.payload_reload_offset % header.entry_size) != 0 ||
@@ -184,12 +189,16 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
     const uint64_t reload_start = layout.payload_reload_offset;
     const uint64_t reload_end = checked_add_u64(layout.payload_reload_offset, layout.payload_reload_bytes, "reload range");
+    const uint64_t readable_reload_end = reload_start >= header.payload_bytes
+            ? reload_start
+            : std::min(reload_end, header.payload_bytes);
     uint64_t read_offset = reload_start;
 
-    // Read the payload image in entry order so the kernel sees the same extend/finish cadence
-    // as the current integrated loader, but without parsing tensors.
-    while (read_offset < reload_end) {
-        const uint64_t read_end = std::min(read_offset + header.entry_size, reload_end);
+    // The ioctl reload window describes which guest payload entries were reclaimed, not how many
+    // bytes of model payload actually exist in the file. Only the overlap with the GGUF payload
+    // image needs file I/O; trailing reclaimed entries beyond payload_bytes stay zero-filled.
+    while (read_offset < readable_reload_end) {
+        const uint64_t read_end = std::min(read_offset + header.entry_size, readable_reload_end);
         if (mem_pool_ensure_payload_mapped_until(read_end) != 0) {
             throw std::runtime_error("mem_pool_ensure_payload_mapped_until failed");
         }
@@ -231,6 +240,7 @@ int main(int argc, char ** argv) {
     try {
         const params p = parse_args(argc, argv);
         const host_load_header header = read_host_load_header(p.input);
+        print_host_load_header_hex("gguf", header);
 
         npu_layout_info layout = {};
         if (npu_get_layout_info(&layout) != 0) {
