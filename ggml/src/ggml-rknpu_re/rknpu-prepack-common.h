@@ -26,6 +26,7 @@ static const char * const RKNPU_PREPACK_META_FORMAT = "split-suffix-v1";
 static const char * const RKNPU_PREPACK_BACKEND = "rknpu2";
 static const char * const RKNPU_PREPACK_META_SUFFIX = ".__rknpu_meta";
 static const char * const RKNPU_PREPACK_PAYLOAD_SUFFIX = ".__rknpu_payload";
+static const char * const RKNPU_PREPACK_PADDING_PREFIX = "__rknpu_padding.";
 static const char * const RKNPU_PREPACK_VERSION_KEY = "rknpu.prepack.version";
 static const char * const RKNPU_PREPACK_BACKEND_KEY = "rknpu.prepack.backend";
 static const char * const RKNPU_PREPACK_FORMAT_KEY = "rknpu.prepack.format";
@@ -188,6 +189,13 @@ static inline int8_t rknpu_prepack_f32_to_i8(float x, float scale) {
         value = 127.0f;
     }
     return (int8_t) value;
+}
+
+static inline bool rknpu_prepack_is_padding_name(const char * name) {
+    if (name == NULL) {
+        return false;
+    }
+    return strncmp(name, RKNPU_PREPACK_PADDING_PREFIX, strlen(RKNPU_PREPACK_PADDING_PREFIX)) == 0;
 }
 
 static inline bool rknpu_prepack_is_candidate_name(const char * name) {
