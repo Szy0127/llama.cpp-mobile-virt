@@ -617,7 +617,7 @@ ggml_backend_rknpu2_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ctx->alloc_size = size_aligned;
     ctx->backend_ctx = &g_rknpu2_mgr[buft_ctx->device];
     ctx->buffer = mem_allocate(size_aligned, &ctx->dma, &ctx->obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle);
+            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &ctx->handle, 1);
 
     if (ctx->buffer == nullptr) {
         printf("%s: failed to allocate %.2f MiB for %s\n", __func__, (double) size / (1 << 20), buft_ctx->name.c_str());
@@ -988,7 +988,7 @@ struct rknn_mem {
     rknn_mem(size_t size): size(size) {
         // Use NON_CACHEABLE memory like rknpu-tests, so no cache sync needed after NPU computation
         dma_ptr = mem_allocate(size, &dma, &obj,
-            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle);
+            RKNPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT, &handle, 1);
 #ifdef FAKE_CACHE
         GGML_ASSERT(dma_alloc(size, &fd, &ptr) == 0);
 #else
@@ -1132,12 +1132,12 @@ struct npu_task {
              std::shared_ptr<rknn_mem> input, std::shared_ptr<rknn_mem> weight, std::shared_ptr<rknn_mem> output)
         : M(M), N(N), K(K), nn(nn), kk(kk), input(input), weight(weight), output(output), type(type) {
             uint64_t output_dma;
-            output_ptr = mem_allocate(M*N*sizeof(int32_t), &output_dma, &output_obj, 0, &output_handle);
-          
-        regcmd = (uint64_t*)mem_allocate(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle);
+            output_ptr = mem_allocate(M*N*sizeof(int32_t), &output_dma, &output_obj, 0, &output_handle, 0);
+	          
+        regcmd = (uint64_t*)mem_allocate(1024, &regcmd_dma, &regcmd_obj, 0, &regcmd_handle, 0);
         GGML_ASSERT(regcmd);
 
-        tasks = (rknpu_task *)mem_allocate(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle);
+        tasks = (rknpu_task *)mem_allocate(1024, &tasks_dma, &tasks_obj, RKNPU_MEM_KERNEL_MAPPING, &tasks_handle, 0);
         GGML_ASSERT(tasks);
         
         // memset(input->ptr, 1, input->size);

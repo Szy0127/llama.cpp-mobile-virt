@@ -105,7 +105,7 @@ int main(int argc, char ** argv) {
         while (p.max_allocs == 0 || allocs.size() < p.max_allocs) {
             alloc_rec rec;
             rec.size = p.chunk_size;
-            rec.ptr = mem_allocate(rec.size, &rec.dma, &rec.obj, 0, &rec.handle);
+            rec.ptr = mem_allocate(rec.size, &rec.dma, &rec.obj, 0, &rec.handle, 0);
             if (rec.ptr == nullptr) {
                 std::fprintf(stderr,
                         "[RKNPU_MEM_PROBE] allocation failed after %zu chunks, total=%.2f MiB\n",

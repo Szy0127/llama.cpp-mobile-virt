@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -37,14 +38,36 @@ int fd;
 pthread_once_t fd_once;
 int npu_open(void);
 
+struct mem_pool_entry {
+  size_t size;
+  void *addr;
+  uint64_t dma_addr;
+  uint64_t obj_addr;
+  uint64_t handle;
+  struct mem_pool_entry *next;
+};
+
+static struct mem_pool_entry *mem_pool_head;
+
 void fd_init(void)
 {
   fd = npu_open();
   printf("%s %d: fd %d\n", __func__, __LINE__, fd);
 }
 
-void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle) {
+void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint64_t *handle, int use_cache) {
   pthread_once(&fd_once, fd_init);
+  if (use_cache) {
+    for (struct mem_pool_entry *entry = mem_pool_head; entry != NULL; entry = entry->next) {
+      if (entry->size == size) {
+        *dma_addr = entry->dma_addr;
+        *obj = entry->obj_addr;
+        *handle = entry->handle;
+        return entry->addr;
+      }
+    }
+  }
+
   int ret;
   struct rknpu_mem_create mem_create = {
     0,
@@ -72,6 +95,29 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
     return NULL;
   }
 
+  if (use_cache) {
+    struct mem_pool_entry *entry = malloc(sizeof(*entry));
+    if (entry == NULL) {
+      printf("Error: mem pool entry allocation failed, len=%zu, errno %d\n", size, errno);
+      munmap(map, size);
+      struct rknpu_mem_destroy destroy = {
+        .handle = mem_create.handle ,
+        0,
+        .obj_addr = mem_create.obj_addr
+      };
+      ioctl(fd, DRM_IOCTL_RKNPU_MEM_DESTROY, &destroy);
+      return NULL;
+    }
+
+    entry->size = size;
+    entry->addr = map;
+    entry->dma_addr = mem_create.dma_addr;
+    entry->obj_addr = mem_create.obj_addr;
+    entry->handle = mem_create.handle;
+    entry->next = mem_pool_head;
+    mem_pool_head = entry;
+  }
+
   *dma_addr = mem_create.dma_addr;
   *obj = mem_create.obj_addr;
   *handle = mem_create.handle;
@@ -83,6 +129,12 @@ void* mem_allocate(size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flag
 
 void mem_destroy(void *addr, size_t len, uint64_t handle, uint64_t obj_addr) {
   pthread_once(&fd_once, fd_init);
+  for (struct mem_pool_entry *entry = mem_pool_head; entry != NULL; entry = entry->next) {
+    if (entry->addr == addr && entry->size == len && entry->handle == handle && entry->obj_addr == obj_addr) {
+      return;
+    }
+  }
+
   munmap(addr, len);
 
   int ret;
