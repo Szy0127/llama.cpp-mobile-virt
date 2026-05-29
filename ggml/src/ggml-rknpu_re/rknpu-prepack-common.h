@@ -280,17 +280,20 @@ static inline rknpu_prepack_sort_key rknpu_prepack_get_sort_key(const std::strin
         key.layer = layer;
     }
 
+    // 为每个组件分配固定rank, 以确保这些权重按照它们“被使用的顺序”来排序，避免domain反复抖动。（尽管domain切换几乎不耗时间，且按层排序已经基本足够）
+    // 目前用于测试的几个模型只有这几个组件，所以在这里硬编码，若要适配更多模型，可能需要在这里添加新的组件。
     static const struct {
         const char * suffix;
         int rank;
     } component_ranks[] = {
-        {".attn_q.weight",      0},
-        {".attn_k.weight",      1},
-        {".attn_v.weight",      2},
-        {".attn_output.weight", 3},
-        {".ffn_gate.weight",    4},
-        {".ffn_up.weight",      5},
-        {".ffn_down.weight",    6},
+        {".attn_qkv.weight",    0},   // phi-3.5-mini uses fused qkv.
+        {".attn_q.weight",      1},
+        {".attn_k.weight",      2},
+        {".attn_v.weight",      3},
+        {".attn_output.weight", 4},
+        {".ffn_gate.weight",    5},
+        {".ffn_up.weight",      6},
+        {".ffn_down.weight",    7},
     };
 
     for (const auto & component : component_ranks) {
