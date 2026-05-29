@@ -408,7 +408,7 @@ extern "C" {
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
-    // Decrypt model tensor data previously encrypted by create_enc_model.c.
+    // Decrypt model tensor data previously encrypted by llama-encrypt.
     // Returns 0 on success.
     LLAMA_API int decrypt_all_tensor(bool);
     LLAMA_API int decrypt_reclaimed_tensors(uint64_t total_reclaim_pages, uint64_t reclaimed_pages);
