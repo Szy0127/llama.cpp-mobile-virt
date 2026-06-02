@@ -7,11 +7,14 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -27,6 +30,121 @@ struct host_load_header {
     uint64_t payload_bytes = 0;
     uint64_t entry_size = 0;
     uint64_t compute_buffer_size = 0;
+};
+
+class finish_pipeline {
+public:
+    explicit finish_pipeline(std::mutex & npu_mutex)
+        : npu_mutex_(npu_mutex),
+          worker_(&finish_pipeline::thread_main, this) {
+    }
+
+    ~finish_pipeline() {
+        request_stop();
+        join_worker();
+    }
+
+    finish_pipeline(const finish_pipeline &) = delete;
+    finish_pipeline & operator=(const finish_pipeline &) = delete;
+
+    void publish(uint64_t payload_end) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        throw_if_failed_locked();
+        if (payload_end < ready_payload_end_) {
+            throw std::runtime_error("finish pipeline received a non-monotonic payload offset");
+        }
+        ready_payload_end_ = payload_end;
+        cv_.notify_one();
+        printf("publish %llx\n", payload_end);
+    }
+
+    void check() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        throw_if_failed_locked();
+    }
+
+    void drain() {
+        request_stop();
+        join_worker();
+        check();
+    }
+
+private:
+    void request_stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    void join_worker() {
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    void fail(const char * message) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failed_ = true;
+            error_ = message;
+            stop_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    void throw_if_failed_locked() const {
+        if (failed_) {
+            throw std::runtime_error(error_);
+        }
+    }
+
+    void thread_main() {
+        uint64_t finished_payload_end = 0;
+
+        for (;;) {
+            uint64_t target_payload_end = 0;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&]() {
+                    return stop_ || failed_ || ready_payload_end_ > finished_payload_end;
+                });
+
+                if (failed_) {
+                    return;
+                }
+
+                target_payload_end = ready_payload_end_;
+                if (target_payload_end == finished_payload_end) {
+                    if (stop_) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> npu_lock(npu_mutex_);
+                printf("ioctl %llx \n", target_payload_end);
+                if (mem_pool_finish_payload_until(target_payload_end) != 0) {
+                    fail("mem_pool_finish_payload_until failed");
+                    return;
+                }
+            }
+
+            finished_payload_end = target_payload_end;
+        }
+    }
+
+    std::mutex & npu_mutex_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread worker_;
+    uint64_t ready_payload_end_ = 0;
+    bool stop_ = false;
+    bool failed_ = false;
+    std::string error_;
 };
 
 void print_usage(const char * argv0) {
@@ -193,15 +311,27 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             ? reload_start
             : std::min(reload_end, header.payload_bytes);
     uint64_t read_offset = reload_start;
+    std::mutex npu_mutex;
+    finish_pipeline pipeline(npu_mutex);
+
+    const auto ensure_payload_mapped_until = [&](uint64_t payload_end) {
+        std::lock_guard<std::mutex> npu_lock(npu_mutex);
+        if (mem_pool_ensure_payload_mapped_until(payload_end) != 0) {
+            throw std::runtime_error("mem_pool_ensure_payload_mapped_until failed");
+        }
+    };
+
+    if (read_offset < readable_reload_end) {
+        ensure_payload_mapped_until(std::min(read_offset + header.entry_size, readable_reload_end));
+    }
 
     // The ioctl reload window describes which guest payload entries were reclaimed, not how many
     // bytes of model payload actually exist in the file. Only the overlap with the GGUF payload
     // image needs file I/O; trailing reclaimed entries beyond payload_bytes stay zero-filled.
     while (read_offset < readable_reload_end) {
+        pipeline.check();
+
         const uint64_t read_end = std::min(read_offset + header.entry_size, readable_reload_end);
-        if (mem_pool_ensure_payload_mapped_until(read_end) != 0) {
-            throw std::runtime_error("mem_pool_ensure_payload_mapped_until failed");
-        }
 
         const uint64_t file_offset = checked_add_u64(header.payload_start, read_offset, "payload file offset");
         input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
@@ -213,14 +343,25 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             throw std::runtime_error("short read while streaming payload data");
         }
 
-        if (mem_pool_finish_payload_until(read_end) != 0) {
-            throw std::runtime_error("mem_pool_finish_payload_until failed");
-        }
         read_offset = read_end;
+
+        if (read_offset < readable_reload_end) {
+            // Map the next chunk before publishing this one to the finish thread. This keeps
+            // npu_interface's global mapping cursor single-threaded while allowing the next
+            // file read to overlap the previous chunk's finish ioctl.
+            ensure_payload_mapped_until(std::min(read_offset + header.entry_size, readable_reload_end));
+        }
+
+        pipeline.publish(read_end);
     }
 
-    if (mem_pool_finish_all_payload() != 0) {
-        throw std::runtime_error("mem_pool_finish_all_payload failed");
+    pipeline.drain();
+
+    {
+        std::lock_guard<std::mutex> npu_lock(npu_mutex);
+        if (mem_pool_finish_all_payload() != 0) {
+            throw std::runtime_error("mem_pool_finish_all_payload failed");
+        }
     }
 
     std::printf(

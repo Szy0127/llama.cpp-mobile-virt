@@ -221,7 +221,7 @@ static int finish_llm_entry(unsigned int entry_index) {
            entry_index, errno);
     return -1;
   }
-  printf("extend block:%d success\n", entry_index);
+  //printf("extend block:%d success\n", entry_index);
 
   return 0;
 }
