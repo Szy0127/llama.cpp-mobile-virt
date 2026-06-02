@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -193,6 +194,9 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             ? reload_start
             : std::min(reload_end, header.payload_bytes);
     uint64_t read_offset = reload_start;
+    uint64_t read_call_count = 0;
+    uint64_t read_byte_count = 0;
+    std::chrono::nanoseconds read_total(0);
 
     // The ioctl reload window describes which guest payload entries were reclaimed, not how many
     // bytes of model payload actually exist in the file. Only the overlap with the GGUF payload
@@ -208,7 +212,12 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
         const size_t chunk_offset = checked_to_size(read_offset, "reload offset");
         const size_t chunk_size = checked_to_size(read_end - read_offset, "reload chunk size");
+        const auto read_start = std::chrono::steady_clock::now();
         input.read(reinterpret_cast<char *>(pool_base + chunk_offset), static_cast<std::streamsize>(chunk_size));
+        const auto read_finish = std::chrono::steady_clock::now();
+        read_total += read_finish - read_start;
+        read_call_count++;
+        read_byte_count += static_cast<uint64_t>(chunk_size);
         if (input.gcount() != static_cast<std::streamsize>(chunk_size)) {
             throw std::runtime_error("short read while streaming payload data");
         }
@@ -222,6 +231,14 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
     if (mem_pool_finish_all_payload() != 0) {
         throw std::runtime_error("mem_pool_finish_all_payload failed");
     }
+
+    const double read_total_ms = std::chrono::duration<double, std::milli>(read_total).count();
+    std::printf(
+            "RKNPU read timing: calls=%" PRIu64 " bytes=%" PRIu64 " total=%.3f ms avg=%.3f ms\n",
+            read_call_count,
+            read_byte_count,
+            read_total_ms,
+            read_call_count ? read_total_ms / static_cast<double>(read_call_count) : 0.0);
 
     std::printf(
             "reloaded %s: payload_start=%" PRIu64 " payload_bytes=%" PRIu64

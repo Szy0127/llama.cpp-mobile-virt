@@ -81,6 +81,128 @@ int npu_open(void);
 static void npu_fd_init(void);
 int mem_pool_ensure_payload_mapped_until(uint64_t payload_end);
 
+#define IOCTL_TIMING_MAX_STATS 16
+
+struct ioctl_timing_stat {
+  const char *label;
+  uint64_t calls;
+  uint64_t total_ns;
+};
+
+static pthread_once_t g_ioctl_timing_atexit_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_ioctl_timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct ioctl_timing_stat g_ioctl_timing_stats[IOCTL_TIMING_MAX_STATS];
+static size_t g_ioctl_timing_stat_count = 0;
+static uint64_t g_ioctl_timing_total_calls = 0;
+static uint64_t g_ioctl_timing_total_ns = 0;
+static uint64_t g_ioctl_timing_overflow_calls = 0;
+static uint64_t g_ioctl_timing_overflow_ns = 0;
+
+static uint64_t timespec_elapsed_ns(const struct timespec *start,
+                                    const struct timespec *finish) {
+  time_t elapsed_sec = finish->tv_sec - start->tv_sec;
+  long elapsed_nsec = finish->tv_nsec - start->tv_nsec;
+  if (elapsed_nsec < 0) {
+    elapsed_sec--;
+    elapsed_nsec += 1000000000L;
+  }
+  return (uint64_t)elapsed_sec * 1000000000ULL + (uint64_t)elapsed_nsec;
+}
+
+static double ns_to_ms(uint64_t ns) {
+  return (double)ns / 1000000.0;
+}
+
+static void print_ioctl_timing(void) {
+  pthread_mutex_lock(&g_ioctl_timing_mutex);
+  printf("RKNPU ioctl timing: calls=%llu total=%.3f ms avg=%.3f ms\n",
+         (unsigned long long)g_ioctl_timing_total_calls,
+         ns_to_ms(g_ioctl_timing_total_ns),
+         g_ioctl_timing_total_calls
+             ? ns_to_ms(g_ioctl_timing_total_ns) /
+                   (double)g_ioctl_timing_total_calls
+             : 0.0);
+  for (size_t i = 0; i < g_ioctl_timing_stat_count; ++i) {
+    const struct ioctl_timing_stat *stat = &g_ioctl_timing_stats[i];
+    printf("  %s: calls=%llu total=%.3f ms avg=%.3f ms\n",
+           stat->label,
+           (unsigned long long)stat->calls,
+           ns_to_ms(stat->total_ns),
+           stat->calls ? ns_to_ms(stat->total_ns) / (double)stat->calls
+                       : 0.0);
+  }
+  if (g_ioctl_timing_overflow_calls) {
+    printf("  other ioctl: calls=%llu total=%.3f ms avg=%.3f ms\n",
+           (unsigned long long)g_ioctl_timing_overflow_calls,
+           ns_to_ms(g_ioctl_timing_overflow_ns),
+           ns_to_ms(g_ioctl_timing_overflow_ns) /
+               (double)g_ioctl_timing_overflow_calls);
+  }
+  pthread_mutex_unlock(&g_ioctl_timing_mutex);
+}
+
+static void register_ioctl_timing_atexit(void) {
+  atexit(print_ioctl_timing);
+}
+
+static void record_ioctl_timing(const char *label, uint64_t elapsed_ns) {
+  pthread_mutex_lock(&g_ioctl_timing_mutex);
+
+  g_ioctl_timing_total_calls++;
+  g_ioctl_timing_total_ns += elapsed_ns;
+
+  for (size_t i = 0; i < g_ioctl_timing_stat_count; ++i) {
+    if (strcmp(g_ioctl_timing_stats[i].label, label) == 0) {
+      g_ioctl_timing_stats[i].calls++;
+      g_ioctl_timing_stats[i].total_ns += elapsed_ns;
+      pthread_mutex_unlock(&g_ioctl_timing_mutex);
+      return;
+    }
+  }
+
+  if (g_ioctl_timing_stat_count < IOCTL_TIMING_MAX_STATS) {
+    struct ioctl_timing_stat *stat =
+        &g_ioctl_timing_stats[g_ioctl_timing_stat_count++];
+    stat->label = label;
+    stat->calls = 1;
+    stat->total_ns = elapsed_ns;
+  } else {
+    g_ioctl_timing_overflow_calls++;
+    g_ioctl_timing_overflow_ns += elapsed_ns;
+  }
+
+  pthread_mutex_unlock(&g_ioctl_timing_mutex);
+}
+
+static int timed_ioctl_arg(int fd, unsigned long request, void *arg,
+                           const char *label) {
+  struct timespec start;
+  struct timespec finish;
+
+  pthread_once(&g_ioctl_timing_atexit_once, register_ioctl_timing_atexit);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  int ret = ioctl(fd, request, arg);
+  int saved_errno = errno;
+  clock_gettime(CLOCK_MONOTONIC, &finish);
+  record_ioctl_timing(label, timespec_elapsed_ns(&start, &finish));
+  errno = saved_errno;
+  return ret;
+}
+
+static int timed_ioctl_noarg(int fd, unsigned long request, const char *label) {
+  struct timespec start;
+  struct timespec finish;
+
+  pthread_once(&g_ioctl_timing_atexit_once, register_ioctl_timing_atexit);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  int ret = ioctl(fd, request);
+  int saved_errno = errno;
+  clock_gettime(CLOCK_MONOTONIC, &finish);
+  record_ioctl_timing(label, timespec_elapsed_ns(&start, &finish));
+  errno = saved_errno;
+  return ret;
+}
+
 static void log_npu_layout_info(const char *source,
                                 const struct npu_layout_info *info) {
   printf("RKNPU layout (%s): gpa_base=0x%llx donate=0x%llx compute=0x%llx iova_window=0x%llx reserve=0x%llx payload_window=0x%llx compute_gpa=0x%llx domains=%u version=%u reload=0x%llx+0x%llx entries=%u+%u entry_size=0x%llx\n",
@@ -174,7 +296,8 @@ int npu_layout_info_init(void) {
   }
 
   memset(&llm_info, 0, sizeof(llm_info));
-  if (ioctl(fd, LLM_IOC_GET_LAYOUT, &llm_info) < 0) {
+  if (timed_ioctl_arg(fd, LLM_IOC_GET_LAYOUT, &llm_info,
+                      "LLM_IOC_GET_LAYOUT") < 0) {
     int saved_errno = errno;
     printf("LLM_IOC_GET_LAYOUT early failed errno=%d\n", saved_errno);
     close(fd);
@@ -216,7 +339,8 @@ static int finish_llm_entry(unsigned int entry_index) {
   ext.flags = LLM_EXTEND_FLAG_FINISH;
   ext.entry_index = entry_index;
 
-  if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
+  if (timed_ioctl_arg(llm_fd, LLM_IOC_EXTEND, &ext,
+                      "LLM_IOC_EXTEND finish") < 0) {
     printf("LLM_IOC_EXTEND finish failed entry=%u errno=%d\n",
            entry_index, errno);
     return -1;
@@ -322,7 +446,7 @@ static int drain_remaining_reload_entries(void) {
 }
 
 static int close_llm_window(void) {
-  if (ioctl(llm_fd, LLM_IOC_FINISH) < 0) {
+  if (timed_ioctl_noarg(llm_fd, LLM_IOC_FINISH, "LLM_IOC_FINISH") < 0) {
     printf("LLM_IOC_FINISH failed errno=%d\n", errno);
     return -1;
   }
@@ -582,7 +706,8 @@ static int extend_payload_entry(unsigned int entry_index) {
     memset(&ext, 0, sizeof(ext));
     ext.entry_index = entry_index;
 
-    if (ioctl(llm_fd, LLM_IOC_EXTEND, &ext) < 0) {
+    if (timed_ioctl_arg(llm_fd, LLM_IOC_EXTEND, &ext,
+                        "LLM_IOC_EXTEND map") < 0) {
       printf("LLM_IOC_EXTEND failed entry=%u errno=%d\n",
              entry_index, errno);
       return -1;
@@ -671,7 +796,7 @@ int mem_pool_prepare(size_t pool_size) {
     return -1;
   }
 
-  int ret = ioctl(llm_fd, LLM_IOC_BEGIN);
+  int ret = timed_ioctl_noarg(llm_fd, LLM_IOC_BEGIN, "LLM_IOC_BEGIN");
   if (ret < 0) {
     printf("LLM_IOC_BEGIN failed for pool size=%zu ret=%d errno=%d\n",
            pool_size, ret, errno);
@@ -705,7 +830,8 @@ int mem_pool_prepare(size_t pool_size) {
 
   struct llm_map_info info;
   memset(&info, 0, sizeof(info));
-  ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
+  ret = timed_ioctl_arg(llm_fd, LLM_IOC_GET_INFO, &info,
+                        "LLM_IOC_GET_INFO");
   if (ret < 0) {
     printf("LLM_IOC_GET_INFO failed ret=%d errno=%d\n", ret, errno);
     munmap(map, map_size);
@@ -738,7 +864,8 @@ int mem_pool_prepare(size_t pool_size) {
   g_payload_pipeline_complete = 0;
 
   memset(&info, 0, sizeof(info));
-  ret = ioctl(llm_fd, LLM_IOC_GET_INFO, &info);
+  ret = timed_ioctl_arg(llm_fd, LLM_IOC_GET_INFO, &info,
+                        "LLM_IOC_GET_INFO");
   if (ret < 0) {
     printf("LLM_IOC_GET_INFO after extend failed ret=%d errno=%d\n", ret, errno);
     cleanup_pool_mapping();
@@ -902,7 +1029,8 @@ int npu_open(void) {
   dv.desc = buf3;
   dv.desc_len = sizeof(buf3);
 
-  int ret = ioctl(local_fd, DRM_IOCTL_VERSION, &dv);
+  int ret = timed_ioctl_arg(local_fd, DRM_IOCTL_VERSION, &dv,
+                            "DRM_IOCTL_VERSION");
   if (ret < 0) {
     printf("DRM_IOCTL_VERISON failed %d\n", ret);
     close(local_fd);
@@ -920,7 +1048,8 @@ int npu_reset(void) {
     .flags = RKNPU_ACT_RESET,
     0,
   };
-  return ioctl(npu_fd, DRM_IOCTL_RKNPU_ACTION, &act);
+  return timed_ioctl_arg(npu_fd, DRM_IOCTL_RKNPU_ACTION, &act,
+                         "DRM_IOCTL_RKNPU_ACTION");
 }
 
 int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id) {
@@ -958,7 +1087,8 @@ int npu_submit(uint64_t regcfg_obj_addr, uint32_t core_mask, uint32_t domain_id)
       subcore_tasks[4]
     },
   };
-  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit);
+  return timed_ioctl_arg(npu_fd, DRM_IOCTL_RKNPU_SUBMIT, &submit_ext.submit,
+                         "DRM_IOCTL_RKNPU_SUBMIT");
 }
 
 int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num,
@@ -999,5 +1129,6 @@ int npu_submit_multi(uint64_t regcfg_obj_addr[], int task_num,
     submit_ext.submit.subcore_task[core_index].task_number = 1;
   }
 
-  return ioctl(npu_fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext);
+  return timed_ioctl_arg(npu_fd, DRM_IOCTL_RKNPU_SUBMIT_EXT, &submit_ext,
+                         "DRM_IOCTL_RKNPU_SUBMIT_EXT");
 }
