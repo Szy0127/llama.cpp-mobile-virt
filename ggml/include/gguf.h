@@ -127,6 +127,7 @@ extern "C" {
 
     // removes key if it exists, returns id that the key had prior to removal (-1 if it didn't exist)
     GGML_API int64_t gguf_remove_key(struct gguf_context * ctx, const char * key);
+    GGML_API void    gguf_set_alignment(struct gguf_context * ctx, uint32_t alignment);
 
     // overrides an existing KV pair or adds a new one, the new KV pair is always at the back
     GGML_API void gguf_set_val_u8  (struct gguf_context * ctx, const char * key, uint8_t      val);

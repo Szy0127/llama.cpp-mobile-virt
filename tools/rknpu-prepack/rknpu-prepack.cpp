@@ -116,13 +116,6 @@ static size_t get_page_size() {
     return static_cast<size_t>(value);
 }
 
-static size_t page_align(size_t size, size_t page_size) {
-    if ((size % page_size) == 0) {
-        return size;
-    }
-    return size + (page_size - (size % page_size));
-}
-
 static params parse_args(int argc, char ** argv) {
     params p;
 
@@ -386,14 +379,14 @@ static int run(const params & p) {
         return rknpu_prepack_tensor_name_less(a.desc.output_name, b.desc.output_name);
     });
 
-    const size_t align = gguf_get_alignment(ctx_in.get());
     const size_t page_size = get_page_size();
+    const size_t align = std::max(gguf_get_alignment(ctx_in.get()), page_size);
     const size_t payload_window_bytes = static_cast<size_t>(RKNPU_PREPACK_DOMAIN_BYTES - p.compute_buffer_size);
     size_t payload_region_bytes = 0;
     size_t padding_tensor_count = 0;
 
     for (auto & prepared : prepared_tensors) {
-        prepared.payload_alloc_size = page_align(prepared.blob.payload_bytes.size(), page_size);
+        prepared.payload_alloc_size = GGML_PAD(prepared.blob.payload_bytes.size(), align);
         if (prepared.payload_alloc_size > payload_window_bytes) {
             throw std::runtime_error("payload tensor exceeds one payload domain");
         }
@@ -420,6 +413,8 @@ static int run(const params & p) {
 
     gguf_ptr ctx_out(gguf_init_empty(), gguf_free);
     gguf_set_kv(ctx_out.get(), ctx_in.get());
+    GGML_ASSERT(align <= UINT32_MAX);
+    gguf_set_alignment(ctx_out.get(), static_cast<uint32_t>(align));
     gguf_set_val_u32(ctx_out.get(), RKNPU_PREPACK_VERSION_KEY, RKNPU_PREPACK_VERSION);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_BACKEND_KEY, RKNPU_PREPACK_BACKEND);
     gguf_set_val_str(ctx_out.get(), RKNPU_PREPACK_FORMAT_KEY, RKNPU_PREPACK_FORMAT);

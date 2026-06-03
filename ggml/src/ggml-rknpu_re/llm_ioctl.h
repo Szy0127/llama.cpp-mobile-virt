@@ -44,6 +44,14 @@ struct llm_extend_info {
     __u32 flags;
 };
 
+struct llm_direct_read_info {
+    __s32 fd;
+    __u32 entry_index;
+    __u64 file_offset;
+    __u64 length;
+    __u64 bytes_read;
+};
+
 #define LLM_EXTEND_FLAG_FINISH (1U << 0)
 #define LLM_EXTEND_FLAG_DONE   (1U << 1)
 #define LLM_EXTEND_FLAG_SKIPPED (1U << 2)
@@ -55,5 +63,6 @@ struct llm_extend_info {
 #define LLM_IOC_FINISH   _IO(LLM_IOC_MAGIC, 0x02)
 #define LLM_IOC_GET_LAYOUT _IOR(LLM_IOC_MAGIC, 0x03, struct llm_layout_info)
 #define LLM_IOC_EXTEND _IOWR(LLM_IOC_MAGIC, 0x04, struct llm_extend_info)
+#define LLM_IOC_DIRECT_READ _IOWR(LLM_IOC_MAGIC, 0x05, struct llm_direct_read_info)
 
 #endif /* _LLM_IOCTL_H_ */

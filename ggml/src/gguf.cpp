@@ -968,6 +968,17 @@ void gguf_set_val_u32(struct gguf_context * ctx, const char * key, uint32_t val)
     ctx->kv.emplace_back(key, val);
 }
 
+void gguf_set_alignment(struct gguf_context * ctx, uint32_t alignment) {
+    GGML_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0);
+    ctx->alignment = alignment;
+    gguf_set_val_u32(ctx, GGUF_KEY_GENERAL_ALIGNMENT, alignment);
+
+    for (size_t i = 1; i < ctx->info.size(); ++i) {
+        ctx->info[i].offset = ctx->info[i - 1].offset +
+            GGML_PAD(ggml_nbytes(&ctx->info[i - 1].t), ctx->alignment);
+    }
+}
+
 void gguf_set_val_i32(struct gguf_context * ctx, const char * key, int32_t val) {
     gguf_check_reserved_keys(key, val);
     gguf_remove_key(ctx, key);
