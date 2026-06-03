@@ -224,7 +224,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
     while (read_offset < readable_reload_end) {
         const uint64_t read_end = std::min(read_offset + header.entry_size, readable_reload_end);
 
-        const uint64_t file_offset = checked_add_u64(header.payload_start, read_offset, "payload file offset") + 0x1000 - 0xe60;
+        const uint64_t file_offset = checked_add_u64(header.payload_start, read_offset, "payload file offset");
 
         const size_t chunk_size = checked_to_size(read_end - read_offset, "reload chunk size");
         require_direct_read_alignment(file_offset, chunk_size);
