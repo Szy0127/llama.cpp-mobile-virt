@@ -1,9 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "gguf.h"
 #include "npu_interface.h"
 #include "rknpu-prepack-common.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +17,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -19,6 +26,27 @@
 namespace {
 
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
+
+void set_current_thread_affinity(int cpu, const char * thread_name) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+
+    const int ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (ret != 0) {
+        char message[128];
+        std::snprintf(
+                message,
+                sizeof(message),
+                "failed to set %s thread affinity to CPU %d ret=%d",
+                thread_name,
+                cpu,
+                ret);
+        throw std::runtime_error(message);
+    }
+
+    std::printf("RKNPU %s thread affinity: cpu=%d\n", thread_name, cpu);
+}
 
 struct params {
     std::string input;
@@ -101,6 +129,13 @@ private:
     }
 
     void thread_main() {
+        try {
+            set_current_thread_affinity(5, "pipeline");
+        } catch (const std::exception & e) {
+            fail(e.what());
+            return;
+        }
+
         uint64_t finished_payload_end = 0;
 
         for (;;) {
@@ -311,6 +346,9 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             ? reload_start
             : std::min(reload_end, header.payload_bytes);
     uint64_t read_offset = reload_start;
+    uint64_t read_call_count = 0;
+    uint64_t read_byte_count = 0;
+    std::chrono::nanoseconds read_total(0);
     std::mutex npu_mutex;
     finish_pipeline pipeline(npu_mutex);
 
@@ -338,7 +376,12 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
         const size_t chunk_offset = checked_to_size(read_offset, "reload offset");
         const size_t chunk_size = checked_to_size(read_end - read_offset, "reload chunk size");
+        const auto read_start = std::chrono::steady_clock::now();
         input.read(reinterpret_cast<char *>(pool_base + chunk_offset), static_cast<std::streamsize>(chunk_size));
+        const auto read_finish = std::chrono::steady_clock::now();
+        read_total += read_finish - read_start;
+        read_call_count++;
+        read_byte_count += static_cast<uint64_t>(chunk_size);
         if (input.gcount() != static_cast<std::streamsize>(chunk_size)) {
             throw std::runtime_error("short read while streaming payload data");
         }
@@ -352,7 +395,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             ensure_payload_mapped_until(std::min(read_offset + header.entry_size, readable_reload_end));
         }
 
-        pipeline.publish(read_end);
+        //pipeline.publish(read_end);
     }
 
     pipeline.drain();
@@ -363,6 +406,14 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             throw std::runtime_error("mem_pool_finish_all_payload failed");
         }
     }
+
+    const double read_total_ms = std::chrono::duration<double, std::milli>(read_total).count();
+    std::printf(
+            "RKNPU read timing: calls=%" PRIu64 " bytes=%" PRIu64 " total=%.3f ms avg=%.3f ms\n",
+            read_call_count,
+            read_byte_count,
+            read_total_ms,
+            read_call_count ? read_total_ms / static_cast<double>(read_call_count) : 0.0);
 
     std::printf(
             "reloaded %s: payload_start=%" PRIu64 " payload_bytes=%" PRIu64
@@ -379,6 +430,8 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
 int main(int argc, char ** argv) {
     try {
+        set_current_thread_affinity(4, "main");
+
         const params p = parse_args(argc, argv);
         const host_load_header header = read_host_load_header(p.input);
         print_host_load_header_hex("gguf", header);
