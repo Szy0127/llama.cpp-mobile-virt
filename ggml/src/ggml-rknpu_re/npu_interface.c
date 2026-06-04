@@ -413,6 +413,42 @@ int mem_pool_finish_all_payload(void) {
   return 0;
 }
 
+int mem_pool_direct_read_payload_entry(int file_fd, uint64_t payload_offset,
+                                       uint64_t file_offset,
+                                       uint64_t length) {
+  struct llm_direct_read_info req;
+
+  if (llm_fd < 0 || !llm_window_began ||
+      g_prealloc_layout.entry_size == 0 || file_fd < 0 ||
+      payload_offset % g_prealloc_layout.entry_size != 0 ||
+      length == 0 || length > g_prealloc_layout.entry_size) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  memset(&req, 0, sizeof(req));
+  req.fd = file_fd;
+  req.entry_index = (uint32_t)(payload_offset / g_prealloc_layout.entry_size);
+  req.file_offset = file_offset;
+  req.length = length;
+
+  if (timed_ioctl_arg(llm_fd, LLM_IOC_DIRECT_READ, &req,
+                      "LLM_IOC_DIRECT_READ") < 0) {
+    printf("LLM_IOC_DIRECT_READ failed entry=%u file_offset=0x%llx length=0x%llx errno=%d\n",
+           req.entry_index,
+           (unsigned long long) file_offset,
+           (unsigned long long) length,
+           errno);
+    return -1;
+  }
+  if (req.bytes_read != length) {
+    errno = EIO;
+    return -1;
+  }
+
+  return 0;
+}
+
 /*
  * Drain any reload payload entries that the model loader did not
  * explicitly finish (e.g. trailing holes after the last tensor, or an

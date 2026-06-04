@@ -10,10 +10,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
-#include <fstream>
+#include <fcntl.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -22,10 +23,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 namespace {
 
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
+
+constexpr uint64_t direct_read_alignment = 4096;
 
 void set_current_thread_affinity(int cpu, const char * thread_name) {
     cpu_set_t cpuset;
@@ -83,7 +87,7 @@ public:
         }
         ready_payload_end_ = payload_end;
         cv_.notify_one();
-        printf("publish %llx\n", payload_end);
+        //printf("publish %llx\n", payload_end);
     }
 
     void check() {
@@ -130,7 +134,7 @@ private:
 
     void thread_main() {
         try {
-            set_current_thread_affinity(5, "pipeline");
+            //set_current_thread_affinity(5, "pipeline");
         } catch (const std::exception & e) {
             fail(e.what());
             return;
@@ -161,7 +165,7 @@ private:
 
             {
                 std::lock_guard<std::mutex> npu_lock(npu_mutex_);
-                printf("ioctl %llx \n", target_payload_end);
+                //printf("ioctl %llx \n", target_payload_end);
                 if (mem_pool_finish_payload_until(target_payload_end) != 0) {
                     fail("mem_pool_finish_payload_until failed");
                     return;
@@ -218,7 +222,7 @@ uint64_t checked_add_u64(uint64_t a, uint64_t b, const char * what) {
     return a + b;
 }
 
-uint64_t checked_to_u64(std::streamoff value, const char * what) {
+uint64_t checked_to_u64(int64_t value, const char * what) {
     if (value < 0) {
         throw std::runtime_error(std::string("invalid ") + what);
     }
@@ -271,9 +275,25 @@ host_load_header read_host_load_header(const std::string & path) {
     return header;
 }
 
-uint64_t get_file_size(std::ifstream & input) {
-    input.seekg(0, std::ios::end);
-    return checked_to_u64(input.tellg(), "file size");
+uint64_t get_file_size(int input_fd) {
+    return checked_to_u64(lseek(input_fd, 0, SEEK_END), "file size");
+}
+
+void require_direct_read_alignment(uint64_t file_offset, size_t size) {
+    if ((file_offset % direct_read_alignment) == 0 &&
+        (size % direct_read_alignment) == 0) {
+        return;
+    }
+
+    char message[512];
+    std::snprintf(
+            message,
+            sizeof(message),
+            "direct-read alignment check failed: align=%llu file_offset=0x%llx size=0x%zx",
+            (unsigned long long) direct_read_alignment,
+            (unsigned long long) file_offset,
+            size);
+    throw std::runtime_error(message);
 }
 
 void validate_header_against_file(const host_load_header & header, uint64_t file_size) {
@@ -321,12 +341,12 @@ void validate_header_against_layout(const host_load_header & header, const npu_l
 }
 
 void stream_reload(const params & p, const host_load_header & header, const npu_layout_info & layout) {
-    std::ifstream input(p.input, std::ios::binary);
-    if (!input.is_open()) {
+    const int input_fd = open(p.input.c_str(), O_RDONLY);
+    if (input_fd < 0) {
         throw std::runtime_error("failed to open input GGUF");
     }
 
-    const uint64_t file_size = get_file_size(input);
+    const uint64_t file_size = get_file_size(input_fd);
     validate_header_against_file(header, file_size);
     validate_header_against_layout(header, layout);
 
@@ -335,8 +355,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
         throw std::runtime_error("mem_pool_prepare failed");
     }
 
-    auto * const pool_base = static_cast<uint8_t *>(mem_pool_vaddr());
-    if (pool_base == nullptr) {
+    if (mem_pool_vaddr() == nullptr) {
         throw std::runtime_error("mem_pool_vaddr returned null");
     }
 
@@ -352,17 +371,6 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
     std::mutex npu_mutex;
     finish_pipeline pipeline(npu_mutex);
 
-    const auto ensure_payload_mapped_until = [&](uint64_t payload_end) {
-        std::lock_guard<std::mutex> npu_lock(npu_mutex);
-        if (mem_pool_ensure_payload_mapped_until(payload_end) != 0) {
-            throw std::runtime_error("mem_pool_ensure_payload_mapped_until failed");
-        }
-    };
-
-    if (read_offset < readable_reload_end) {
-        ensure_payload_mapped_until(std::min(read_offset + header.entry_size, readable_reload_end));
-    }
-
     // The ioctl reload window describes which guest payload entries were reclaimed, not how many
     // bytes of model payload actually exist in the file. Only the overlap with the GGUF payload
     // image needs file I/O; trailing reclaimed entries beyond payload_bytes stay zero-filled.
@@ -371,31 +379,23 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
         const uint64_t read_end = std::min(read_offset + header.entry_size, readable_reload_end);
 
-        const uint64_t file_offset = checked_add_u64(header.payload_start, read_offset, "payload file offset");
-        input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+        const uint64_t file_offset =
+                checked_add_u64(header.payload_start, read_offset, "payload file offset") ;
 
-        const size_t chunk_offset = checked_to_size(read_offset, "reload offset");
         const size_t chunk_size = checked_to_size(read_end - read_offset, "reload chunk size");
+        require_direct_read_alignment(file_offset, chunk_size);
         const auto read_start = std::chrono::steady_clock::now();
-        input.read(reinterpret_cast<char *>(pool_base + chunk_offset), static_cast<std::streamsize>(chunk_size));
+        if (mem_pool_direct_read_payload_entry(input_fd, read_offset, file_offset, chunk_size) != 0) {
+            throw std::runtime_error("mem_pool_direct_read_payload_entry failed");
+        }
         const auto read_finish = std::chrono::steady_clock::now();
         read_total += read_finish - read_start;
         read_call_count++;
         read_byte_count += static_cast<uint64_t>(chunk_size);
-        if (input.gcount() != static_cast<std::streamsize>(chunk_size)) {
-            throw std::runtime_error("short read while streaming payload data");
-        }
 
         read_offset = read_end;
 
-        if (read_offset < readable_reload_end) {
-            // Map the next chunk before publishing this one to the finish thread. This keeps
-            // npu_interface's global mapping cursor single-threaded while allowing the next
-            // file read to overlap the previous chunk's finish ioctl.
-            ensure_payload_mapped_until(std::min(read_offset + header.entry_size, readable_reload_end));
-        }
-
-        //pipeline.publish(read_end);
+        pipeline.publish(read_end);
     }
 
     pipeline.drain();
@@ -406,6 +406,8 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             throw std::runtime_error("mem_pool_finish_all_payload failed");
         }
     }
+
+    close(input_fd);
 
     const double read_total_ms = std::chrono::duration<double, std::milli>(read_total).count();
     std::printf(
@@ -430,7 +432,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
 int main(int argc, char ** argv) {
     try {
-        set_current_thread_affinity(4, "main");
+        //set_current_thread_affinity(4, "main");
 
         const params p = parse_args(argc, argv);
         const host_load_header header = read_host_load_header(p.input);

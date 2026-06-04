@@ -36,6 +36,9 @@ uint64_t mem_pool_finished_payload_offset(void);
 int mem_pool_ensure_payload_mapped_until(uint64_t payload_end);
 int mem_pool_finish_payload_until(uint64_t payload_end);
 int mem_pool_finish_all_payload(void);
+int mem_pool_direct_read_payload_entry(int file_fd, uint64_t payload_offset,
+                                       uint64_t file_offset,
+                                       uint64_t length);
 
 int npu_layout_info_init(void);
 int npu_get_layout_info(struct npu_layout_info *info);
