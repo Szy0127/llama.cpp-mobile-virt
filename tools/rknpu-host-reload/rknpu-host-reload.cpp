@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +23,10 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#ifdef RKNPU_ENABLE_TIMING
+#include <chrono>
+#endif
 
 namespace {
 
@@ -365,9 +368,11 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             ? reload_start
             : std::min(reload_end, header.payload_bytes);
     uint64_t read_offset = reload_start;
+#ifdef RKNPU_ENABLE_TIMING
     uint64_t read_call_count = 0;
     uint64_t read_byte_count = 0;
     std::chrono::nanoseconds read_total(0);
+#endif
     std::mutex npu_mutex;
     finish_pipeline pipeline(npu_mutex);
 
@@ -384,14 +389,18 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
         const size_t chunk_size = checked_to_size(read_end - read_offset, "reload chunk size");
         require_direct_read_alignment(file_offset, chunk_size);
+#ifdef RKNPU_ENABLE_TIMING
         const auto read_start = std::chrono::steady_clock::now();
+#endif
         if (mem_pool_direct_read_payload_entry(input_fd, read_offset, file_offset, chunk_size) != 0) {
             throw std::runtime_error("mem_pool_direct_read_payload_entry failed");
         }
+#ifdef RKNPU_ENABLE_TIMING
         const auto read_finish = std::chrono::steady_clock::now();
         read_total += read_finish - read_start;
         read_call_count++;
         read_byte_count += static_cast<uint64_t>(chunk_size);
+#endif
 
         read_offset = read_end;
 
@@ -409,6 +418,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
 
     close(input_fd);
 
+#ifdef RKNPU_ENABLE_TIMING
     const double read_total_ms = std::chrono::duration<double, std::milli>(read_total).count();
     std::printf(
             "RKNPU read timing: calls=%" PRIu64 " bytes=%" PRIu64 " total=%.3f ms avg=%.3f ms\n",
@@ -416,6 +426,7 @@ void stream_reload(const params & p, const host_load_header & header, const npu_
             read_byte_count,
             read_total_ms,
             read_call_count ? read_total_ms / static_cast<double>(read_call_count) : 0.0);
+#endif
 
     std::printf(
             "reloaded %s: payload_start=%" PRIu64 " payload_bytes=%" PRIu64

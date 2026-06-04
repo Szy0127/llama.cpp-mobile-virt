@@ -30,7 +30,9 @@
 #include <sys/ioctl.h>
 #include <limits.h>
 #include <assert.h>
+#ifdef RKNPU_ENABLE_TIMING
 #include <time.h>
+#endif
 
 #include "rknpu-ioctl.h"
 #include "npu_hw.h"
@@ -80,6 +82,8 @@ static int g_npu_layout_info_initialized = 0;
 int npu_open(void);
 static void npu_fd_init(void);
 int mem_pool_ensure_payload_mapped_until(uint64_t payload_end);
+
+#ifdef RKNPU_ENABLE_TIMING
 
 #define IOCTL_TIMING_MAX_STATS 16
 
@@ -202,6 +206,13 @@ static int timed_ioctl_noarg(int fd, unsigned long request, const char *label) {
   errno = saved_errno;
   return ret;
 }
+
+#else
+
+#define timed_ioctl_arg(fd, request, arg, label) ioctl((fd), (request), (arg))
+#define timed_ioctl_noarg(fd, request, label) ioctl((fd), (request))
+
+#endif
 
 static void log_npu_layout_info(const char *source,
                                 const struct npu_layout_info *info) {
@@ -463,21 +474,27 @@ int mem_pool_direct_read_payload_entry(int file_fd, uint64_t payload_offset,
  * after munmap.
  */
 static int drain_remaining_reload_entries(void) {
+#ifdef RKNPU_ENABLE_TIMING
   struct timespec start;
   struct timespec finish;
+#endif
   int ret = 0;
 
+#ifdef RKNPU_ENABLE_TIMING
   clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
 
   if (mem_pool_finish_all_payload() != 0) {
     printf("mem_pool_finish_all_payload before LLM_IOC_FINISH failed\n");
     ret = -1;
   }
 
+#ifdef RKNPU_ENABLE_TIMING
   clock_gettime(CLOCK_MONOTONIC, &finish);
   printf("drain_remaining_reload_entries cost %.3f ms\n",
          (finish.tv_sec - start.tv_sec) * 1000.0 +
          (finish.tv_nsec - start.tv_nsec) / 1000000.0);
+#endif
   return ret;
 }
 
