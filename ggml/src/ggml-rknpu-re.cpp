@@ -2736,7 +2736,7 @@ static int ggml_rknpu2_pipeline_ensure_payload_ready(const void * payload, size_
     }
 
     const uint64_t payload_end = payload_offset + (uint64_t) size;
-    uint64_t wait_loops = 0;
+    //uint64_t wait_loops = 0;
 
     while (true) {
         std::unique_lock<std::mutex> lock(g_pipeline_mtx);
@@ -2773,16 +2773,16 @@ static int ggml_rknpu2_pipeline_ensure_payload_ready(const void * payload, size_
                 continue;
             }
 
-            if ((wait_loops % 2000) == 0) {
-                GGML_LOG_INFO("%s: wait tensor pipeline init payload=[0x%" PRIx64 ",0x%" PRIx64 ") compute=%" PRIu64 " reload=%u+%u\n",
-                        __func__,
-                        payload_offset,
-                        payload_end,
-                        info.compute_entries_state,
-                        info.reload_start_entry,
-                        info.reload_entry_count);
-            }
-            wait_loops++;
+            //if ((wait_loops % 2000) == 0) {
+            //    GGML_LOG_INFO("%s: wait tensor pipeline init payload=[0x%" PRIx64 ",0x%" PRIx64 ") compute=%" PRIu64 " reload=%u+%u\n",
+            //            __func__,
+            //            payload_offset,
+            //            payload_end,
+            //            info.compute_entries_state,
+            //            info.reload_start_entry,
+            //            info.reload_entry_count);
+            //}
+            //wait_loops++;
             g_pipeline_cv.wait_for(lock, std::chrono::microseconds(50));
             continue;
         }
@@ -2809,16 +2809,16 @@ static int ggml_rknpu2_pipeline_ensure_payload_ready(const void * payload, size_
             continue;
         }
 
-        if ((wait_loops % 2000) == 0) {
-            GGML_LOG_INFO("%s: wait tensor='%s' payload=[0x%" PRIx64 ",0x%" PRIx64 ") tensor_reload=[0x%" PRIx64 ",0x%" PRIx64 ")\n",
-                    __func__,
-                    ggml_get_name(span->tensor),
-                    payload_offset,
-                    payload_end,
-                    span->reload_start,
-                    span->reload_end);
-        }
-        wait_loops++;
+        //if ((wait_loops % 2000) == 0) {
+        //    GGML_LOG_INFO("%s: wait tensor='%s' payload=[0x%" PRIx64 ",0x%" PRIx64 ") tensor_reload=[0x%" PRIx64 ",0x%" PRIx64 ")\n",
+        //            __func__,
+        //            ggml_get_name(span->tensor),
+        //            payload_offset,
+        //            payload_end,
+        //            span->reload_start,
+        //            span->reload_end);
+        //}
+        //wait_loops++;
         g_pipeline_cv.wait_for(lock, std::chrono::microseconds(50));
     }
 
