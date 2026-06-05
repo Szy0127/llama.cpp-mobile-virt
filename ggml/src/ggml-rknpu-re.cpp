@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <atomic>
+#include <memory>
 
 // System headers for file operations
 #include <fcntl.h>
@@ -29,124 +30,55 @@ static inline void ggml_thread_cpu_relax_out(void) {
 }
 
 
+struct rknpu_offline_prepack_blob;
+static std::shared_ptr<const rknpu_offline_prepack_blob> ggml_rknpu2_find_offline_prepack(const char * tensor_name);
+
 static uint64_t npu_count = 0;
 static uint64_t npu_total_count = 0;
 static uint64_t npu_total_failed_count = 0;
  static bool ggml_backend_rknpure_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
+    GGML_UNUSED(backend);
+
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst = op;
-    //src0->name
-    // if(src0 && src1 && dst){
-    // fprintf(stderr, "src0->name=%s\n", src0->name ? src0->name : "NULL");
-    // fprintf(stderr, "src1->name=%s\n", src1->name ? src1->name : "NULL");
-    // fprintf(stderr, "dst->name=%s\n", dst->name ? dst->name : "NULL");
-    // }
     npu_total_count++;
-    //return false;
+
     if (op->op != GGML_OP_MUL_MAT) {
-        // printf("zzh: op is %d, not mul mat\n", op->op);
         npu_total_failed_count++;
-        // fprintf(stderr, "NPU failed0! npu_total_failed_count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
         return false;
     }
 
-    // /* cpu computation when batch size == 1, i.e., decoding stage */
-    // if (src1->ne[1] == 1) {
-    //     return false;
-    // }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        npu_total_failed_count++;
+        return false;
+    }
+
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_F16) {
+        npu_total_failed_count++;
+        return false;
+    }
 
     {
-        const int64_t m = src1->ne[1];
         const int64_t k = src0->ne[0];
         const int64_t n = dst->ne[0];
         /* can not allocate large B buffers for large vocab_size. just use cpu to perform these matmuls */
-        if (k >= 50000 || n >= 50000){
+        if (k >= 50000 || n >= 50000) {
             npu_total_failed_count++;
-            // fprintf(stderr, "NPU failed1! npu_total_failed_count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
             return false;
         }
     }
 
-    // printf("ggml_backend_rknpure_supports_op, %d, %d, %p\n", src1->type, dst->type, src0->extra);
-    // return false; // DEBUG: first, never use this backend
-
-    const int64_t ne10 = src1->ne[0];
-
-    const int64_t ne0 = dst->ne[0];
-    const int64_t ne1 = dst->ne[1];
-
-    if(!ggml_is_contiguous(src0)){
-        // fprintf(stderr,"src0 is not contiguous: name=%s, type=%d, ne=[%ld,%ld,%ld,%ld], nb=[%ld,%ld,%ld,%ld], "
-        //         "view_src=%p, op=%d, is_permuted=%d, is_transposed=%d\n",
-        //         src0->name ? src0->name : "NULL",
-        //         src0->type,
-        //         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-        //         src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
-        //         src0->view_src,
-        //         src0->op,
-        //         ggml_is_permuted(src0),
-        //         ggml_is_transposed(src0));
+    if (!ggml_rknpu2_find_offline_prepack(src0->name)) {
+        npu_total_failed_count++;
         return false;
     }
-    if(!ggml_is_contiguous(src1)){
-        fprintf(stderr,"src1 is not contiguous\n");
-        return false;
-    }
-    
-    if (ggml_is_contiguous(src0) &&
-        ggml_is_contiguous(src1) &&
-        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        const int64_t k = src0->ne[0];
-        const int64_t n = src0->ne[1];
-        // return false;
-        // fprintf(stderr, "NPU support!  npu failed count=%llu/%llu\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count);
-        return true;
-        if (npu_count < 1123) {
-            npu_count++;
-            //fprintf(stderr, "NPU support! npu_count=%llu\n", (unsigned long long)npu_count);
-            // return false;
-            return true;
-        }
-        // fprintf(stderr, "NPU support! npu_count=%llu\n", (unsigned long long)npu_count);
-        return true;
-        // k > 8192 时，B 会被分成 T 段，int T = std::ceil(K / 8192)，推荐使用 rknn_B_normal_layout_to_native_layout 接口直接进行数据转换
-        if(k > 8192 || n > 4096) // RKNPU2 limit （原来是10240）
-        {
-            // printf("oversize: k=%ld, n=%ld\n", k, n);
 
-            return 0;
-        }
-
-        // k and n size must align to 32 bytes
-        if(k % 32 != 0 || n % 32 != 0)
-        {
-            printf("not align: k=%ld, n=%ld\n", k, n);
-            return 0;
-        }
-
-        // make sure the tensor has assosiated data
-        // printf("zzh: %s\n", src0->buffer->buft->iface.get_name(src0->buffer->buft));
-        // if (strcmp(src0->buffer->buft->iface.get_name(src0->buffer->buft), "RKNPURE")) {
-        //     return 0;
-        // }
-
-        if(src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_F16)
-        {
-            printf("zzh: tensor->type wrong\n");
-            return 0;
-        }
-
-        /*printf("RKNPU2: %d %d %d %d %d\n", ne0, ne1, ne10, ne00, ne01);*/
-            return true;
-
-    }
-    npu_total_failed_count++;
-    // fprintf(stderr, "NPU failed2! npu_total_failed_count=%llu/%llu type:%d %d %d\n", (unsigned long long)npu_total_failed_count, (unsigned long long)npu_total_count, src0->type, src1->type, dst->type);
-    // printf("rknpu2 not support this MUL_MAT\n");
-    return false;
-
-    GGML_UNUSED(backend);
+    return true;
 }
 
 extern "C" {
@@ -1664,7 +1596,8 @@ struct rknpu_weight_prepack_block {
     int nn;
     int kk;
     float scale;
-    std::shared_ptr<rknn_mem> dma_mem;
+    const uint8_t * packed_ptr;
+    size_t packed_size;
 };
 
 struct rknpu_weight_prepack_key {
@@ -1697,11 +1630,6 @@ struct rknpu_weight_prepack_key_hash {
     }
 };
 
-struct rknpu_weight_prepack_cache {
-    rknpu_weight_prepack_key key;
-    std::unordered_map<uint64_t, rknpu_weight_prepack_block> blocks;
-};
-
 struct rknpu_offline_prepack_blob {
     std::string tensor_name;
     std::string blob_tensor_name;
@@ -1710,14 +1638,26 @@ struct rknpu_offline_prepack_blob {
     std::vector<uint8_t> bytes;
 };
 
+struct rknpu_weight_prepack_cache {
+    rknpu_weight_prepack_key key;
+    std::shared_ptr<const rknpu_offline_prepack_blob> offline;
+    std::unordered_map<uint64_t, rknpu_weight_prepack_block> blocks;
+};
+
 static std::mutex g_weight_prepack_mtx;
 static std::mutex g_offline_prepack_mtx;
-static std::unordered_map<std::string, rknpu_offline_prepack_blob> g_offline_prepack_registry;
+static std::unordered_map<std::string, std::shared_ptr<const rknpu_offline_prepack_blob>> g_offline_prepack_registry;
 static std::unordered_map<rknpu_weight_prepack_key, std::shared_ptr<rknpu_weight_prepack_cache>, rknpu_weight_prepack_key_hash> g_weight_prepack_cache;
 
 void ggml_rknpu2_clear_offline_prepack_registry(void) {
-    std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
-    g_offline_prepack_registry.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
+        g_weight_prepack_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
+        g_offline_prepack_registry.clear();
+    }
 }
 
 bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta * meta, const void * data, size_t size) {
@@ -1725,25 +1665,25 @@ bool ggml_rknpu2_register_offline_prepack(const struct ggml_rknpu_prepack_meta *
         return false;
     }
 
-    rknpu_offline_prepack_blob blob;
-    blob.tensor_name = meta->tensor_name;
-    blob.blob_tensor_name = meta->blob_tensor_name;
+    auto blob = std::make_shared<rknpu_offline_prepack_blob>();
+    blob->tensor_name = meta->tensor_name;
+    blob->blob_tensor_name = meta->blob_tensor_name;
     if (meta->layout != nullptr) {
-        blob.layout = meta->layout;
+        blob->layout = meta->layout;
     }
-    blob.meta = *meta;
-    blob.meta.tensor_name = blob.tensor_name.c_str();
-    blob.meta.blob_tensor_name = blob.blob_tensor_name.c_str();
-    blob.meta.layout = blob.layout.c_str();
-    blob.bytes.resize(size);
-    std::memcpy(blob.bytes.data(), data, size);
+    blob->meta = *meta;
+    blob->bytes.resize(size);
+    std::memcpy(blob->bytes.data(), data, size);
+    blob->meta.tensor_name = blob->tensor_name.c_str();
+    blob->meta.blob_tensor_name = blob->blob_tensor_name.c_str();
+    blob->meta.layout = blob->layout.c_str();
 
     std::lock_guard<std::mutex> lock(g_offline_prepack_mtx);
-    g_offline_prepack_registry[meta->tensor_name] = std::move(blob);
+    g_offline_prepack_registry[meta->tensor_name] = blob;
     return true;
 }
 
-static const rknpu_offline_prepack_blob * ggml_rknpu2_find_offline_prepack(const char * tensor_name) {
+static std::shared_ptr<const rknpu_offline_prepack_blob> ggml_rknpu2_find_offline_prepack(const char * tensor_name) {
     if (tensor_name == nullptr || tensor_name[0] == '\0') {
         return nullptr;
     }
@@ -1753,7 +1693,7 @@ static const rknpu_offline_prepack_blob * ggml_rknpu2_find_offline_prepack(const
     if (it == g_offline_prepack_registry.end()) {
         return nullptr;
     }
-    return &it->second;
+    return it->second;
 }
 
 static std::atomic<uint64_t> g_weight_prepack_lookup_cnt{0};
@@ -1797,8 +1737,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
     int N,
     rknn_tensor_type tensor_type) {
 
-    const rknpu_offline_prepack_blob * offline = ggml_rknpu2_find_offline_prepack(src0->name);
-    if (offline == nullptr) {
+    auto offline = ggml_rknpu2_find_offline_prepack(src0->name);
+    if (!offline) {
         return nullptr;
     }
 
@@ -1860,6 +1800,7 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
 
     auto cache = std::make_shared<rknpu_weight_prepack_cache>();
     cache->key = { src0, k, n, K, N, tensor_type };
+    cache->offline = offline;
 
     const float * scales = header->scales_bytes_total == 0
         ? nullptr
@@ -1873,9 +1814,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_try_load_weight_p
             block.nn = nn;
             block.kk = kk;
             block.scale = scales ? scales[block_index] : 1.0f;
-            block.dma_mem = std::make_shared<rknn_mem>(packed_size);
-            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
-            std::memcpy(block.dma_mem->ptr, packed_base + size_t(block_index) * packed_size, packed_size);
+            block.packed_ptr = packed_base + size_t(block_index) * packed_size;
+            block.packed_size = packed_size;
             cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
             ++block_index;
         }
@@ -1905,92 +1845,8 @@ static std::shared_ptr<rknpu_weight_prepack_cache> ggml_rknpu2_get_weight_prepac
 
     auto cache = ggml_rknpu2_try_load_weight_prepack_from_offline(src0, k, n, K, N, tensor_type);
     if (!cache) {
-        if (src0->data == nullptr) {
-            GGML_LOG_ERROR("%s: tensor %s has no source weights and no offline prepack\n", __func__, src0->name);
-            GGML_ABORT("%s: tensor %s has no source weights and no offline prepack", __func__, src0->name);
-        }
-        GGML_LOG_DEBUG("%s: offline prepack unavailable for tensor %s, building runtime prepack from source weights\n", __func__, src0->name);
-        cache = std::make_shared<rknpu_weight_prepack_cache>();
-        cache->key = cache_key;
-    } else {
-        std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
-        auto it = g_weight_prepack_cache.find(cache_key);
-        if (it != g_weight_prepack_cache.end()) {
-            g_weight_prepack_hit_cnt.fetch_add(1);
-            return it->second;
-        }
-        g_weight_prepack_cache.emplace(cache_key, cache);
-        g_weight_prepack_build_cnt.fetch_add(1);
-        return cache;
-    }
-
-    const void * B = src0->data;
-    const float * fB = nullptr;
-    std::unique_ptr<float[]> fB_storage;
-
-    if (tensor_type == RKNN_TENSOR_INT8) {
-        const ggml_type_traits * traits = ggml_get_type_traits(src0->type);
-        GGML_ASSERT(traits->to_float != NULL);
-        const int nele = k * n;
-        fB_storage.reset(new float[nele]);
-        traits->to_float(B, fB_storage.get(), nele);
-        fB = fB_storage.get();
-    }
-
-    const size_t packed_size = rknn_type_size_B(tensor_type) * K * N;
-    for (int nn = 0; nn < n; nn += N) {
-        for (int kk = 0; kk < k; kk += K) {
-            rknpu_weight_prepack_block block;
-            block.nn = nn;
-            block.kk = kk;
-            block.scale = 1.0f;
-            block.dma_mem = std::make_shared<rknn_mem>(packed_size);
-            GGML_ASSERT(block.dma_mem && block.dma_mem->ptr);
-            memset(block.dma_mem->ptr, 0, packed_size);
-
-            if (tensor_type == RKNN_TENSOR_FLOAT32) {
-                __fp16 * packed = (__fp16 *)block.dma_mem->ptr;
-                const __fp16 * src_fp16 = (const __fp16 *)B;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_fp16(K, i + 1, j + 1)] = src_fp16[ii * k + jj];
-                    }
-                }
-            } else {
-                GGML_ASSERT(tensor_type == RKNN_TENSOR_INT8);
-                float scale = RKNPU_PREPACK_SCALE_MIN;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        scale = std::max(scale, std::abs(fB[ii * k + jj]));
-                    }
-                }
-
-                block.scale = scale / 127.f;
-                int8_t * packed = (int8_t *)block.dma_mem->ptr;
-                for (int i = 0; i < N; i++) {
-                    for (int j = 0; j < K; j++) {
-                        int ii = nn + i;
-                        int jj = kk + j;
-                        if (ii >= n || jj >= k) {
-                            continue;
-                        }
-                        packed[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB[ii * k + jj], block.scale);
-                    }
-                }
-            }
-
-            cache->blocks.emplace(rknpu_block_key(nn, kk), std::move(block));
-        }
+        GGML_LOG_ERROR("%s: tensor %s is missing offline prepack\n", __func__, src0->name);
+        GGML_ABORT("%s: tensor %s is missing offline prepack", __func__, src0->name);
     }
 
     std::lock_guard<std::mutex> lock(g_weight_prepack_mtx);
@@ -2469,54 +2325,17 @@ void rknpu2_matmul_pre1(struct ggml_tensor * dst, int nth, int ith) {
     );
     kernel->for_all_weights(
         [&](int nn, int kk, int N, int K, std::shared_ptr<rknn_mem> weight_mem) {
-            // fprintf(stderr, "set weight->ptr[0] = %d\n", ((int32_t*)weight_mem->ptr)[0]);
-            // fprintf(stderr, "n = %d, k = %d, pre1 weight: nn=%d kk=%d N=%d K=%d\n", n, k, nn, kk, N, K);
             const rknpu_weight_prepack_block * block = ggml_rknpu2_find_weight_prepack_block(weight_prepack, nn, kk);
             GGML_ASSERT(block && "cache missed at pre1, but it should have been built at pre0");
             if (ith == 0) {
                 g_weight_block_hit_pre1_cnt.fetch_add(1);
-            }
-            if (ith == 0) {
-                GGML_ASSERT(block->dma_mem);
-                GGML_ASSERT(block->dma_mem->dma != 0);
+                GGML_ASSERT(block->packed_ptr != nullptr);
+                GGML_ASSERT(block->packed_size <= weight_mem->size);
                 if (tensor_type == RKNN_TENSOR_INT8) {
                     weight_mem->scale = block->scale;
                 }
-
-                for (const auto & task_group : kernel->npu_tasks) {
-                    for (const auto & task : task_group->npu_tasks) {
-                        if (task->nn == nn && task->kk == kk) {
-                            task->set_weight_dma(block->dma_mem->dma);
-                        }
-                    }
-                }
+                std::memcpy(weight_mem->ptr, block->packed_ptr, block->packed_size);
             }
-
-            // if (ith == 0) {
-            //     g_weight_block_miss_pre1_cnt.fetch_add(1);
-            // }
-
-            // auto weight = weight_mem->ptr;
-            // if (tensor_type == RKNN_TENSOR_FLOAT32) {
-            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-            //         for (int j = 0; j < K; j++) {
-            //             int ii = nn + i;
-            //             int jj = kk + j;
-            //             if (ii >= n || jj >= k) continue;
-            //             ((__fp16 *)weight)[weight_fp16(K, i + 1, j + 1)] = ((__fp16 *)B)[ii * k + jj];
-            //         }
-            // } else if (tensor_type == RKNN_TENSOR_INT8) {
-            //     const float *fB_local = ensure_fB();
-            //     for (int i = weight_mem->pre1_cnt.fetch_add(1); i < N; i = weight_mem->pre1_cnt.fetch_add(1))
-            //         for (int j = 0; j < K; j++) {
-            //             int ii = nn + i;
-            //             int jj = kk + j;
-            //             if (ii >= n || jj >= k) continue;
-            //             ((int8_t *)weight)[weight_int8(K, i + 1, j + 1)] = f32_to_i8(fB_local[ii * k + jj], weight_mem->scale);
-            //         }
-            // }else{
-            //     fprintf(stderr, "unknown tensor type: %d\n", tensor_type);
-            // }
         }
     );
     END_MEASURE_0;
