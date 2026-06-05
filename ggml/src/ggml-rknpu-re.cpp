@@ -63,16 +63,6 @@ static uint64_t npu_total_failed_count = 0;
         return false;
     }
 
-    {
-        const int64_t k = src0->ne[0];
-        const int64_t n = dst->ne[0];
-        /* can not allocate large B buffers for large vocab_size. just use cpu to perform these matmuls */
-        if (k >= 50000 || n >= 50000) {
-            npu_total_failed_count++;
-            return false;
-        }
-    }
-
     if (!ggml_rknpu2_find_offline_prepack(src0->name)) {
         npu_total_failed_count++;
         return false;
