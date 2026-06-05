@@ -2452,7 +2452,7 @@ static int ggml_rknpu2_pipeline_wait_compute_ready_locked(
         std::unique_lock<std::mutex> & lock,
         const char * caller,
         ggml_rknpu2_pipeline_header * out_info) {
-    uint64_t wait_loops = 0;
+    //uint64_t wait_loops = 0;
     ggml_rknpu2_pipeline_header info = {};
 
     while (true) {
@@ -2471,16 +2471,16 @@ static int ggml_rknpu2_pipeline_wait_compute_ready_locked(
             return 0;
         }
 
-        if ((wait_loops % 2000) == 0) {
-            GGML_LOG_INFO("%s: wait compute/header compute=%" PRIu64 " entry_size=%u entries=%u reload=%u+%u\n",
-                    caller,
-                    info.compute_entries_state,
-                    info.entry_size,
-                    info.entry_count,
-                    info.reload_start_entry,
-                    info.reload_entry_count);
-        }
-        wait_loops++;
+        //if ((wait_loops % 2000) == 0) {
+        //    GGML_LOG_INFO("%s: wait compute/header compute=%" PRIu64 " entry_size=%u entries=%u reload=%u+%u\n",
+        //            caller,
+        //            info.compute_entries_state,
+        //            info.entry_size,
+        //            info.entry_count,
+        //            info.reload_start_entry,
+        //            info.reload_entry_count);
+        //}
+        //wait_loops++;
 
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -2548,7 +2548,7 @@ static bool ggml_rknpu2_pipeline_wait_async_input_locked(
 
 static void ggml_rknpu2_pipeline_async_decrypt_worker() {
     int worker_error = 0;
-    GGML_LOG_INFO("%s: async tensor decrypt thread started\n", __func__);
+    //GGML_LOG_INFO("%s: async tensor decrypt thread started\n", __func__);
 
     {
         std::unique_lock<std::mutex> lock(g_pipeline_mtx);
@@ -2641,12 +2641,12 @@ static void ggml_rknpu2_pipeline_async_decrypt_worker() {
                 worker_error = -1;
             } else {
                 ggml_rknpu2_tensor_pipeline_store_state(span.state_index, PKVM_PIPELINE_READY);
-                GGML_LOG_INFO("%s: tensor='%s' ready payload=[0x%" PRIx64 ",0x%" PRIx64 ") %.2f MiB\n",
-                        __func__,
-                        ggml_get_name(span.tensor),
-                        span.reload_start,
-                        span.reload_end,
-                        tensor_len / 1024.0 / 1024.0);
+               // GGML_LOG_INFO("%s: tensor='%s' ready payload=[0x%" PRIx64 ",0x%" PRIx64 ") %.2f MiB\n",
+               //         __func__,
+               //         ggml_get_name(span.tensor),
+               //         span.reload_start,
+               //         span.reload_end,
+               //         tensor_len / 1024.0 / 1024.0);
             }
 
             if (ggml_rknpu2_pipeline_read_header(info)) {
