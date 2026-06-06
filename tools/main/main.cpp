@@ -530,6 +530,21 @@ int main(int argc, char ** argv) {
     display = params.display_prompt;
 
     std::vector<llama_token> embd;
+    auto stage_unconsumed_input = [&]() {
+        LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
+        while ((int) embd_inp.size() > n_consumed) {
+            embd.push_back(embd_inp[n_consumed]);
+
+            // push the prompt in the sampling context in order to apply repetition penalties later
+            // for the prompt, we don't apply grammar rules
+            common_sampler_accept(smpl, embd_inp[n_consumed], /* accept_grammar= */ false);
+
+            ++n_consumed;
+            if ((int) embd.size() >= params.n_batch) {
+                break;
+            }
+        }
+    };
 
     // single-token antiprompts
     std::vector<llama_token> antiprompt_token;
@@ -935,6 +950,10 @@ int main(int argc, char ** argv) {
                     common_sampler_reset(smpl);
                 }
                 is_interacting = false;
+
+                if ((int) embd_inp.size() > n_consumed) {
+                    stage_unconsumed_input();
+                }
 
                 if (waiting_for_first_input && params.single_turn) {
                     params.interactive = false;
