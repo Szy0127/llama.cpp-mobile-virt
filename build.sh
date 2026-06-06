@@ -19,4 +19,4 @@ cmake -Bbuild -H. \
 # cmake --build build -j10 --target llama-rknpu-prepack
 
 cmake --build build -j20 --target llama-cli
-scp build/bin/llama-cli opi5:~
+adb push build/bin/llama-cli /data/data/com.termux/files/home/llama-cli-strawman
