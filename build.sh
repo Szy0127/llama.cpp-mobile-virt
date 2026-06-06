@@ -9,8 +9,8 @@ cmake -Bbuild -H. \
     -DGGML_NATIVE=OFF \
     -DGGML_OPENMP=OFF \
     -DLLAMA_CURL=OFF\
-    -DCMAKE_C_FLAGS="-march=armv8-a"\
-    -DCMAKE_CXX_FLAGS="-march=armv8-a -std=c++17"\
+    -DCMAKE_C_FLAGS="-march=armv8.2-a+fp16+dotprod"\
+    -DCMAKE_CXX_FLAGS="-march=armv8.2-a+fp16+dotprod"\
     -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/aarch64-linux-gnu/libcrypto.so \
     -DOPENSSL_SSL_LIBRARY=/usr/lib/aarch64-linux-gnu/libssl.so \
     -DOPENSSL_INCLUDE_DIR=/usr/include \
