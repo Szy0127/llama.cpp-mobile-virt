@@ -727,6 +727,10 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+static bool ggml_backend_sched_is_rknpu_placeholder(const struct ggml_tensor * tensor) {
+    return (tensor->flags & GGML_TENSOR_FLAG_RKNPU_PLACEHOLDER) != 0;
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
@@ -758,11 +762,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     }
 
     // operations with weights are preferably run on the same backend as the weights
+    bool has_rknpu_placeholder_src = false;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = tensor->src[i];
         if (src == NULL) {
             continue;
         }
+        has_rknpu_placeholder_src = has_rknpu_placeholder_src || ggml_backend_sched_is_rknpu_placeholder(src);
         // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
         // not an ideal solution
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -778,6 +784,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             SET_CAUSE(tensor, "1.wgt%d", i);
             return src_backend_id;
+        }
+    }
+
+    if (has_rknpu_placeholder_src) {
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.rkp");
+                return b;
+            }
         }
     }
 

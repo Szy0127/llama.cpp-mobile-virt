@@ -1535,26 +1535,36 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto create_ctx = [&]() -> ggml_context * {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+
+        pimpl->ctxs.emplace_back(ctx);
+        return ctx;
+    };
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
+            ggml_context * ctx = create_ctx();
             ctx_map[buft] = ctx;
-            pimpl->ctxs.emplace_back(ctx);
-
             return ctx;
         }
         return it->second;
+    };
+    ggml_context * rknpu_placeholder_ctx = nullptr;
+    auto ctx_for_rknpu_placeholder = [&]() -> ggml_context * {
+        if (rknpu_placeholder_ctx == nullptr) {
+            rknpu_placeholder_ctx = create_ctx();
+        }
+        return rknpu_placeholder_ctx;
     };
 
     const auto TENSOR_DUPLICATED   = llama_model_loader::TENSOR_DUPLICATED;
@@ -1680,14 +1690,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             if (is_rknpu_only) {
-                ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
-                if (buft != nullptr && buft != cpu_buft) {
-                    LLAMA_LOG_DEBUG("%s: overriding buffer type %s with %s for RKNPU-only tensor %s\n",
-                            __func__, ggml_backend_buft_name(buft), ggml_backend_buft_name(cpu_buft), tn.str().c_str());
+                ggml_context * ctx = ctx_for_rknpu_placeholder();
+                if (flags & TENSOR_DUPLICATED) {
+                    ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+                    if (t) {
+                        return t;
+                    }
                 }
-                buft = cpu_buft;
-                LLAMA_LOG_DEBUG("%s: using %s buffer for RKNPU-only tensor %s; offline prepack is consumed later by the CPU/NPU mul_mat path\n",
-                        __func__, ggml_backend_buft_name(buft), tn.str().c_str());
+                LLAMA_LOG_DEBUG("%s: using placeholder-only context for RKNPU-only tensor %s; offline prepack is consumed later by the CPU/NPU mul_mat path\n",
+                        __func__, tn.str().c_str());
+                ggml_tensor * t = ml.create_tensor(ctx, tn, ne, flags);
+                if (t != nullptr) {
+                    t->flags |= GGML_TENSOR_FLAG_RKNPU_PLACEHOLDER;
+                }
+                return t;
             }
 
             if (!buft) {
