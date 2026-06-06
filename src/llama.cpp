@@ -209,9 +209,19 @@ static struct llama_model * llama_model_load_from_file_impl(
         LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
     }
 
+    const int64_t load_start_us = ggml_time_us();
+    LLAMA_LOG_INFO("%s: model load started: %s\n", __func__, path_model.c_str());
+
     const int status = llama_model_load(path_model, splits, *model, params);
+    const int64_t load_finish_us = ggml_time_us();
+    const double load_elapsed_ms = (load_finish_us - load_start_us) / 1000.0;
+
     GGML_ASSERT(status <= 0);
     if (status < 0) {
+        LLAMA_LOG_INFO("%s: model load %s after %.2f ms (%.3f s)\n",
+                __func__, status == -2 ? "cancelled" : "failed",
+                load_elapsed_ms, load_elapsed_ms / 1000.0);
+
         if (status == -1) {
             LLAMA_LOG_ERROR("%s: failed to load model\n", __func__);
         } else if (status == -2) {
@@ -221,6 +231,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         llama_model_free(model);
         return nullptr;
     }
+
+    LLAMA_LOG_INFO("%s: model load finished in %.2f ms (%.3f s)\n",
+            __func__, load_elapsed_ms, load_elapsed_ms / 1000.0);
 
     return model;
 }
