@@ -101,9 +101,30 @@ The `llama-cli` program provides several ways to interact with the LLaMA models 
 
 -   `--prompt PROMPT`: Provide a prompt directly as a command-line option.
 -   `--file FNAME`: Provide a file containing a prompt or multiple prompts.
+-   `--ttft-prompts-file FNAME`: Provide newline-delimited prompts for single-process TTFT benchmarking. Each line is treated as one independent prompt. If a line is JSON, a top-level `prompt` field will be used when present.
 -   `--system-prompt PROMPT`: Provide a system prompt (will otherwise use the default one in the chat template (if provided)).
 -   `--system-prompt-file FNAME`: Provide a file containing a system prompt.
 -   `--interactive-first`: Run the program in interactive mode and wait for input right away. (More on this below.)
+
+## TTFT batch mode
+
+For TTFT benchmarking, you can keep the model loaded and process many prompts in one process with `--ttft-prompts-file`.
+
+- Each input line is treated as one independent request.
+- The prompt is prefetched fully, then generation stops immediately after the **first generated token**.
+- KV cache and request-local state are cleared between prompts, so prompts do not share conversation history.
+- `-n` / `--n-predict` is ignored in this mode.
+- After each prompt, the CLI sleeps for `prompt_tokens * 0.03s` to reduce thermal skew across long runs.
+- Each completed prompt is appended immediately to a persistent results file next to the input prompt file, using the extension `.ttft-results.jsonl`.
+- This mode cannot be combined with interactive mode or prompt-cache options.
+
+Example:
+
+```sh
+./llama-cli -m model.gguf --ttft-prompts-file prompts.jsonl -no-cnv
+```
+
+Each result line prints the prompt index, prompt token count, TTFT in milliseconds, and the first generated token, followed by a summary line with aggregate TTFT statistics.
 
 ## Interaction
 
