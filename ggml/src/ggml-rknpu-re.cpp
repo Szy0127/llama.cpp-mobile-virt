@@ -2014,6 +2014,11 @@ ggml_rknpu2_matmul_kernel_create(int m, int k, int n, rknn_tensor_type type)
     return kernel;
 }
 
+void ggml_rknpu2_clear_matmul_cache(void) {
+    matmul_kernels.clear();
+    matmul_buffer_mgr.clear();
+}
+
 static void ggml_backend_rknpu2_mul_mat_mul_npu(
     struct ggml_rknpu2_data_pack** packs,
     const int64_t m,

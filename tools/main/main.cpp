@@ -6,6 +6,10 @@
 #include "llama.h"
 #include "chat.h"
 
+#if defined(GGML_USE_RKNPU_RE)
+#include "ggml-rknpu-re.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -124,6 +128,15 @@ static void install_ttft_debug_handlers() {
     std::set_terminate(ttft_terminate_handler);
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     signal(SIGABRT, ttft_fatal_signal_handler);
+#endif
+}
+
+static void rknpu_clear_after_generation() {
+#if defined(GGML_USE_RKNPU_RE)
+    // TTFT mode stops right after sampling the first token, so the normal decode-stage
+    // cleanup path may never run. Clear per-request matmul/task caches explicitly to
+    // avoid accumulating RKNPU allocations across many prompts.
+    ggml_rknpu2_clear_matmul_cache();
 #endif
 }
 
@@ -432,6 +445,7 @@ static int run_ttft_benchmark(
 
         results.push_back(result);
         reset_ttft_request_state(ctx);
+        rknpu_clear_after_generation();
 
         std::this_thread::sleep_for(std::chrono::duration<double>(result.sleep_s));
     }
