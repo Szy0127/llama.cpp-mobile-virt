@@ -205,7 +205,7 @@ static inline bool rknpu_prepack_is_candidate_name(const char * name) {
         strstr(name, RKNPU_PREPACK_PAYLOAD_SUFFIX) != NULL) {
         return false;
     }
-    if (strcmp(name, "token_embd.weight") == 0) {
+    if (strcmp(name, "token_embd.weight") == 0 || strcmp(name, "output.weight") == 0) {
         return false;
     }
     if (strstr(name, "norm") != NULL) {

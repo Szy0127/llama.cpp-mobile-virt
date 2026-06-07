@@ -422,24 +422,22 @@ static int run_ttft_benchmark(
         result.sleep_s = result.prompt_tokens * 0.03;
 
         const std::string token_piece = ttft_escape_json_string(result.first_token_piece);
-        LOG("ttft[%zu/%zu]: prompt_tokens=%d ttft_ms=%.3f sleep_s=%.3f first_token_id=%d first_token=\"%s\"\n",
+        LOG("ttft[%zu/%zu]: prompt_tokens=%d ttft_ms=%.3f sleep_s=%.3f first_token_id=%d\n",
                 result.index,
                 params.ttft_prompts.size(),
                 result.prompt_tokens,
                 result.ttft_ms,
                 result.sleep_s,
-                result.first_token,
-                token_piece.c_str());
+                result.first_token);
 
         if (!ttft_append_jsonl_line(results_path,
                 string_format(
-                    "{\"type\":\"sample\",\"index\":%zu,\"prompt_length\":%d,\"ttft_ms\":%.6f,\"sleep_s\":%.6f,\"first_token_id\":%d,\"first_token\":\"%s\"}",
+                    "{\"type\":\"sample\",\"index\":%zu,\"prompt_length\":%d,\"ttft_ms\":%.6f,\"sleep_s\":%.6f,\"first_token_id\":%d}",
                     result.index,
                     result.prompt_tokens,
                     result.ttft_ms,
                     result.sleep_s,
-                    result.first_token,
-                    token_piece.c_str()))) {
+                    result.first_token))) {
             return 1;
         }
 
