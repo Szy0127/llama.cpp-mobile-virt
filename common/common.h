@@ -271,6 +271,7 @@ struct common_params {
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
+    std::string ttft_prompts_file    = ""; // newline-delimited prompts for single-process TTFT benchmarking // NOLINT
     std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
@@ -278,8 +279,9 @@ struct common_params {
     std::string lookup_cache_dynamic = ""; // path of dynamic ngram cache file for lookup decoding          // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
 
-    std::vector<std::string> in_files;   // all input files
-    std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
+    std::vector<std::string> in_files;      // all input files
+    std::vector<std::string> ttft_prompts;  // newline-delimited prompts for single-process TTFT benchmarking
+    std::vector<std::string> antiprompt;    // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 

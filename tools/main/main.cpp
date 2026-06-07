@@ -10,15 +10,19 @@
 #include "ggml-rknpu-re.h"
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -176,6 +180,7 @@ static void print_usage(int argc, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
+    LOG("\n  TTFT batch mode:     %s -m your_model.gguf --ttft-prompts-file prompts.jsonl -no-cnv\n", argv[0]);
     LOG("\n");
 }
 
@@ -211,6 +216,326 @@ static void sigint_handler(int signo) {
     }
 }
 #endif
+
+struct ttft_sample_result {
+    size_t index = 0;
+    int prompt_tokens = 0;
+    double ttft_ms = 0.0;
+    double sleep_s = 0.0;
+    llama_token first_token = LLAMA_TOKEN_NULL;
+    std::string first_token_piece;
+};
+
+static std::string ttft_escape_json_string(std::string text) {
+    string_replace_all(text, "\\", "\\\\");
+    string_replace_all(text, "\n", "\\n");
+    string_replace_all(text, "\r", "\\r");
+    string_replace_all(text, "\t", "\\t");
+    string_replace_all(text, "\"", "\\\"");
+    return text;
+}
+
+static std::string ttft_results_file_path(const common_params & params) {
+    if (params.ttft_prompts_file.empty()) {
+        return "ttft-results.jsonl";
+    }
+
+    std::filesystem::path result_path(params.ttft_prompts_file);
+    result_path.replace_extension(".ttft-results.jsonl");
+    return result_path.string();
+}
+
+static bool ttft_append_jsonl_line(const std::string & path, const std::string & line, bool truncate = false) {
+    std::ofstream file(path, std::ios::out | (truncate ? std::ios::trunc : std::ios::app));
+    if (!file) {
+        LOG_ERR("%s: failed to open TTFT results file '%s'\n", __func__, path.c_str());
+        return false;
+    }
+
+    file << line << '\n';
+    file.flush();
+    return (bool) file;
+}
+
+static double ttft_quantile(const std::vector<double> & sorted, double q) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    if (sorted.size() == 1) {
+        return sorted[0];
+    }
+
+    const double pos = q * (sorted.size() - 1);
+    const size_t lo = (size_t) pos;
+    const size_t hi = std::min(lo + 1, sorted.size() - 1);
+    const double frac = pos - lo;
+    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
+static void reset_ttft_request_state(llama_context * ctx) {
+    llama_kv_self_clear(ctx);
+    llama_synchronize(ctx);
+    llama_perf_context_reset(ctx);
+    rknpu_clear_after_generation();
+}
+
+static int prepare_generation_tensors(const char * reason) {
+    if (decrypt_all_tensor(false) != 0) {
+        LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
+        return -1;
+    }
+
+#if defined(GGML_USE_RKNPU_RE)
+    if (!ggml_rknpu2_pipeline_has_pending_work()) {
+        if (ggml_rknpu2_flush_all_payload() != 0) {
+            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
+            return -1;
+        }
+        LOG("flush all\n");
+    } else {
+        if (rknpu_start_async_decrypt_if_pending(reason) != 0) {
+            return -1;
+        }
+        LOG_INF("%s : RKNPU pipeline pending; payload flush is deferred to async tensor decrypt\n", __func__);
+    }
+#else
+    (void) reason;
+#endif
+
+    return 0;
+}
+
+static bool build_ttft_prompt_tokens(
+        llama_model * model,
+        llama_context * ctx,
+        const common_params & params,
+        const common_chat_templates * chat_templates,
+        const std::string & prompt_line,
+        std::string & prompt,
+        std::vector<llama_token> & embd_inp) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_ctx = llama_n_ctx(ctx);
+    const bool add_bos = llama_vocab_get_add_bos(vocab) && !params.use_jinja;
+
+    if (!llama_model_has_encoder(model)) {
+        GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+    }
+
+    if (params.conversation_mode && params.enable_chat_template) {
+        std::vector<common_chat_msg> chat_msgs;
+
+        if (!params.system_prompt.empty()) {
+            common_chat_msg system_msg;
+            system_msg.role = "system";
+            system_msg.content = params.system_prompt;
+            chat_msgs.push_back(system_msg);
+        }
+
+        common_chat_msg user_msg;
+        user_msg.role = "user";
+        user_msg.content = prompt_line;
+        chat_msgs.push_back(user_msg);
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = std::move(chat_msgs);
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = params.use_jinja;
+
+        prompt = common_chat_templates_apply(chat_templates, inputs).prompt;
+    } else {
+        prompt = prompt_line;
+    }
+
+    embd_inp = common_tokenize(ctx, prompt, true, true);
+
+    if (embd_inp.empty()) {
+        if (add_bos) {
+            embd_inp.push_back(llama_vocab_bos(vocab));
+            LOG_WRN("%s: embd_inp was considered empty and bos was added\n", __func__);
+        } else {
+            LOG_ERR("%s: input is empty\n", __func__);
+            return false;
+        }
+    }
+
+    if ((int) embd_inp.size() > n_ctx - 4) {
+        LOG_ERR("%s: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
+        return false;
+    }
+
+    return true;
+}
+
+static bool run_ttft_prompt(
+        llama_model * model,
+        llama_context * ctx,
+        const common_chat_templates * chat_templates,
+        const common_params & params,
+        const std::string & prompt_line,
+        common_sampler *& active_smpl,
+        ttft_sample_result & result) {
+    std::string prompt;
+    std::vector<llama_token> embd_inp;
+    if (!build_ttft_prompt_tokens(model, ctx, params, chat_templates, prompt_line, prompt, embd_inp)) {
+        return false;
+    }
+
+    result.prompt_tokens = (int) embd_inp.size();
+
+    common_sampler * smpl = common_sampler_init(model, params.sampling);
+    if (!smpl) {
+        LOG_ERR("%s: failed to initialize sampling subsystem\n", __func__);
+        return false;
+    }
+    active_smpl = smpl;
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int64_t t_start_us = ggml_time_us();
+
+    if (llama_model_has_encoder(model)) {
+        const int enc_input_size = (int) embd_inp.size();
+        llama_token * enc_input_buf = embd_inp.data();
+
+        if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
+            LOG_ERR("%s: failed to eval encoder prompt\n", __func__);
+            common_sampler_free(smpl);
+            active_smpl = nullptr;
+            return false;
+        }
+
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+            decoder_start_token_id = llama_vocab_bos(vocab);
+        }
+
+        embd_inp.clear();
+        embd_inp.push_back(decoder_start_token_id);
+    }
+
+    for (int i = 0; i < (int) embd_inp.size(); i += params.n_batch) {
+        const int n_eval = std::min((int) embd_inp.size() - i, params.n_batch);
+        for (int j = 0; j < n_eval; ++j) {
+            common_sampler_accept(smpl, embd_inp[i + j], /* accept_grammar= */ false);
+        }
+        if (llama_decode(ctx, llama_batch_get_one(&embd_inp[i], n_eval))) {
+            LOG_ERR("%s: failed to eval prompt\n", __func__);
+            common_sampler_free(smpl);
+            active_smpl = nullptr;
+            return false;
+        }
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, -1);
+    common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+
+    llama_synchronize(ctx);
+    const int64_t t_end_us = ggml_time_us();
+
+    result.first_token = id;
+    result.first_token_piece = common_token_to_piece(ctx, id, params.special);
+    result.ttft_ms = (t_end_us - t_start_us) / 1000.0;
+
+    common_sampler_free(smpl);
+    active_smpl = nullptr;
+    return true;
+}
+
+static int run_ttft_benchmark(
+        llama_model * model,
+        llama_context * ctx,
+        const common_chat_templates * chat_templates,
+        const common_params & params,
+        common_sampler *& active_smpl) {
+    const std::string results_path = ttft_results_file_path(params);
+
+    LOG_INF("%s: TTFT batch mode on, prompts = %zu\n", __func__, params.ttft_prompts.size());
+    LOG_INF("%s: n_predict is ignored in TTFT batch mode; each prompt stops after the first generated token\n", __func__);
+    LOG_INF("%s: intermediate TTFT results will be persisted to %s\n", __func__, results_path.c_str());
+    LOG_INF("%s: cooldown sleep after each prompt = prompt_tokens * 0.1 s\n", __func__);
+
+    is_interacting = false;
+    need_insert_eot = false;
+
+    if (!ttft_append_jsonl_line(results_path,
+            string_format(
+                "{\"type\":\"meta\",\"source\":\"%s\",\"count\":%zu,\"sleep_factor_s_per_prompt_token\":0.1}",
+                ttft_escape_json_string(params.ttft_prompts_file).c_str(),
+                params.ttft_prompts.size()),
+            /* truncate = */ true)) {
+        return 1;
+    }
+
+    std::vector<ttft_sample_result> results;
+    results.reserve(params.ttft_prompts.size());
+
+    for (size_t i = 0; i < params.ttft_prompts.size(); ++i) {
+        reset_ttft_request_state(ctx);
+
+        ttft_sample_result result;
+        result.index = i + 1;
+        if (!run_ttft_prompt(model, ctx, chat_templates, params, params.ttft_prompts[i], active_smpl, result)) {
+            return 1;
+        }
+
+        result.sleep_s = result.prompt_tokens * 0.1;
+
+        const std::string token_piece = ttft_escape_json_string(result.first_token_piece);
+        LOG("ttft[%zu/%zu]: prompt_tokens=%d ttft_ms=%.3f sleep_s=%.3f first_token_id=%d first_token=\"%s\"\n",
+                result.index,
+                params.ttft_prompts.size(),
+                result.prompt_tokens,
+                result.ttft_ms,
+                result.sleep_s,
+                result.first_token,
+                token_piece.c_str());
+
+        if (!ttft_append_jsonl_line(results_path,
+                string_format(
+                    "{\"type\":\"sample\",\"index\":%zu,\"prompt_length\":%d,\"ttft_ms\":%.6f,\"sleep_s\":%.6f,\"first_token_id\":%d,\"first_token\":\"%s\"}",
+                    result.index,
+                    result.prompt_tokens,
+                    result.ttft_ms,
+                    result.sleep_s,
+                    result.first_token,
+                    token_piece.c_str()))) {
+            return 1;
+        }
+
+        results.push_back(result);
+        reset_ttft_request_state(ctx);
+
+        std::this_thread::sleep_for(std::chrono::duration<double>(result.sleep_s));
+    }
+
+    std::vector<double> ttft_ms;
+    ttft_ms.reserve(results.size());
+    double sum_ms = 0.0;
+    for (const auto & result : results) {
+        ttft_ms.push_back(result.ttft_ms);
+        sum_ms += result.ttft_ms;
+    }
+    std::sort(ttft_ms.begin(), ttft_ms.end());
+
+    const double mean_ms = results.empty() ? 0.0 : sum_ms / results.size();
+    const double min_ms  = ttft_ms.empty() ? 0.0 : ttft_ms.front();
+    const double max_ms  = ttft_ms.empty() ? 0.0 : ttft_ms.back();
+    const double p50_ms  = ttft_quantile(ttft_ms, 0.50);
+    const double p90_ms  = ttft_quantile(ttft_ms, 0.90);
+    const double p95_ms  = ttft_quantile(ttft_ms, 0.95);
+    const double p99_ms  = ttft_quantile(ttft_ms, 0.99);
+
+    LOG("ttft-summary: count=%zu mean_ms=%.3f min_ms=%.3f p50_ms=%.3f p90_ms=%.3f p95_ms=%.3f p99_ms=%.3f max_ms=%.3f\n",
+            results.size(), mean_ms, min_ms, p50_ms, p90_ms, p95_ms, p99_ms, max_ms);
+
+    if (!ttft_append_jsonl_line(results_path,
+            string_format(
+                "{\"type\":\"summary\",\"count\":%zu,\"mean_ms\":%.6f,\"min_ms\":%.6f,\"p50_ms\":%.6f,\"p90_ms\":%.6f,\"p95_ms\":%.6f,\"p99_ms\":%.6f,\"max_ms\":%.6f}",
+                results.size(), mean_ms, min_ms, p50_ms, p90_ms, p95_ms, p99_ms, max_ms))) {
+        return 1;
+    }
+
+    return 0;
+}
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -366,6 +691,23 @@ int main(int argc, char ** argv) {
         LOG_INF("\n");
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
         LOG_INF("\n");
+    }
+
+    if (!params.ttft_prompts.empty()) {
+        if (prepare_generation_tensors("ttft-batch") != 0) {
+            llama_backend_free();
+            ggml_threadpool_free_fn(threadpool);
+            ggml_threadpool_free_fn(threadpool_batch);
+            return 1;
+        }
+
+        const int ttft_ret = run_ttft_benchmark(model, ctx, chat_templates.get(), params, smpl);
+
+        llama_backend_free();
+        ggml_threadpool_free_fn(threadpool);
+        ggml_threadpool_free_fn(threadpool_batch);
+
+        return ttft_ret;
     }
 
     std::string path_session = params.path_prompt_cache;
@@ -719,25 +1061,9 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    if (decrypt_all_tensor(false) != 0) {
-        LOG_ERR("%s : failed to decrypt model tensors\n", __func__);
+    if (prepare_generation_tensors("initial-prompt") != 0) {
         return 1;
     }
-#if defined(GGML_USE_RKNPU_RE)
-    const bool rknpu_pipeline_pending = ggml_rknpu2_pipeline_has_pending_work();
-    if (!rknpu_pipeline_pending) {
-        if (ggml_rknpu2_flush_all_payload() != 0) {
-            LOG_ERR("%s : failed to flush RKNPU payload cache, errno=%d\n", __func__, errno);
-            return 1;
-        }
-        LOG("flush all\n");
-    } else {
-        if (rknpu_start_async_decrypt_if_pending("initial-prompt") != 0) {
-            return 1;
-        }
-        LOG_INF("%s : RKNPU pipeline pending; payload flush is deferred to async tensor decrypt\n", __func__);
-    }
-#endif
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {

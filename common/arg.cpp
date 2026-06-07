@@ -38,11 +38,10 @@
 
 using json = nlohmann::ordered_json;
 
-std::initializer_list<enum llama_example> mmproj_examples = {
+static const std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_LLAVA,
     LLAMA_EXAMPLE_SERVER,
 };
-
 static std::string read_file(const std::string & fname) {
     std::ifstream file(fname);
     if (!file) {
@@ -62,13 +61,49 @@ static void write_file(const std::string & fname, const std::string & content) {
     file.close();
 }
 
+static std::vector<std::string> read_ttft_prompts_file(const std::string & fname) {
+    std::ifstream file(fname);
+    if (!file) {
+        throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
+    }
+
+    std::vector<std::string> prompts;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        if (line.find_first_not_of(" \t") == std::string::npos) {
+            continue;
+        }
+
+        const size_t first_non_ws = line.find_first_not_of(" \t");
+        if (first_non_ws != std::string::npos && line[first_non_ws] == '{' && json::accept(line)) {
+            const auto parsed = json::parse(line);
+            if (parsed.contains("prompt") && parsed["prompt"].is_string()) {
+                prompts.push_back(parsed["prompt"].get<std::string>());
+                continue;
+            }
+        }
+
+        prompts.push_back(line);
+    }
+
+    if (prompts.empty()) {
+        throw std::runtime_error(string_format("error: prompt file '%s' does not contain any usable prompts\n", fname.c_str()));
+    }
+
+    return prompts;
+}
+
 common_arg & common_arg::set_examples(std::initializer_list<enum llama_example> examples) {
-    this->examples = std::move(examples);
+    this->examples = examples;
     return *this;
 }
 
 common_arg & common_arg::set_excludes(std::initializer_list<enum llama_example> excludes) {
-    this->excludes = std::move(excludes);
+    this->excludes = excludes;
     return *this;
 }
 
@@ -932,6 +967,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    if (!params.ttft_prompts.empty()) {
+        if (params.interactive || params.interactive_first) {
+            throw std::invalid_argument("error: --ttft-prompts-file cannot be used with interactive mode\n");
+        }
+        if (!params.path_prompt_cache.empty() || params.prompt_cache_all || params.prompt_cache_ro) {
+            throw std::invalid_argument("error: --ttft-prompts-file cannot be used with prompt cache options\n");
+        }
+        if (!params.prompt.empty() || !params.prompt_file.empty()) {
+            throw std::invalid_argument("error: --ttft-prompts-file cannot be combined with --prompt/--file/--binary-file\n");
+        }
+    }
+
     // handle model and download
     {
         auto res = common_params_handle_model(params.model, params.hf_token, DEFAULT_MODEL_PATH);
@@ -956,6 +1003,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         string_process_escapes(params.prompt);
         string_process_escapes(params.input_prefix);
         string_process_escapes(params.input_suffix);
+        for (auto & prompt : params.ttft_prompts) {
+            string_process_escapes(prompt);
+        }
         for (auto & antiprompt : params.antiprompt) {
             string_process_escapes(antiprompt);
         }
@@ -1500,6 +1550,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_excludes({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ttft-prompts-file"}, "FNAME",
+        "newline-delimited prompts for single-process TTFT benchmarking (one prompt per line, or JSONL with a prompt field)",
+        [](common_params & params, const std::string & value) {
+            params.ttft_prompts_file = value;
+            params.ttft_prompts = read_ttft_prompts_file(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
         {"-sysf", "--system-prompt-file"}, "FNAME",
         "a file containing the system prompt (default: none)",
