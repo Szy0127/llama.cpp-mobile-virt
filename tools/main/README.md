@@ -114,7 +114,7 @@ For TTFT benchmarking, you can keep the model loaded and process many prompts in
 - The prompt is prefetched fully, then generation stops immediately after the **first generated token**.
 - KV cache and request-local state are cleared between prompts, so prompts do not share conversation history.
 - `-n` / `--n-predict` is ignored in this mode.
-- After each prompt, the CLI sleeps for `prompt_tokens * 0.1s` to reduce thermal skew across long runs.
+- After each prompt, the CLI sleeps for `prompt_tokens * 0.03s` to reduce thermal skew across long runs.
 - Each completed prompt is appended immediately to a persistent results file next to the input prompt file, using the extension `.ttft-results.jsonl`.
 - This mode cannot be combined with interactive mode or prompt-cache options.
 

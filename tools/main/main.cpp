@@ -7,11 +7,14 @@
 #include "chat.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -21,6 +24,7 @@
 #include <vector>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
 #elif defined (_WIN32)
@@ -44,6 +48,84 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+// Track the current shutdown / TTFT phase so a crash on the board leaves enough breadcrumbs.
+static std::atomic<size_t>       g_ttft_prompt_index { 0 };
+static std::atomic<const char *> g_ttft_phase { "startup" };
+
+static void set_ttft_phase(const char * phase, size_t prompt_index = 0) {
+    g_ttft_phase.store(phase, std::memory_order_relaxed);
+    g_ttft_prompt_index.store(prompt_index, std::memory_order_relaxed);
+}
+
+static void log_ttft_crash_context(const char * reason) {
+    const size_t prompt_index = g_ttft_prompt_index.load(std::memory_order_relaxed);
+    const char * phase = g_ttft_phase.load(std::memory_order_relaxed);
+    LOG_ERR("ttft-crash-context: reason=%s phase=%s prompt_index=%zu\n",
+            reason,
+            phase ? phase : "(null)",
+            prompt_index);
+}
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+static void dump_native_backtrace() {
+    void * frames[64];
+    const int n_frames = backtrace(frames, 64);
+    if (n_frames <= 0) {
+        LOG_ERR("ttft-backtrace: unavailable\n");
+        return;
+    }
+
+    char ** symbols = backtrace_symbols(frames, n_frames);
+    if (!symbols) {
+        LOG_ERR("ttft-backtrace: backtrace_symbols failed\n");
+        return;
+    }
+
+    LOG_ERR("ttft-backtrace: frames=%d\n", n_frames);
+    for (int i = 0; i < n_frames; ++i) {
+        LOG_ERR("  [%02d] %s\n", i, symbols[i]);
+    }
+    free((void *) symbols);
+}
+#else
+static void dump_native_backtrace() {}
+#endif
+
+[[noreturn]] static void ttft_terminate_handler() {
+    const std::exception_ptr exptr = std::current_exception();
+    if (exptr) {
+        try {
+            std::rethrow_exception(exptr);
+        } catch (const std::exception & e) {
+            log_ttft_crash_context(e.what());
+        } catch (...) {
+            log_ttft_crash_context("non-std exception");
+        }
+    } else {
+        log_ttft_crash_context("no active exception");
+    }
+
+    dump_native_backtrace();
+    fflush(stderr);
+    std::_Exit(1);
+}
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+[[noreturn]] static void ttft_fatal_signal_handler(int signo) {
+    log_ttft_crash_context(signo == SIGABRT ? "SIGABRT" : "fatal signal");
+    dump_native_backtrace();
+    fflush(stderr);
+    _exit(128 + signo);
+}
+#endif
+
+static void install_ttft_debug_handlers() {
+    std::set_terminate(ttft_terminate_handler);
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    signal(SIGABRT, ttft_fatal_signal_handler);
+#endif
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -292,17 +374,18 @@ static int run_ttft_benchmark(
         common_sampler *& active_smpl) {
     const std::string results_path = ttft_results_file_path(params);
 
+    set_ttft_phase("ttft-benchmark-start", 0);
     LOG_INF("%s: TTFT batch mode on, prompts = %zu\n", __func__, params.ttft_prompts.size());
     LOG_INF("%s: n_predict is ignored in TTFT batch mode; each prompt stops after the first generated token\n", __func__);
     LOG_INF("%s: intermediate TTFT results will be persisted to %s\n", __func__, results_path.c_str());
-    LOG_INF("%s: cooldown sleep after each prompt = prompt_tokens * 0.1 s\n", __func__);
+    LOG_INF("%s: cooldown sleep after each prompt = prompt_tokens * 0.03 s\n", __func__);
 
     is_interacting = false;
     need_insert_eot = false;
 
     if (!ttft_append_jsonl_line(results_path,
             string_format(
-                "{\"type\":\"meta\",\"source\":\"%s\",\"count\":%zu,\"sleep_factor_s_per_prompt_token\":0.1}",
+                "{\"type\":\"meta\",\"source\":\"%s\",\"count\":%zu,\"sleep_factor_s_per_prompt_token\":0.03}",
                 ttft_escape_json_string(params.ttft_prompts_file).c_str(),
                 params.ttft_prompts.size()),
             /* truncate = */ true)) {
@@ -313,15 +396,17 @@ static int run_ttft_benchmark(
     results.reserve(params.ttft_prompts.size());
 
     for (size_t i = 0; i < params.ttft_prompts.size(); ++i) {
+        set_ttft_phase("ttft-reset-before-prompt", i + 1);
         reset_ttft_request_state(ctx);
 
         ttft_sample_result result;
         result.index = i + 1;
+        set_ttft_phase("ttft-run-prompt", result.index);
         if (!run_ttft_prompt(model, ctx, chat_templates, params, params.ttft_prompts[i], active_smpl, result)) {
             return 1;
         }
 
-        result.sleep_s = result.prompt_tokens * 0.1;
+        result.sleep_s = result.prompt_tokens * 0.03;
 
         const std::string token_piece = ttft_escape_json_string(result.first_token_piece);
         LOG("ttft[%zu/%zu]: prompt_tokens=%d ttft_ms=%.3f sleep_s=%.3f first_token_id=%d first_token=\"%s\"\n",
@@ -389,6 +474,7 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+    install_ttft_debug_handlers();
 
     auto & sparams = params.sampling;
 
@@ -530,11 +616,22 @@ int main(int argc, char ** argv) {
     }
 
     if (!params.ttft_prompts.empty()) {
+        set_ttft_phase("ttft-dispatch", 0);
         const int ttft_ret = run_ttft_benchmark(model, ctx, chat_templates.get(), params, smpl);
 
+        set_ttft_phase("ttft-before-backend-free", g_ttft_prompt_index.load(std::memory_order_relaxed));
+        LOG_INF("ttft-debug: about to call llama_backend_free()\n");
         llama_backend_free();
+        set_ttft_phase("ttft-after-backend-free", g_ttft_prompt_index.load(std::memory_order_relaxed));
+        LOG_INF("ttft-debug: llama_backend_free() finished\n");
+
+        LOG_INF("ttft-debug: about to free threadpool\n");
         ggml_threadpool_free_fn(threadpool);
+        LOG_INF("ttft-debug: threadpool freed\n");
+
+        LOG_INF("ttft-debug: about to free batch threadpool\n");
         ggml_threadpool_free_fn(threadpool_batch);
+        LOG_INF("ttft-debug: batch threadpool freed\n");
 
         return ttft_ret;
     }

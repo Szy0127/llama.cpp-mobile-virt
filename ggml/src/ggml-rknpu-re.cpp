@@ -2629,6 +2629,7 @@ static const char * ggml_backend_rknpu2_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rknpu2_free(ggml_backend_t backend) {
+    fprintf(stderr, "[rknpu-free] enter backend=%p npu_threads=%zu done=%d\n", (void *) backend, npu_threads.size(), (int) done);
     ggml_backend_rknpure_context * ctx = (ggml_backend_rknpure_context *)backend->context;
     // delete ctx;
     // delete backend;
@@ -2654,8 +2655,12 @@ static void ggml_backend_rknpu2_free(ggml_backend_t backend) {
     // }
 
     if (g_rknpu2_mgr[ctx->device].backend != nullptr) {
+        fprintf(stderr, "[rknpu-free] deleting backend=%p for device=%d\n", (void *) backend, ctx->device);
         delete backend;
         g_rknpu2_mgr[ctx->device].backend = nullptr;
+        fprintf(stderr, "[rknpu-free] delete backend done for device=%d\n", ctx->device);
+    } else {
+        fprintf(stderr, "[rknpu-free] backend already null for device=%d\n", ctx->device);
     }
     matmul_kernels.clear();
     {
@@ -2664,11 +2669,26 @@ static void ggml_backend_rknpu2_free(ggml_backend_t backend) {
     }
     ggml_rknpu2_dump_weight_prepack_stats();
 
-    done = true;
-    cv_worker.notify_all();
-    for (auto &thread: npu_threads) {
-        thread.join();
+    // `llama_backend_free()` may tear down more than one backend object during process exit.
+    // Make this worker-thread shutdown idempotent, otherwise a second `join()` on the same
+    // std::thread can end in `std::terminate()` right after one dataset finishes.
+    if (!npu_threads.empty()) {
+        fprintf(stderr, "[rknpu-free] stopping workers count=%zu\n", npu_threads.size());
+        done = true;
+        cv_worker.notify_all();
+        for (size_t i = 0; i < npu_threads.size(); ++i) {
+            auto & thread = npu_threads[i];
+            fprintf(stderr, "[rknpu-free] thread[%zu] joinable=%d before join\n", i, (int) thread.joinable());
+            if (thread.joinable()) {
+                thread.join();
+                fprintf(stderr, "[rknpu-free] thread[%zu] joined\n", i);
+            }
+        }
+        npu_threads.clear();
+        fprintf(stderr, "[rknpu-free] workers cleared\n");
     }
+
+    fprintf(stderr, "[rknpu-free] exit backend=%p\n", (void *) backend);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_rknpu2_get_default_buffer_type(ggml_backend_t backend) {
