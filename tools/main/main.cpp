@@ -1011,6 +1011,7 @@ int main(int argc, char ** argv) {
     std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
     int64_t ttft_start_us = 0;
     bool    ttft_pending  = false;
+    bool    exit_after_ttft_token = false;
 
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(console::prompt);
@@ -1207,6 +1208,9 @@ int main(int argc, char ** argv) {
                 const int64_t ttft_us = llama_time_us() - ttft_start_us;
                 LOG("\nTTFT: %" PRId64 " us (%.3f ms)\n", ttft_us, ttft_us / 1000.0);
                 ttft_pending = false;
+                if (params.interactive) {
+                    exit_after_ttft_token = true;
+                }
             }
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
@@ -1252,6 +1256,11 @@ int main(int argc, char ** argv) {
         if (input_echo && (int) embd_inp.size() == n_consumed) {
             console::set_display(console::reset);
             display = true;
+        }
+
+        if (exit_after_ttft_token) {
+            LOG("\n");
+            break;
         }
 
         // if not currently processing queued inputs;
