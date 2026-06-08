@@ -1,6 +1,25 @@
 #!/bin/bash
 #CC=gcc-12-aarch64-linux-gnu
 #CXX=g++-12-aarch64-linux-gnu
+set -euo pipefail
+
+DOCKER_IMAGE="${LLAMA_DOCKER_IMAGE:-llama-jammy-xbuild}"
+
+if [[ ! -f /.dockerenv ]] && docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+    mkdir -p "$HOME/.android"
+
+    docker run --rm -it \
+        --network host \
+        --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp \
+        -v "$PWD":/workspace \
+        -v "$HOME/.android":/tmp/.android \
+        -w /workspace \
+        "$DOCKER_IMAGE" \
+        bash build.sh "$@"
+    exit 0
+fi
+
 cmake -Bbuild -H. \
     -DCMAKE_TOOLCHAIN_FILE=./aarch64-toolchain.cmake\
     -DCMAKE_BUILD_TYPE=Release\
